@@ -28,8 +28,7 @@ tg_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 stats = {"checks": 0, "found": 0}
 is_searching = False
 
-# ID коллекций — берём из getStarGifts
-NFT_COLLECTIONS = {}  # будет заполнено при старте: {title: gift_id}
+NFT_COLLECTIONS = {}
 
 
 class Auth(StatesGroup):
@@ -65,14 +64,12 @@ def user_nft_kb(username: str, slug: str):
 
 
 async def load_collections():
-    """Загружает список коллекций из Telegram API"""
     global NFT_COLLECTIONS
     try:
         result = await tg_client(GetStarGiftsRequest(hash=0))
         for gift in result.gifts:
             title = getattr(gift, 'title', None)
             gift_id = getattr(gift, 'id', None)
-            # Только уникальные (NFT) подарки имеют title
             if title and gift_id:
                 NFT_COLLECTIONS[title] = gift_id
         logger.info(f"Загружено коллекций: {len(NFT_COLLECTIONS)}")
@@ -81,10 +78,6 @@ async def load_collections():
 
 
 async def fetch_market_gifts(gift_id: int = None, offset: str = "", limit: int = 50) -> tuple:
-    """
-    Получает NFT с маркета через payments.getResaleStarGifts.
-    Возвращает (список подарков с владельцами, next_offset)
-    """
     try:
         result = await tg_client(GetResaleStarGiftsRequest(
             gift_id=gift_id,
@@ -96,7 +89,6 @@ async def fetch_market_gifts(gift_id: int = None, offset: str = "", limit: int =
         users_map = {u.id: u for u in (result.users or [])}
 
         for gift in (result.gifts or []):
-            # Получаем владельца
             owner_id = getattr(gift, 'owner_id', None)
             owner_peer_id = getattr(owner_id, 'user_id', None) if owner_id else None
             owner = users_map.get(owner_peer_id) if owner_peer_id else None
@@ -133,12 +125,10 @@ async def fetch_market_gifts(gift_id: int = None, offset: str = "", limit: int =
 
 
 async def search_market(status_msg: Message, gift_id: int = None, max_results: int = 30):
-    """Парсит маркет и выдаёт NFT на продаже"""
     global is_searching
     is_searching = True
     found = 0
 
-    # Если gift_id не задан — берём все коллекции по очереди
     if gift_id is not None:
         gift_ids = [gift_id]
     else:
@@ -178,7 +168,6 @@ async def search_market(status_msg: Message, gift_id: int = None, max_results: i
                     )
                     await asyncio.sleep(0.2)
 
-                # Обновляем статус
                 try:
                     await status_msg.edit_text(
                         f"🛒 Парсю маркет...\n🎁 Найдено: <b>{found}</b>",
@@ -216,7 +205,7 @@ async def cmd_start(message: Message, state: FSMContext):
         if uid == ADMIN_ID:
             await message.answer(
                 "⚙️ <b>Первый запуск — нужна авторизация</b>\n\n"
-                "📱 Введи номер: <code>+79001234567</code>",
+                "📱 Введи номер телефона в формате: <code>+79001234567</code>",
                 parse_mode="HTML"
             )
             await state.set_state(Auth.phone)
@@ -239,38 +228,56 @@ async def cmd_start(message: Message, state: FSMContext):
 async def auth_phone(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
+
     phone = message.text.strip()
     if not phone.startswith("+"):
-        await message.answer("❌ Формат: <code>+79001234567</code>", parse_mode="HTML")
+        await message.answer("❌ Формат номера: <code>+79001234567</code>", parse_mode="HTML")
         return
+
+    await message.answer("⏳ Подключаюсь к Telegram...")
+
     try:
         if not tg_client.is_connected():
             await tg_client.connect()
+            await asyncio.sleep(1)
+
         result = await tg_client.send_code_request(phone)
         await state.update_data(phone=phone, phone_code_hash=result.phone_code_hash)
         await state.set_state(Auth.code)
-        await message.answer("📨 Введи код: <code>12345</code>", parse_mode="HTML")
+        await message.answer(
+            "📨 Код отправлен в Telegram.\n\n"
+            "Введи его <b>без пробелов</b>: <code>12345</code>",
+            parse_mode="HTML"
+        )
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        logger.error(f"send_code_request error: {e}")
+        await message.answer(f"❌ Ошибка отправки кода: <code>{e}</code>", parse_mode="HTML")
+        await state.clear()
 
 
 @dp.message(Auth.code)
 async def auth_code(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
+
     code = message.text.strip().replace(" ", "")
     data = await state.get_data()
+
     try:
         await tg_client.sign_in(phone=data["phone"], code=code, phone_code_hash=data["phone_code_hash"])
         me = await tg_client.get_me()
         await state.clear()
         await load_collections()
-        await message.answer(f"✅ Авторизован как @{me.username}", reply_markup=main_kb())
+        await message.answer(
+            f"✅ Авторизован как @{me.username or me.first_name}",
+            reply_markup=main_kb()
+        )
     except SessionPasswordNeededError:
         await state.set_state(Auth.password)
-        await message.answer("🔐 Введи пароль 2FA:")
+        await message.answer("🔐 Введи пароль двухфакторной аутентификации:")
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        logger.error(f"sign_in error: {e}")
+        await message.answer(f"❌ Ошибка входа: <code>{e}</code>", parse_mode="HTML")
         await state.clear()
 
 
@@ -278,21 +285,30 @@ async def auth_code(message: Message, state: FSMContext):
 async def auth_password(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
+
     try:
         await tg_client.sign_in(password=message.text.strip())
         me = await tg_client.get_me()
         await state.clear()
         await load_collections()
-        await message.answer(f"✅ Авторизован как @{me.username}", reply_markup=main_kb())
+        await message.answer(
+            f"✅ Авторизован как @{me.username or me.first_name}",
+            reply_markup=main_kb()
+        )
     except Exception as e:
-        await message.answer(f"❌ Неверный пароль: {e}")
+        logger.error(f"2FA error: {e}")
+        await message.answer(f"❌ Неверный пароль: <code>{e}</code>", parse_mode="HTML")
 
 
 @dp.message(Command("auth"))
 async def cmd_auth(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    await message.answer("📱 Введи номер: <code>+79001234567</code>", parse_mode="HTML")
+    await state.clear()
+    await message.answer(
+        "📱 Введи номер телефона: <code>+79001234567</code>",
+        parse_mode="HTML"
+    )
     await state.set_state(Auth.phone)
 
 
@@ -422,7 +438,6 @@ async def cb_stop(callback: CallbackQuery):
 async def main():
     await tg_client.connect()
     logger.info("🎁 NFT Market Parser запущен!")
-    # Загружаем коллекции если уже авторизованы
     try:
         if await tg_client.is_user_authorized():
             await load_collections()
