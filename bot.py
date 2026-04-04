@@ -2,6 +2,7 @@ import asyncio
 import logging
 from telethon import TelegramClient
 from telethon.tl.functions.payments import GetResaleStarGiftsRequest, GetStarGiftsRequest
+from telethon.tl.functions.users import GetUsersRequest
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -13,8 +14,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # ========================
 API_ID = 28687552
 API_HASH = "1abf9a58d0c22f62437bec89bd6b27a3"
-BOT_TOKEN = "8746204744:AAFlTI76SnDdnkRAuZPC6Fy6OeqaXP370Uk"
-ADMIN_ID = 7602363090
+BOT_TOKEN = "8629977687:AAEv-QHXC-9Bh8lyixVrMp2bIlwxT_yAs2k"
+ADMIN_ID = 174415647
 SESSION_NAME = "nft_session"
 # ========================
 
@@ -30,6 +31,19 @@ is_searching = False
 
 NFT_COLLECTIONS = {}
 
+GIRL_NAMES = {
+    "анна", "мария", "екатерина", "анастасия", "наталья", "ольга", "елена",
+    "татьяна", "ирина", "юлия", "алина", "виктория", "дарья", "полина",
+    "ксения", "валерия", "александра", "надежда", "людмила", "галина",
+    "christina", "anna", "maria", "kate", "natasha", "olga", "elena",
+    "tatiana", "irina", "julia", "alina", "victoria", "dasha", "polina",
+    "ksenia", "valeria", "alexandra", "diana", "sophia", "sofia", "lisa",
+    "лиза", "диана", "софья", "софия", "кристина", "светлана", "sveta",
+    "милана", "milana", "арина", "arina", "вера", "vera", "жанна", "zhanna",
+    "angela", "angela", "ангелина", "angelina", "карина", "karina",
+    "оксана", "oksana", "нина", "nina", "лариса", "larisa", "регина", "regina"
+}
+
 
 class Auth(StatesGroup):
     phone = State()
@@ -37,10 +51,28 @@ class Auth(StatesGroup):
     password = State()
 
 
+def is_girl(user) -> bool:
+    first = (getattr(user, 'first_name', '') or '').lower().strip()
+    last = (getattr(user, 'last_name', '') or '').lower().strip()
+    username = (getattr(user, 'username', '') or '').lower().strip()
+
+    for name in GIRL_NAMES:
+        if first.startswith(name) or last.startswith(name) or username.startswith(name):
+            return True
+
+    girl_keywords = ['girl', 'lady', 'princess', 'queen', 'барби', 'принцесса', 'королева', 'девочка', 'baby', 'cute', 'sweetie']
+    for kw in girl_keywords:
+        if kw in first or kw in last or kw in username:
+            return True
+
+    return False
+
+
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛒 Маркет — все NFT на продаже", callback_data="market_all")],
         [InlineKeyboardButton(text="🗂 Выбрать коллекцию", callback_data="market_col")],
+        [InlineKeyboardButton(text="👧 Искать девушек", callback_data="search_girls")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
     ])
 
@@ -77,7 +109,7 @@ async def load_collections():
         logger.error(f"Ошибка загрузки коллекций: {e}")
 
 
-async def fetch_market_gifts(gift_id: int = None, offset: str = "", limit: int = 50) -> tuple:
+async def fetch_market_gifts(gift_id: int = None, offset: str = "", limit: int = 100) -> tuple:
     try:
         result = await tg_client(GetResaleStarGiftsRequest(
             gift_id=gift_id,
@@ -104,6 +136,8 @@ async def fetch_market_gifts(gift_id: int = None, offset: str = "", limit: int =
             price = getattr(gift, 'resell_stars', None) or getattr(gift, 'availability_resale_stars', None)
 
             items.append({
+                "owner": owner,
+                "owner_id": owner_peer_id,
                 "username": username,
                 "name": name,
                 "title": title,
@@ -124,10 +158,11 @@ async def fetch_market_gifts(gift_id: int = None, offset: str = "", limit: int =
         return [], ""
 
 
-async def search_market(status_msg: Message, gift_id: int = None, max_results: int = 30):
+async def search_market(status_msg: Message, gift_id: int = None, max_results: int = 30, girls_only: bool = False):
     global is_searching
     is_searching = True
     found = 0
+    seen_owner_ids = set()  # дедупликация по владельцу
 
     if gift_id is not None:
         gift_ids = [gift_id]
@@ -151,6 +186,20 @@ async def search_market(status_msg: Message, gift_id: int = None, max_results: i
                     if not is_searching or found >= max_results:
                         break
 
+                    owner_id = item.get("owner_id")
+
+                    # Пропускаем если уже показали этого владельца
+                    if owner_id and owner_id in seen_owner_ids:
+                        continue
+                    if owner_id:
+                        seen_owner_ids.add(owner_id)
+
+                    # Фильтр по девушкам
+                    if girls_only:
+                        owner = item.get("owner")
+                        if not owner or not is_girl(owner):
+                            continue
+
                     found += 1
                     stats["found"] += 1
 
@@ -158,9 +207,11 @@ async def search_market(status_msg: Message, gift_id: int = None, max_results: i
                     owner_text = f"@{item['username']}" if item['username'] else f"👤 {item['name'] or 'Скрыт'}"
                     slug = item['slug'] or f"{item['title']}-{item['num']}".replace(" ", "")
 
+                    girl_tag = "👧 " if girls_only else ""
+
                     await status_msg.bot.send_message(
                         chat_id=status_msg.chat.id,
-                        text=f"🎁 <b>{item['title']} #{item['num']}</b>\n"
+                        text=f"{girl_tag}🎁 <b>{item['title']} #{item['num']}</b>\n"
                              f"👤 {owner_text}\n"
                              f"💰 {price_text}",
                         parse_mode="HTML",
@@ -169,8 +220,9 @@ async def search_market(status_msg: Message, gift_id: int = None, max_results: i
                     await asyncio.sleep(0.2)
 
                 try:
+                    label = "👧 Девушек" if girls_only else "NFT"
                     await status_msg.edit_text(
-                        f"🛒 Парсю маркет...\n🎁 Найдено: <b>{found}</b>",
+                        f"🛒 Парсю маркет...\n🎁 Найдено {label}: <b>{found}</b>",
                         parse_mode="HTML",
                         reply_markup=stop_kb()
                     )
@@ -356,6 +408,33 @@ async def cb_market_all(callback: CallbackQuery):
     try:
         await status.edit_text(
             f"✅ <b>Готово!</b>\n\n🎁 Показано NFT: <b>{found}</b>",
+            parse_mode="HTML",
+            reply_markup=menu_kb()
+        )
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data == "search_girls")
+async def cb_search_girls(callback: CallbackQuery):
+    global is_searching
+    if is_searching:
+        await callback.answer("⏳ Поиск уже идёт!", show_alert=True)
+        return
+    await callback.answer("👧 Ищу девушек...")
+    stats["checks"] += 1
+
+    status = await callback.message.answer(
+        "👧 Ищу девушек на маркете...\n🎁 Найдено: 0",
+        parse_mode="HTML",
+        reply_markup=stop_kb()
+    )
+
+    found = await search_market(status, max_results=30, girls_only=True)
+
+    try:
+        await status.edit_text(
+            f"✅ <b>Готово!</b>\n\n👧 Найдено девушек: <b>{found}</b>",
             parse_mode="HTML",
             reply_markup=menu_kb()
         )
