@@ -15,7 +15,7 @@ import os
 # ========================
 API_ID = 28687552
 API_HASH = "1abf9a58d0c22f62437bec89bd6b27a3"
-BOT_TOKEN = "8746204744:AAFlTI76SnDdnkRAuZPC6Fy6OeqaXP370Uk"
+BOT_TOKEN = "8776491012:AAEzwun5g4i9iri5pqacGQ09DMXbJtAvXLA"
 ADMIN_ID = 7602363090
 SESSION_NAME = "nft_session"
 USERS_FILE = "users.json"
@@ -31,6 +31,26 @@ tg_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 stats = {"checks": 0, "found": 0}
 is_searching = False
 NFT_COLLECTIONS = {}
+
+PRICE_CATEGORIES = {
+    "cheap":  {"label": "💚 Дешёвые",  "min": 0,     "max": 2000},
+    "mid":    {"label": "💛 Средние",   "min": 2000,  "max": 5000},
+    "hard":   {"label": "🟠 Сложные",  "min": 5000,  "max": 20000},
+    "ultra":  {"label": "🔴 Хард",     "min": 20000, "max": None},
+}
+
+GIRL_NAMES = {
+    "анна", "мария", "екатерина", "анастасия", "наталья", "ольга", "елена",
+    "татьяна", "ирина", "юлия", "алина", "виктория", "дарья", "полина",
+    "ксения", "валерия", "александра", "надежда", "людмила", "галина",
+    "christina", "anna", "maria", "kate", "natasha", "olga", "elena",
+    "tatiana", "irina", "julia", "alina", "victoria", "dasha", "polina",
+    "ksenia", "valeria", "alexandra", "diana", "sophia", "sofia", "lisa",
+    "лиза", "диана", "софья", "софия", "кристина", "светлана", "sveta",
+    "милана", "milana", "арина", "arina", "вера", "vera", "жанна", "zhanna",
+    "angela", "ангелина", "angelina", "карина", "karina",
+    "оксана", "oksana", "нина", "nina", "лариса", "larisa", "регина", "regina"
+}
 
 
 # ===================== USERS DB =====================
@@ -61,19 +81,6 @@ class Broadcast(StatesGroup):
 
 
 # ===================== GIRL DETECTION =====================
-GIRL_NAMES = {
-    "анна", "мария", "екатерина", "анастасия", "наталья", "ольга", "елена",
-    "татьяна", "ирина", "юлия", "алина", "виктория", "дарья", "полина",
-    "ксения", "валерия", "александра", "надежда", "людмила", "галина",
-    "christina", "anna", "maria", "kate", "natasha", "olga", "elena",
-    "tatiana", "irina", "julia", "alina", "victoria", "dasha", "polina",
-    "ksenia", "valeria", "alexandra", "diana", "sophia", "sofia", "lisa",
-    "лиза", "диана", "софья", "софия", "кристина", "светлана", "sveta",
-    "милана", "milana", "арина", "arina", "вера", "vera", "жанна", "zhanna",
-    "angela", "ангелина", "angelina", "карина", "karina",
-    "оксана", "oksana", "нина", "nina", "лариса", "larisa", "регина", "regina"
-}
-
 def is_girl(user) -> bool:
     first = (getattr(user, 'first_name', '') or '').lower().strip()
     last = (getattr(user, 'last_name', '') or '').lower().strip()
@@ -81,8 +88,7 @@ def is_girl(user) -> bool:
     for name in GIRL_NAMES:
         if first.startswith(name) or last.startswith(name) or username.startswith(name):
             return True
-    girl_keywords = ['girl', 'lady', 'princess', 'queen', 'барби', 'принцесса', 'королева', 'baby', 'cute', 'sweetie']
-    for kw in girl_keywords:
+    for kw in ['girl', 'lady', 'princess', 'queen', 'барби', 'принцесса', 'королева', 'baby', 'cute', 'sweetie']:
         if kw in first or kw in last or kw in username:
             return True
     return False
@@ -91,10 +97,20 @@ def is_girl(user) -> bool:
 # ===================== KEYBOARDS =====================
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛒 Маркет — все NFT на продаже", callback_data="market_all")],
-        [InlineKeyboardButton(text="🗂 Выбрать коллекцию", callback_data="market_col")],
+        [InlineKeyboardButton(text="🛒 Все NFT на продаже", callback_data="market_all")],
+        [InlineKeyboardButton(text="💰 По цене", callback_data="market_price")],
+        [InlineKeyboardButton(text="🗂 По коллекции", callback_data="market_col")],
         [InlineKeyboardButton(text="👧 Искать девушек", callback_data="search_girls")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
+    ])
+
+def price_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💚 Дешёвые (до 2000 ⭐️)", callback_data="price_cheap")],
+        [InlineKeyboardButton(text="💛 Средние (2000–5000 ⭐️)", callback_data="price_mid")],
+        [InlineKeyboardButton(text="🟠 Сложные (5000–20000 ⭐️)", callback_data="price_hard")],
+        [InlineKeyboardButton(text="🔴 Хард (20000+ ⭐️)", callback_data="price_ultra")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu")],
     ])
 
 def admin_kb():
@@ -109,7 +125,7 @@ def admin_kb():
 
 def stop_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏹ Стоп", callback_data="stop_search")],
+        [InlineKeyboardButton(text="⏹ СТОП", callback_data="stop_search")],
     ])
 
 def menu_kb():
@@ -195,12 +211,20 @@ async def fetch_market_gifts(gift_id: int = None, offset: str = "", limit: int =
         return [], ""
 
 
-async def search_market(status_msg: Message, gift_id: int = None, max_results: int = 30, girls_only: bool = False):
+async def search_market(
+    status_msg: Message,
+    gift_id: int = None,
+    max_results: int = 50,
+    girls_only: bool = False,
+    price_min: int = None,
+    price_max: int = None,
+):
     global is_searching
     is_searching = True
     found = 0
     seen_owner_ids = set()
 
+    # Если gift_id не указан — берём все коллекции
     if gift_id is not None:
         gift_ids = [gift_id]
     else:
@@ -217,24 +241,42 @@ async def search_market(status_msg: Message, gift_id: int = None, max_results: i
                 items, next_offset = await fetch_market_gifts(gift_id=gid, offset=offset)
                 if not items:
                     break
+
                 for item in items:
                     if not is_searching or found >= max_results:
                         break
+
+                    # Дедупликация по владельцу
                     owner_id = item.get("owner_id")
                     if owner_id and owner_id in seen_owner_ids:
                         continue
                     if owner_id:
                         seen_owner_ids.add(owner_id)
+
+                    # Фильтр по цене
+                    price = item.get("price")
+                    if price_min is not None or price_max is not None:
+                        if price is None:
+                            continue
+                        if price_min is not None and price < price_min:
+                            continue
+                        if price_max is not None and price > price_max:
+                            continue
+
+                    # Фильтр по девушкам
                     if girls_only:
                         owner = item.get("owner")
                         if not owner or not is_girl(owner):
                             continue
+
                     found += 1
                     stats["found"] += 1
+
                     price_text = f"⭐️ {item['price']}" if item['price'] else "цена неизвестна"
                     owner_text = f"@{item['username']}" if item['username'] else f"👤 {item['name'] or 'Скрыт'}"
                     slug = item['slug'] or f"{item['title']}-{item['num']}".replace(" ", "")
                     girl_tag = "👧 " if girls_only else ""
+
                     await status_msg.bot.send_message(
                         chat_id=status_msg.chat.id,
                         text=f"{girl_tag}🎁 <b>{item['title']} #{item['num']}</b>\n"
@@ -244,32 +286,33 @@ async def search_market(status_msg: Message, gift_id: int = None, max_results: i
                         reply_markup=user_nft_kb(item['username'], slug)
                     )
                     await asyncio.sleep(0.2)
+
                 try:
                     label = "👧 Девушек" if girls_only else "NFT"
                     await status_msg.edit_text(
-                        f"🛒 Парсю маркет...\n🎁 Найдено {label}: <b>{found}</b>",
+                        f"🔍 Парсю...\n🎁 Найдено {label}: <b>{found}</b>",
                         parse_mode="HTML",
                         reply_markup=stop_kb()
                     )
                 except Exception:
                     pass
+
                 if not next_offset:
                     break
                 offset = next_offset
                 await asyncio.sleep(0.5)
+
     finally:
         is_searching = False
 
     return found
 
 
-# ===================== HANDLERS =====================
+# ===================== /START & /ADMIN =====================
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     add_user(message.from_user.id)
-    uid = message.from_user.id
-
     authorized = False
     try:
         if tg_client.is_connected():
@@ -278,10 +321,10 @@ async def cmd_start(message: Message, state: FSMContext):
         pass
 
     if not authorized:
-        if uid == ADMIN_ID:
+        if message.from_user.id == ADMIN_ID:
             await message.answer(
                 "⚙️ <b>Первый запуск — нужна авторизация</b>\n\n"
-                "📱 Введи номер телефона в формате: <code>+79001234567</code>",
+                "📱 Введи номер телефона: <code>+79001234567</code>",
                 parse_mode="HTML"
             )
             await state.set_state(Auth.phone)
@@ -301,7 +344,7 @@ async def cmd_start(message: Message, state: FSMContext):
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ У тебя нет доступа")
+        await message.answer("❌ Нет доступа")
         return
     await state.clear()
     users = load_users()
@@ -315,6 +358,192 @@ async def cmd_admin(message: Message, state: FSMContext):
     )
 
 
+# ===================== PRICE CATEGORY CALLBACKS =====================
+@dp.callback_query(F.data == "market_price")
+async def cb_market_price(callback: CallbackQuery):
+    await callback.message.answer(
+        "💰 <b>Выбери ценовую категорию:</b>",
+        parse_mode="HTML",
+        reply_markup=price_kb()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("price_"))
+async def cb_price_category(callback: CallbackQuery):
+    global is_searching
+    if is_searching:
+        await callback.answer("⏳ Поиск уже идёт!", show_alert=True)
+        return
+
+    cat_key = callback.data[6:]
+    cat = PRICE_CATEGORIES.get(cat_key)
+    if not cat:
+        await callback.answer("❌ Неизвестная категория", show_alert=True)
+        return
+
+    await callback.answer(f"{cat['label']}")
+    stats["checks"] += 1
+
+    price_min = cat["min"] if cat["min"] > 0 else None
+    price_max = cat["max"]
+
+    price_range = f"{cat['min']}–{cat['max']} ⭐️" if cat["max"] else f"от {cat['min']} ⭐️"
+
+    status = await callback.message.answer(
+        f"{cat['label']} ({price_range})\n🔍 Ищу...\n🎁 Найдено: 0",
+        parse_mode="HTML",
+        reply_markup=stop_kb()
+    )
+
+    found = await search_market(
+        status,
+        max_results=50,
+        price_min=price_min,
+        price_max=price_max
+    )
+
+    if is_searching is False:
+        result_text = f"⏹ Остановлено\n\n{cat['label']}\n🎁 Найдено: <b>{found}</b>"
+    else:
+        result_text = f"✅ Готово!\n\n{cat['label']}\n🎁 Найдено: <b>{found}</b>"
+
+    try:
+        await status.edit_text(result_text, parse_mode="HTML", reply_markup=menu_kb())
+    except Exception:
+        pass
+
+
+# ===================== MARKET CALLBACKS =====================
+@dp.callback_query(F.data == "market_all")
+async def cb_market_all(callback: CallbackQuery):
+    global is_searching
+    if is_searching:
+        await callback.answer("⏳ Поиск уже идёт!", show_alert=True)
+        return
+    await callback.answer("🛒 Загружаю маркет...")
+    stats["checks"] += 1
+    status = await callback.message.answer(
+        "🛒 Парсю все NFT на маркете...\n🎁 Найдено: 0",
+        parse_mode="HTML",
+        reply_markup=stop_kb()
+    )
+    found = await search_market(status, max_results=50)
+    result_text = f"⏹ Остановлено\n🎁 Найдено: <b>{found}</b>" if not is_searching else f"✅ Готово!\n🎁 Показано: <b>{found}</b>"
+    try:
+        await status.edit_text(result_text, parse_mode="HTML", reply_markup=menu_kb())
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data == "search_girls")
+async def cb_search_girls(callback: CallbackQuery):
+    global is_searching
+    if is_searching:
+        await callback.answer("⏳ Поиск уже идёт!", show_alert=True)
+        return
+    await callback.answer("👧 Ищу девушек...")
+    stats["checks"] += 1
+    status = await callback.message.answer(
+        "👧 Ищу девушек на маркете...\n🎁 Найдено: 0",
+        parse_mode="HTML",
+        reply_markup=stop_kb()
+    )
+    found = await search_market(status, max_results=50, girls_only=True)
+    result_text = f"⏹ Остановлено\n👧 Найдено: <b>{found}</b>" if not is_searching else f"✅ Готово!\n👧 Найдено: <b>{found}</b>"
+    try:
+        await status.edit_text(result_text, parse_mode="HTML", reply_markup=menu_kb())
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data == "market_col")
+async def cb_market_col(callback: CallbackQuery):
+    if not NFT_COLLECTIONS:
+        await callback.answer("⏳ Загружаю коллекции...", show_alert=False)
+        await load_collections()
+    if not NFT_COLLECTIONS:
+        await callback.message.answer("❌ Не удалось загрузить коллекции", reply_markup=menu_kb())
+        await callback.answer()
+        return
+    items = list(NFT_COLLECTIONS.keys())
+    rows = []
+    for i in range(0, len(items), 2):
+        row = [InlineKeyboardButton(text=items[i], callback_data=f"mcol_{i}")]
+        if i + 1 < len(items):
+            row.append(InlineKeyboardButton(text=items[i+1], callback_data=f"mcol_{i+1}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="📱 Меню", callback_data="menu")])
+    await callback.message.answer("🗂 <b>Выбери коллекцию:</b>", parse_mode="HTML",
+                                   reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("mcol_"))
+async def cb_mcol(callback: CallbackQuery):
+    global is_searching
+    if is_searching:
+        await callback.answer("⏳ Поиск уже идёт!", show_alert=True)
+        return
+    idx = int(callback.data[5:])
+    items = list(NFT_COLLECTIONS.items())
+    col_name, gift_id = items[idx]
+    await callback.answer(f"🔍 {col_name}")
+    stats["checks"] += 1
+    status = await callback.message.answer(
+        f"🛒 Ищу <b>{col_name}</b>...\n🎁 Найдено: 0",
+        parse_mode="HTML",
+        reply_markup=stop_kb()
+    )
+    found = await search_market(status, gift_id=gift_id, max_results=50)
+    try:
+        await status.edit_text(
+            f"✅ <b>{col_name}</b>\n🎁 Показано: <b>{found}</b>",
+            parse_mode="HTML",
+            reply_markup=menu_kb()
+        )
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data == "stop_search")
+async def cb_stop(callback: CallbackQuery):
+    global is_searching
+    is_searching = False
+    await callback.answer("⏹ Останавливаю...", show_alert=False)
+    try:
+        await callback.message.edit_text(
+            "⏹ <b>Поиск остановлен</b>",
+            parse_mode="HTML",
+            reply_markup=menu_kb()
+        )
+    except Exception:
+        pass
+
+
+# ===================== MENU & STATS =====================
+@dp.callback_query(F.data == "menu")
+async def cb_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer(
+        "🎁 <b>NFT Market Parser</b>\n\n👇 Выбери действие:",
+        parse_mode="HTML",
+        reply_markup=main_kb()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "stats")
+async def cb_stats(callback: CallbackQuery):
+    await callback.message.answer(
+        f"📊 <b>Статистика</b>\n\n"
+        f"🔍 Поисков: <b>{stats['checks']}</b>\n"
+        f"🎁 Найдено NFT: <b>{stats['found']}</b>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
 # ===================== ADMIN CALLBACKS =====================
 @dp.callback_query(F.data == "admin_broadcast")
 async def cb_admin_broadcast(callback: CallbackQuery, state: FSMContext):
@@ -322,8 +551,7 @@ async def cb_admin_broadcast(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(Broadcast.message)
     await callback.message.answer(
-        "📢 <b>Рассылка</b>\n\nОтправь сообщение которое хочешь разослать всем пользователям.\n\n"
-        "Поддерживается текст, фото, видео, стикеры.",
+        "📢 <b>Рассылка</b>\n\nОтправь сообщение для рассылки всем пользователям.\nПоддерживается текст, фото, видео.",
         parse_mode="HTML",
         reply_markup=cancel_kb()
     )
@@ -336,10 +564,7 @@ async def broadcast_message(message: Message, state: FSMContext):
         return
     await state.update_data(broadcast_msg_id=message.message_id, broadcast_chat_id=message.chat.id)
     await state.set_state(None)
-    await message.answer(
-        "✅ Сообщение получено. Подтверди рассылку:",
-        reply_markup=confirm_broadcast_kb()
-    )
+    await message.answer("✅ Сообщение получено. Подтверди рассылку:", reply_markup=confirm_broadcast_kb())
 
 
 @dp.callback_query(F.data == "admin_broadcast_confirm")
@@ -352,11 +577,9 @@ async def cb_broadcast_confirm(callback: CallbackQuery, state: FSMContext):
     if not msg_id:
         await callback.answer("❌ Сообщение не найдено", show_alert=True)
         return
-
     users = load_users()
     await callback.message.answer(f"📢 Начинаю рассылку для <b>{len(users)}</b> пользователей...", parse_mode="HTML")
     await callback.answer()
-
     success = 0
     failed = 0
     for uid in users:
@@ -367,11 +590,8 @@ async def cb_broadcast_confirm(callback: CallbackQuery, state: FSMContext):
         except Exception as e:
             logger.warning(f"Broadcast failed for {uid}: {e}")
             failed += 1
-
     await callback.message.answer(
-        f"✅ <b>Рассылка завершена!</b>\n\n"
-        f"✅ Успешно: <b>{success}</b>\n"
-        f"❌ Не доставлено: <b>{failed}</b>",
+        f"✅ <b>Рассылка завершена!</b>\n\n✅ Успешно: <b>{success}</b>\n❌ Не доставлено: <b>{failed}</b>",
         parse_mode="HTML",
         reply_markup=admin_kb()
     )
@@ -384,8 +604,7 @@ async def cb_admin_users(callback: CallbackQuery):
         return
     users = load_users()
     await callback.message.answer(
-        f"👥 <b>Пользователи бота</b>\n\n"
-        f"Всего: <b>{len(users)}</b>\n\n"
+        f"👥 <b>Пользователи бота</b>\n\nВсего: <b>{len(users)}</b>\n\n"
         f"ID: {', '.join(str(u) for u in list(users)[:50])}{'...' if len(users) > 50 else ''}",
         parse_mode="HTML",
         reply_markup=admin_kb()
@@ -414,10 +633,7 @@ async def cb_admin_auth(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return
     await state.clear()
-    await callback.message.answer(
-        "📱 Введи номер телефона: <code>+79001234567</code>",
-        parse_mode="HTML"
-    )
+    await callback.message.answer("📱 Введи номер телефона: <code>+79001234567</code>", parse_mode="HTML")
     await state.set_state(Auth.phone)
     await callback.answer()
 
@@ -430,7 +646,7 @@ async def cb_admin_logout(callback: CallbackQuery):
         await tg_client.log_out()
     except Exception:
         pass
-    await callback.message.answer("✅ Вышел из TG аккаунта. Используй /admin → Авторизация для входа.", reply_markup=admin_kb())
+    await callback.message.answer("✅ Вышел из TG аккаунта.", reply_markup=admin_kb())
     await callback.answer()
 
 
@@ -450,9 +666,9 @@ async def auth_phone(message: Message, state: FSMContext):
         return
     phone = message.text.strip()
     if not phone.startswith("+"):
-        await message.answer("❌ Формат номера: <code>+79001234567</code>", parse_mode="HTML")
+        await message.answer("❌ Формат: <code>+79001234567</code>", parse_mode="HTML")
         return
-    await message.answer("⏳ Подключаюсь к Telegram...")
+    await message.answer("⏳ Подключаюсь...")
     try:
         if not tg_client.is_connected():
             await tg_client.connect()
@@ -460,13 +676,9 @@ async def auth_phone(message: Message, state: FSMContext):
         result = await tg_client.send_code_request(phone)
         await state.update_data(phone=phone, phone_code_hash=result.phone_code_hash)
         await state.set_state(Auth.code)
-        await message.answer(
-            "📨 Код отправлен в Telegram.\n\nВведи его <b>без пробелов</b>: <code>12345</code>",
-            parse_mode="HTML"
-        )
+        await message.answer("📨 Код отправлен.\n\nВведи без пробелов: <code>12345</code>", parse_mode="HTML")
     except Exception as e:
-        logger.error(f"send_code_request error: {e}")
-        await message.answer(f"❌ Ошибка отправки кода: <code>{e}</code>", parse_mode="HTML")
+        await message.answer(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
         await state.clear()
 
 
@@ -484,10 +696,9 @@ async def auth_code(message: Message, state: FSMContext):
         await message.answer(f"✅ Авторизован как @{me.username or me.first_name}", reply_markup=main_kb())
     except SessionPasswordNeededError:
         await state.set_state(Auth.password)
-        await message.answer("🔐 Введи пароль двухфакторной аутентификации:")
+        await message.answer("🔐 Введи пароль 2FA:")
     except Exception as e:
-        logger.error(f"sign_in error: {e}")
-        await message.answer(f"❌ Ошибка входа: <code>{e}</code>", parse_mode="HTML")
+        await message.answer(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
         await state.clear()
 
 
@@ -502,7 +713,6 @@ async def auth_password(message: Message, state: FSMContext):
         await load_collections()
         await message.answer(f"✅ Авторизован как @{me.username or me.first_name}", reply_markup=main_kb())
     except Exception as e:
-        logger.error(f"2FA error: {e}")
         await message.answer(f"❌ Неверный пароль: <code>{e}</code>", parse_mode="HTML")
 
 
@@ -511,143 +721,8 @@ async def cmd_auth(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.clear()
-    await message.answer("📱 Введи номер телефона: <code>+79001234567</code>", parse_mode="HTML")
+    await message.answer("📱 Введи номер: <code>+79001234567</code>", parse_mode="HTML")
     await state.set_state(Auth.phone)
-
-
-# ===================== MENU =====================
-@dp.callback_query(F.data == "menu")
-async def cb_menu(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.answer(
-        "🎁 <b>NFT Market Parser</b>\n\n👇 Выбери действие:",
-        parse_mode="HTML",
-        reply_markup=main_kb()
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "stats")
-async def cb_stats(callback: CallbackQuery):
-    await callback.message.answer(
-        f"📊 <b>Статистика</b>\n\n"
-        f"🔍 Поисков: <b>{stats['checks']}</b>\n"
-        f"🎁 Найдено NFT: <b>{stats['found']}</b>",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-
-# ===================== MARKET CALLBACKS =====================
-@dp.callback_query(F.data == "market_all")
-async def cb_market_all(callback: CallbackQuery):
-    global is_searching
-    if is_searching:
-        await callback.answer("⏳ Поиск уже идёт!", show_alert=True)
-        return
-    await callback.answer("🛒 Загружаю маркет...")
-    stats["checks"] += 1
-    status = await callback.message.answer(
-        "🛒 Парсю маркет Telegram...\n🎁 Найдено: 0",
-        parse_mode="HTML",
-        reply_markup=stop_kb()
-    )
-    found = await search_market(status, max_results=30)
-    try:
-        await status.edit_text(
-            f"✅ <b>Готово!</b>\n\n🎁 Показано NFT: <b>{found}</b>",
-            parse_mode="HTML",
-            reply_markup=menu_kb()
-        )
-    except Exception:
-        pass
-
-
-@dp.callback_query(F.data == "search_girls")
-async def cb_search_girls(callback: CallbackQuery):
-    global is_searching
-    if is_searching:
-        await callback.answer("⏳ Поиск уже идёт!", show_alert=True)
-        return
-    await callback.answer("👧 Ищу девушек...")
-    stats["checks"] += 1
-    status = await callback.message.answer(
-        "👧 Ищу девушек на маркете...\n🎁 Найдено: 0",
-        parse_mode="HTML",
-        reply_markup=stop_kb()
-    )
-    found = await search_market(status, max_results=30, girls_only=True)
-    try:
-        await status.edit_text(
-            f"✅ <b>Готово!</b>\n\n👧 Найдено девушек: <b>{found}</b>",
-            parse_mode="HTML",
-            reply_markup=menu_kb()
-        )
-    except Exception:
-        pass
-
-
-@dp.callback_query(F.data == "market_col")
-async def cb_market_col(callback: CallbackQuery):
-    if not NFT_COLLECTIONS:
-        await callback.answer("⏳ Загружаю коллекции...", show_alert=False)
-        await load_collections()
-    if not NFT_COLLECTIONS:
-        await callback.message.answer("❌ Не удалось загрузить коллекции", reply_markup=menu_kb())
-        await callback.answer()
-        return
-    items = list(NFT_COLLECTIONS.keys())
-    rows = []
-    for i in range(0, len(items), 2):
-        row = [InlineKeyboardButton(text=items[i], callback_data=f"mcol_{i}")]
-        if i + 1 < len(items):
-            row.append(InlineKeyboardButton(text=items[i+1], callback_data=f"mcol_{i+1}"))
-        rows.append(row)
-    rows.append([InlineKeyboardButton(text="📱 Меню", callback_data="menu")])
-    await callback.message.answer(
-        "🗂 <b>Выбери коллекцию:</b>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("mcol_"))
-async def cb_mcol(callback: CallbackQuery):
-    global is_searching
-    if is_searching:
-        await callback.answer("⏳ Поиск уже идёт!", show_alert=True)
-        return
-    idx = int(callback.data[5:])
-    items = list(NFT_COLLECTIONS.items())
-    col_name, gift_id = items[idx]
-    await callback.answer(f"🔍 {col_name}")
-    stats["checks"] += 1
-    status = await callback.message.answer(
-        f"🛒 Ищу <b>{col_name}</b> на маркете...\n🎁 Найдено: 0",
-        parse_mode="HTML",
-        reply_markup=stop_kb()
-    )
-    found = await search_market(status, gift_id=gift_id, max_results=30)
-    try:
-        await status.edit_text(
-            f"✅ <b>{col_name}</b>\n\n🎁 Показано: <b>{found}</b>",
-            parse_mode="HTML",
-            reply_markup=menu_kb()
-        )
-    except Exception:
-        pass
-
-
-@dp.callback_query(F.data == "stop_search")
-async def cb_stop(callback: CallbackQuery):
-    global is_searching
-    is_searching = False
-    await callback.answer("⏹ Останавливаю...")
-    try:
-        await callback.message.edit_reply_markup(reply_markup=menu_kb())
-    except Exception:
-        pass
 
 
 # ===================== MAIN =====================
