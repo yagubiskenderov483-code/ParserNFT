@@ -15,7 +15,7 @@ import os
 # ========================
 API_ID = 28687552
 API_HASH = "1abf9a58d0c22f62437bec89bd6b27a3"
-BOT_TOKEN = "8776491012:AAEzwun5g4i9iri5pqacGQ09DMXbJtAvXLA"
+BOT_TOKEN = "8746204744:AAFlTI76SnDdnkRAuZPC6Fy6OeqaXP370Uk"
 ADMIN_ID = 7602363090
 SESSION_NAME = "nft_session"
 USERS_FILE = "users.json"
