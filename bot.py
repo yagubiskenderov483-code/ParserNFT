@@ -17,7 +17,7 @@ import os
 API_ID = 28687552
 API_HASH = "1abf9a58d0c22f62437bec89bd6b27a3"
 BOT_TOKEN = "8406363273:AAF36kxfkOJiLvYPs1FBBWmPUgNcd_kX140"
-ADMIN_ID = 8726084830
+ADMIN_ID = 8726084830  # ИСПРАВЛЕНО
 SESSION_NAME = "nft_session"
 USERS_FILE = "users.json"
 # ========================
@@ -94,6 +94,9 @@ async def check_authorized() -> bool:
 
 
 # ===================== HELPERS =====================
+def is_admin(uid: int) -> bool:
+    return int(uid) == int(ADMIN_ID)
+
 def is_girl(user) -> bool:
     first = (getattr(user, 'first_name', '') or '').lower().strip()
     last  = (getattr(user, 'last_name',  '') or '').lower().strip()
@@ -491,8 +494,7 @@ async def cmd_start(message: Message, state: FSMContext):
     authorized = await check_authorized()
 
     if not authorized:
-        # Если это админ — сразу просим телефон
-        if message.from_user.id == ADMIN_ID:
+        if is_admin(message.from_user.id):
             await message.answer(
                 "⚙️ <b>Нужна авторизация Telegram</b>\n\n"
                 "Введи номер телефона аккаунта для парсинга:\n"
@@ -501,7 +503,6 @@ async def cmd_start(message: Message, state: FSMContext):
             )
             await state.set_state(Auth.phone)
         else:
-            # Обычный пользователь — предлагаем подождать
             await message.answer(
                 "⏳ <b>Бот настраивается</b>\n\nПопробуй позже.",
                 parse_mode="HTML"
@@ -517,7 +518,7 @@ async def cmd_start(message: Message, state: FSMContext):
 # ===================== /ADMIN =====================
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         await message.answer(
             f"❌ Нет доступа.\n\nТвой ID: <code>{message.from_user.id}</code>",
             parse_mode="HTML"
@@ -549,7 +550,7 @@ async def cb_menu(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "do_auth")
 async def cb_do_auth(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         await callback.answer("Только для администратора", show_alert=True)
         return
     await state.set_state(Auth.phone)
@@ -677,7 +678,7 @@ async def cb_stats(callback: CallbackQuery):
 # ===================== ADMIN CALLBACKS =====================
 @dp.callback_query(F.data == "admin_broadcast")
 async def cb_admin_broadcast(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         return
     await state.set_state(Broadcast.message)
     await callback.message.answer(
@@ -688,7 +689,7 @@ async def cb_admin_broadcast(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(Broadcast.message)
 async def broadcast_get_msg(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     await state.update_data(broadcast_msg_id=message.message_id, broadcast_chat_id=message.chat.id)
     await state.set_state(None)
@@ -696,7 +697,7 @@ async def broadcast_get_msg(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "admin_broadcast_confirm")
 async def cb_broadcast_confirm(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         return
     data = await state.get_data()
     msg_id  = data.get("broadcast_msg_id")
@@ -731,7 +732,7 @@ async def cb_broadcast_confirm(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "admin_users")
 async def cb_admin_users(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         return
     users = load_users()
     await callback.message.answer(
@@ -742,7 +743,7 @@ async def cb_admin_users(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "admin_stats")
 async def cb_admin_stats(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         return
     users = load_users()
     await callback.message.answer(
@@ -754,7 +755,7 @@ async def cb_admin_stats(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "admin_auth")
 async def cb_admin_auth(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         return
     await state.clear()
     await callback.message.answer("📱 Введи номер: <code>+79001234567</code>", parse_mode="HTML")
@@ -763,7 +764,7 @@ async def cb_admin_auth(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "admin_logout")
 async def cb_admin_logout(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         return
     try:
         await tg_client.log_out()
@@ -774,7 +775,7 @@ async def cb_admin_logout(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "admin_cancel")
 async def cb_admin_cancel(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         return
     await state.clear()
     await callback.message.answer("❌ Отменено", reply_markup=admin_kb())
@@ -784,7 +785,7 @@ async def cb_admin_cancel(callback: CallbackQuery, state: FSMContext):
 # ===================== AUTH HANDLERS =====================
 @dp.message(Auth.phone)
 async def auth_phone(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     phone = message.text.strip()
     if not phone.startswith("+"):
@@ -797,14 +798,17 @@ async def auth_phone(message: Message, state: FSMContext):
         result = await tg_client.send_code_request(phone)
         await state.update_data(phone=phone, phone_code_hash=result.phone_code_hash)
         await state.set_state(Auth.code)
-        await message.answer("📨 Код отправлен. Введи без пробелов: <code>12345</code>", parse_mode="HTML")
+        await message.answer(
+            "📨 Код отправлен в Telegram.\n\nВведи код без пробелов: <code>12345</code>",
+            parse_mode="HTML"
+        )
     except Exception as e:
         await message.answer(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
         await state.clear()
 
 @dp.message(Auth.code)
 async def auth_code(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     code = message.text.strip().replace(" ", "")
     data = await state.get_data()
@@ -819,18 +823,23 @@ async def auth_code(message: Message, state: FSMContext):
             parse_mode="HTML", reply_markup=main_kb()
         )
     except SessionPasswordNeededError:
+        # ИСПРАВЛЕНО: не сбрасываем state, ждём пароль
         await state.set_state(Auth.password)
-        await message.answer("🔐 Введи пароль 2FA:")
+        await message.answer(
+            "🔐 Требуется пароль 2FA.\n\nВведи пароль следующим сообщением:",
+            parse_mode="HTML"
+        )
     except Exception as e:
-        await message.answer(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
-        await state.clear()
+        await message.answer(f"❌ Неверный код: <code>{e}</code>\n\nПопробуй снова:", parse_mode="HTML")
+        # Не сбрасываем state — даём ввести код ещё раз
 
 @dp.message(Auth.password)
 async def auth_password(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
+    pwd = message.text.strip()
     try:
-        await tg_client.sign_in(password=message.text.strip())
+        await tg_client.sign_in(password=pwd)
         me = await tg_client.get_me()
         await state.clear()
         await load_collections()
@@ -840,11 +849,15 @@ async def auth_password(message: Message, state: FSMContext):
             parse_mode="HTML", reply_markup=main_kb()
         )
     except Exception as e:
-        await message.answer(f"❌ Неверный пароль: <code>{e}</code>", parse_mode="HTML")
+        # ИСПРАВЛЕНО: не сбрасываем state — даём попробовать пароль снова
+        await message.answer(
+            f"❌ Неверный пароль 2FA: <code>{e}</code>\n\nПопробуй ещё раз:",
+            parse_mode="HTML"
+        )
 
 @dp.message(Command("auth"))
 async def cmd_auth(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     await state.clear()
     await message.answer("📱 Введи номер: <code>+79001234567</code>", parse_mode="HTML")
@@ -854,6 +867,10 @@ async def cmd_auth(message: Message, state: FSMContext):
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("❌ Отменено.", reply_markup=main_kb())
+
+@dp.message(Command("myid"))
+async def cmd_myid(message: Message):
+    await message.answer(f"🆔 Твой ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
 
 
 # ===================== MAIN =====================
