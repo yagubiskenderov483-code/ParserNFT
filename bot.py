@@ -3,6 +3,7 @@ import logging
 import urllib.parse
 from telethon import TelegramClient
 from telethon.tl.functions.payments import GetResaleStarGiftsRequest, GetStarGiftsRequest
+from telethon.tl.types import PeerUser, StarsAmount
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -31,7 +32,7 @@ tg_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 stats = {"checks": 0, "found": 0}
 is_searching = False
-NFT_COLLECTIONS = {}
+NFT_COLLECTIONS = {}  # title -> gift_id
 
 PRICE_CATEGORIES = {
     "cheap": {"label": "💚 Дешёвые",  "min": 0,     "max": 2000,  "desc": "до 2000 ⭐️"},
@@ -110,32 +111,35 @@ def is_girl(user) -> bool:
 
 def extract_price(gift) -> int | None:
     """
-    Извлекает цену перепродажи из NFT объекта.
-    Ищет только конкретные поля цены, НЕ кэширует поле глобально.
-    Ограничение: цена не может быть > 10 млн звёзд (исключает id/num/hash).
+    Цена хранится в resell_amount — список StarsAmount объектов.
+    Берём первый элемент у которого amount > 0.
     """
-    PRICE_FIELDS = [
-        'resell_stars',
-        'resale_amount',
-        'availability_resale_stars',
-        'stars',
-        'price',
-        'cost',
-        'amount',
-        'convert_stars',
-        'star_count',
-    ]
-    MAX_SANE_PRICE = 10_000_000  # 10 млн звёзд — потолок реальной цены
+    resell_amount = getattr(gift, 'resell_amount', None)
+    if resell_amount:
+        for sa in resell_amount:
+            amt = getattr(sa, 'amount', None)
+            if amt is not None:
+                try:
+                    iv = int(amt)
+                    if iv > 0:
+                        return iv
+                except Exception:
+                    pass
+    return None
 
-    for field in PRICE_FIELDS:
-        val = getattr(gift, field, None)
-        if val is not None:
-            try:
-                iv = int(val)
-                if 0 < iv <= MAX_SANE_PRICE:
-                    return iv
-            except Exception:
-                pass
+
+def extract_owner_id(gift) -> int | None:
+    """Достаём user_id из owner_id (PeerUser объект)."""
+    owner_id = getattr(gift, 'owner_id', None)
+    if owner_id is None:
+        return None
+    # PeerUser имеет .user_id
+    uid = getattr(owner_id, 'user_id', None)
+    if uid is not None:
+        return int(uid)
+    # На случай если просто int
+    if isinstance(owner_id, int):
+        return owner_id
     return None
 
 
@@ -216,10 +220,9 @@ def girls_col_kb():
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="search_girls_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def user_nft_kb(username: str, slug: str, title: str, num):
+def user_nft_kb(username: str, slug: str):
     """
-    Кнопки для NFT.
-    Кнопка 'Написать' — только ссылка на NFT, без названия и #номера.
+    Кнопки: профиль владельца, открыть NFT, написать (только ссылка на NFT).
     """
     buttons = []
     nft_url = f"https://t.me/nft/{slug}" if slug else None
@@ -228,11 +231,8 @@ def user_nft_kb(username: str, slug: str, title: str, num):
         buttons.append([InlineKeyboardButton(text=f"👤 @{username}", url=f"https://t.me/{username}")])
     if nft_url:
         buttons.append([InlineKeyboardButton(text="🎁 Открыть NFT", url=nft_url)])
-    if username:
-        if nft_url:
-            msg_text = f"Привет! Хочу купить твой NFT 👉 {nft_url}"
-        else:
-            msg_text = "Привет! Хочу купить твой NFT"
+    if username and nft_url:
+        msg_text = f"Привет! Хочу купить твой NFT 👉 {nft_url}"
         encoded = urllib.parse.quote(msg_text)
         buttons.append([InlineKeyboardButton(text="✉️ Написать", url=f"https://t.me/{username}?text={encoded}")])
 
@@ -250,53 +250,63 @@ async def load_collections():
             gift_id = getattr(gift, 'id',    None)
             if title and gift_id:
                 NFT_COLLECTIONS[title] = gift_id
-        logger.info(f"✅ Коллекций загружено: {len(NFT_COLLECTIONS)}: {list(NFT_COLLECTIONS.keys())}")
+        logger.info(f"✅ Коллекций загружено: {len(NFT_COLLECTIONS)} — {list(NFT_COLLECTIONS.keys())}")
     except Exception as e:
         logger.error(f"❌ load_collections: {e}")
 
 
 # ===================== FETCH =====================
 async def fetch_market_gifts(gift_id: int, offset: str = "", limit: int = 100) -> tuple:
+    """
+    Получает список NFT на продажу для одной коллекции.
+    Возвращает (список items, next_offset).
+    """
     try:
         result = await tg_client(GetResaleStarGiftsRequest(
-            gift_id=gift_id, offset=offset, limit=limit,
+            gift_id=gift_id,
+            offset=offset,
+            limit=limit,
+            sort_by_price=True,   # сортировка по цене
         ))
-        users_map = {u.id: u for u in (getattr(result, 'users', None) or [])}
-        gifts     = getattr(result, 'gifts', None) or []
-        items     = []
+
+        # Строим словарь пользователей из ответа
+        users_map = {}
+        for u in (getattr(result, 'users', None) or []):
+            users_map[u.id] = u
+
+        gifts = getattr(result, 'gifts', None) or []
+        items = []
+
         for gift in gifts:
-            oid_obj = getattr(gift, 'owner_id', None)
-            opid = None
-            if oid_obj is not None:
-                opid = (getattr(oid_obj, 'user_id', None) or getattr(oid_obj, 'id', None))
-                if opid is None and isinstance(oid_obj, int):
-                    opid = oid_obj
-            owner    = users_map.get(opid) if opid else None
+            # Достаём owner_id
+            opid = extract_owner_id(gift)
+            owner = users_map.get(opid) if opid else None
             username = getattr(owner, 'username', None) if owner else None
-            name     = ""
+            name = ""
             if owner:
                 name = f"{owner.first_name or ''} {owner.last_name or ''}".strip()
+
             title = getattr(gift, 'title', '?')
-            slug  = (getattr(gift, 'slug', None)
-                     or getattr(gift, 'unique_id', None)
-                     or str(getattr(gift, 'num', '')))
+            slug  = getattr(gift, 'slug', None) or str(getattr(gift, 'num', ''))
             num   = getattr(gift, 'num', '?')
+
+            # ПРАВИЛЬНОЕ извлечение цены из resell_amount
             price = extract_price(gift)
 
-            # Логируем поля первого подарка каждой коллекции для отладки цены
-            if not items:
-                d = getattr(gift, '__dict__', {})
-                safe = {k: v for k, v in d.items() if not k.startswith('_') and isinstance(v, (int, str, float, bool, type(None)))}
-                logger.info(f"[DEBUG] gid={gift_id} first gift fields: {safe}")
-
             items.append({
-                "owner": owner, "owner_id": opid,
-                "username": username, "name": name,
-                "title": title, "slug": slug,
-                "num": num, "price": price,
+                "owner": owner,
+                "owner_id": opid,
+                "username": username,
+                "name": name,
+                "title": title,
+                "slug": slug,
+                "num": num,
+                "price": price,
             })
+
         next_offset = getattr(result, 'next_offset', "") or ""
         return items, next_offset
+
     except FloodWaitError as e:
         logger.warning(f"FloodWait {e.seconds}s")
         await asyncio.sleep(e.seconds + 2)
@@ -330,26 +340,32 @@ async def search_market(
         is_searching = False
         return 0
 
-    logger.info(f"🔍 Поиск: {len(gift_ids_list)} коллекций, price={price_min}-{price_max}, girls={girls_only}")
+    logger.info(f"🔍 Старт поиска: {len(gift_ids_list)} коллекций, цена={price_min}-{price_max}, девушки={girls_only}")
 
     try:
         for gid in gift_ids_list:
             if not is_searching or found >= max_results:
                 break
+
             offset = ""
             empty_streak = 0
+
             while is_searching and found < max_results:
                 items, next_offset = await fetch_market_gifts(gift_id=gid, offset=offset, limit=100)
+
                 if not items:
                     empty_streak += 1
-                    if empty_streak >= 3:
+                    if empty_streak >= 2:
                         break
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)
                     continue
+
                 empty_streak = 0
+
                 for item in items:
                     if not is_searching or found >= max_results:
                         break
+
                     slug = item.get("slug", "")
                     if slug and slug in seen_slugs:
                         continue
@@ -380,10 +396,12 @@ async def search_market(
 
                     found += 1
                     stats["found"] += 1
+
                     price_text = f"⭐️ {price:,}".replace(",", " ") if price else "цена неизвестна"
                     owner_text = f"@{item['username']}" if item['username'] else f"👤 {item['name'] or 'Скрыт'}"
                     prefix = "👧 " if girls_only else ""
-                    kb = user_nft_kb(item['username'], slug, item['title'], item['num'])
+                    kb = user_nft_kb(item['username'], slug)
+
                     try:
                         await status_msg.bot.send_message(
                             chat_id=status_msg.chat.id,
@@ -393,28 +411,35 @@ async def search_market(
                                 f"💰 {price_text}"
                             ),
                             parse_mode="HTML",
-                            reply_markup=kb
+                            reply_markup=kb,
                         )
                     except Exception as e:
-                        logger.warning(f"send: {e}")
-                    await asyncio.sleep(0.1)
+                        logger.warning(f"send_message: {e}")
 
+                    await asyncio.sleep(0.05)
+
+                # Обновляем статус
                 try:
                     lbl = "👧 Девушек" if girls_only else "NFT"
                     await status_msg.edit_text(
                         f"🔍 Ищу...\n🎁 Найдено {lbl}: <b>{found}</b>",
-                        parse_mode="HTML", reply_markup=stop_kb()
+                        parse_mode="HTML",
+                        reply_markup=stop_kb(),
                     )
                 except Exception:
                     pass
+
                 if not next_offset:
                     break
+
                 offset = next_offset
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
+
     except Exception as e:
-        logger.error(f"search_market: {e}")
+        logger.error(f"search_market error: {e}")
     finally:
         is_searching = False
+
     return found
 
 
@@ -447,8 +472,10 @@ async def run_nft_search(callback: CallbackQuery, cat_key: str = None, gift_ids_
     status = await callback.message.answer(
         f"<b>{label}</b>\n\n🔍 Найдено: 0", parse_mode="HTML", reply_markup=stop_kb()
     )
-    found = await search_market(status, gift_ids_list=gift_ids_list,
-                                max_results=100, price_min=price_min, price_max=price_max)
+    found = await search_market(
+        status, gift_ids_list=gift_ids_list,
+        max_results=100, price_min=price_min, price_max=price_max
+    )
     try:
         await status.edit_text(
             f"✅ <b>Готово!</b>\n{label}\n🎁 Найдено: <b>{found}</b>",
@@ -486,8 +513,11 @@ async def run_girl_search(callback: CallbackQuery, cat_key: str = None, gift_ids
     status = await callback.message.answer(
         f"<b>{label}</b>\n\n🔍 Найдено: 0", parse_mode="HTML", reply_markup=stop_kb()
     )
-    found = await search_market(status, gift_ids_list=gift_ids_list, max_results=100,
-                                girls_only=True, price_min=price_min, price_max=price_max)
+    found = await search_market(
+        status, gift_ids_list=gift_ids_list,
+        max_results=100, girls_only=True,
+        price_min=price_min, price_max=price_max
+    )
     try:
         await status.edit_text(
             f"✅ <b>Готово!</b>\n{label}\n👧 Найдено: <b>{found}</b>",
@@ -502,25 +532,18 @@ async def run_girl_search(callback: CallbackQuery, cat_key: str = None, gift_ids
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     add_user_to_db(message.from_user.id)
-
     authorized = await check_authorized()
-
     if not authorized:
         if is_admin(message.from_user.id):
             await message.answer(
                 "⚙️ <b>Нужна авторизация Telegram</b>\n\n"
-                "Введи номер телефона аккаунта для парсинга:\n"
-                "<code>+79001234567</code>",
+                "Введи номер телефона:\n<code>+79001234567</code>",
                 parse_mode="HTML"
             )
             await state.set_state(Auth.phone)
         else:
-            await message.answer(
-                "⏳ <b>Бот настраивается</b>\n\nПопробуй позже.",
-                parse_mode="HTML"
-            )
+            await message.answer("⏳ <b>Бот настраивается</b>\n\nПопробуй позже.", parse_mode="HTML")
         return
-
     await message.answer(
         "🎁 <b>NFT Market Parser</b>\n\nПарсю маркет Telegram\n\n👇 Выбери действие:",
         parse_mode="HTML", reply_markup=main_kb()
@@ -531,10 +554,7 @@ async def cmd_start(message: Message, state: FSMContext):
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
-        await message.answer(
-            f"❌ Нет доступа.\n\nТвой ID: <code>{message.from_user.id}</code>",
-            parse_mode="HTML"
-        )
+        await message.answer(f"❌ Нет доступа.\n\nТвой ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
         return
     await state.clear()
     users = load_users()
@@ -550,7 +570,7 @@ async def cmd_admin(message: Message, state: FSMContext):
     )
 
 
-# ===================== MENU =====================
+# ===================== MENU CALLBACKS =====================
 @dp.callback_query(F.data == "menu")
 async def cb_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -566,9 +586,7 @@ async def cb_do_auth(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Только для администратора", show_alert=True)
         return
     await state.set_state(Auth.phone)
-    await callback.message.answer(
-        "📱 Введи номер телефона: <code>+79001234567</code>", parse_mode="HTML"
-    )
+    await callback.message.answer("📱 Введи номер телефона: <code>+79001234567</code>", parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data == "search_nft_menu")
@@ -694,7 +712,7 @@ async def cb_admin_broadcast(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(Broadcast.message)
     await callback.message.answer(
-        "📢 <b>Рассылка</b>\n\nОтправь сообщение (текст, фото, видео).\n\n/cancel — отмена",
+        "📢 <b>Рассылка</b>\n\nОтправь сообщение.\n/cancel — отмена",
         parse_mode="HTML", reply_markup=cancel_kb()
     )
     await callback.answer()
@@ -747,10 +765,7 @@ async def cb_admin_users(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     users = load_users()
-    await callback.message.answer(
-        f"👥 <b>Пользователей в базе: {len(users)}</b>",
-        parse_mode="HTML", reply_markup=admin_kb()
-    )
+    await callback.message.answer(f"👥 <b>Пользователей: {len(users)}</b>", parse_mode="HTML", reply_markup=admin_kb())
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_stats")
@@ -811,7 +826,7 @@ async def auth_phone(message: Message, state: FSMContext):
         await state.update_data(phone=phone, phone_code_hash=result.phone_code_hash)
         await state.set_state(Auth.code)
         await message.answer(
-            "📨 Код отправлен в Telegram.\n\nВведи код без пробелов: <code>12345</code>",
+            "📨 Код отправлен в Telegram.\n\nВведи без пробелов: <code>12345</code>",
             parse_mode="HTML"
         )
     except Exception as e:
@@ -836,24 +851,16 @@ async def auth_code(message: Message, state: FSMContext):
         )
     except SessionPasswordNeededError:
         await state.set_state(Auth.password)
-        await message.answer(
-            "🔐 Требуется пароль 2FA.\n\nВведи пароль следующим сообщением:",
-            parse_mode="HTML"
-        )
+        await message.answer("🔐 Требуется пароль 2FA.\n\nВведи пароль:", parse_mode="HTML")
     except Exception as e:
-        await message.answer(
-            f"❌ Неверный код: <code>{e}</code>\n\nПопробуй снова:",
-            parse_mode="HTML"
-        )
-        # Не сбрасываем state — ждём правильный код
+        await message.answer(f"❌ Неверный код: <code>{e}</code>\n\nПопробуй снова:", parse_mode="HTML")
 
 @dp.message(Auth.password)
 async def auth_password(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    pwd = message.text.strip()
     try:
-        await tg_client.sign_in(password=pwd)
+        await tg_client.sign_in(password=message.text.strip())
         me = await tg_client.get_me()
         await state.clear()
         await load_collections()
@@ -863,7 +870,6 @@ async def auth_password(message: Message, state: FSMContext):
             parse_mode="HTML", reply_markup=main_kb()
         )
     except Exception as e:
-        # Не сбрасываем state — даём попробовать пароль снова
         await message.answer(
             f"❌ Неверный пароль 2FA: <code>{e}</code>\n\nПопробуй ещё раз:",
             parse_mode="HTML"
@@ -888,13 +894,12 @@ async def cmd_myid(message: Message):
 
 @dp.message(Command("collections"))
 async def cmd_collections(message: Message):
-    """Показать загруженные коллекции — для отладки"""
     if not is_admin(message.from_user.id):
         return
     if not NFT_COLLECTIONS:
         await load_collections()
     text = f"📦 <b>Коллекций: {len(NFT_COLLECTIONS)}</b>\n\n"
-    for name, gid in list(NFT_COLLECTIONS.items())[:30]:
+    for name, gid in list(NFT_COLLECTIONS.items())[:40]:
         text += f"• {name} (id={gid})\n"
     await message.answer(text, parse_mode="HTML")
 
@@ -909,9 +914,9 @@ async def main():
             await load_collections()
             logger.info(f"✅ Telethon авторизован, коллекций: {len(NFT_COLLECTIONS)}")
         else:
-            logger.warning("⚠️ Telethon не авторизован — нужно пройти авторизацию через /start или /admin")
+            logger.warning("⚠️ Telethon не авторизован — пройди авторизацию через /start")
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
+        logger.error(f"Ошибка запуска: {e}")
     try:
         await dp.start_polling(bot)
     finally:
