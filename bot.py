@@ -17,7 +17,7 @@ import os
 API_ID = 28687552
 API_HASH = "1abf9a58d0c22f62437bec89bd6b27a3"
 BOT_TOKEN = "8406363273:AAF36kxfkOJiLvYPs1FBBWmPUgNcd_kX140"
-ADMIN_ID = 8726084830  # ИСПРАВЛЕНО
+ADMIN_ID = 8726084830
 SESSION_NAME = "nft_session"
 USERS_FILE = "users.json"
 # ========================
@@ -32,8 +32,6 @@ tg_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 stats = {"checks": 0, "found": 0}
 is_searching = False
 NFT_COLLECTIONS = {}
-_price_field_logged = False
-_known_price_field = None
 
 PRICE_CATEGORIES = {
     "cheap": {"label": "💚 Дешёвые",  "min": 0,     "max": 2000,  "desc": "до 2000 ⭐️"},
@@ -111,36 +109,33 @@ def is_girl(user) -> bool:
 
 
 def extract_price(gift) -> int | None:
-    global _price_field_logged, _known_price_field
-    d = getattr(gift, '__dict__', {})
-    if not _price_field_logged:
-        _price_field_logged = True
-        logger.info(f"NFT fields: { {k:str(v) for k,v in d.items() if not k.startswith('_')} }")
-    if _known_price_field:
-        val = getattr(gift, _known_price_field, None)
-        if val is not None:
-            try:
-                return int(val)
-            except Exception:
-                pass
-    for field in ['resell_stars','resale_amount','availability_resale_stars',
-                  'stars','price','cost','amount','convert_stars','total_amount','star_count']:
+    """
+    Извлекает цену перепродажи из NFT объекта.
+    Ищет только конкретные поля цены, НЕ кэширует поле глобально.
+    Ограничение: цена не может быть > 10 млн звёзд (исключает id/num/hash).
+    """
+    PRICE_FIELDS = [
+        'resell_stars',
+        'resale_amount',
+        'availability_resale_stars',
+        'stars',
+        'price',
+        'cost',
+        'amount',
+        'convert_stars',
+        'star_count',
+    ]
+    MAX_SANE_PRICE = 10_000_000  # 10 млн звёзд — потолок реальной цены
+
+    for field in PRICE_FIELDS:
         val = getattr(gift, field, None)
         if val is not None:
             try:
                 iv = int(val)
-                if iv > 0:
-                    _known_price_field = field
+                if 0 < iv <= MAX_SANE_PRICE:
                     return iv
             except Exception:
                 pass
-    SKIP = {'id','num','hash','date','access_hash','dc_id','flags','flags2'}
-    for k, v in d.items():
-        if k.startswith('_') or k in SKIP:
-            continue
-        if isinstance(v, int) and v > 0:
-            _known_price_field = k
-            return v
     return None
 
 
@@ -150,11 +145,6 @@ def main_kb():
         [InlineKeyboardButton(text="🎁 Искать NFT",     callback_data="search_nft_menu")],
         [InlineKeyboardButton(text="👧 Искать девушек",  callback_data="search_girls_menu")],
         [InlineKeyboardButton(text="📊 Статистика",      callback_data="stats")],
-    ])
-
-def auth_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔐 Авторизоваться", callback_data="do_auth")],
     ])
 
 def nft_difficulty_kb():
@@ -227,19 +217,25 @@ def girls_col_kb():
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def user_nft_kb(username: str, slug: str, title: str, num):
+    """
+    Кнопки для NFT.
+    Кнопка 'Написать' — только ссылка на NFT, без названия и #номера.
+    """
     buttons = []
     nft_url = f"https://t.me/nft/{slug}" if slug else None
+
     if username:
         buttons.append([InlineKeyboardButton(text=f"👤 @{username}", url=f"https://t.me/{username}")])
     if nft_url:
         buttons.append([InlineKeyboardButton(text="🎁 Открыть NFT", url=nft_url)])
     if username:
         if nft_url:
-            msg_text = f"Привет! Я хочу купить твой NFT {title} #{num} 👉 {nft_url}"
+            msg_text = f"Привет! Хочу купить твой NFT 👉 {nft_url}"
         else:
-            msg_text = f"Привет! Я хочу купить твой NFT {title} #{num}"
+            msg_text = "Привет! Хочу купить твой NFT"
         encoded = urllib.parse.quote(msg_text)
         buttons.append([InlineKeyboardButton(text="✉️ Написать", url=f"https://t.me/{username}?text={encoded}")])
+
     return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
 
@@ -254,7 +250,7 @@ async def load_collections():
             gift_id = getattr(gift, 'id',    None)
             if title and gift_id:
                 NFT_COLLECTIONS[title] = gift_id
-        logger.info(f"✅ Коллекций: {len(NFT_COLLECTIONS)}")
+        logger.info(f"✅ Коллекций загружено: {len(NFT_COLLECTIONS)}: {list(NFT_COLLECTIONS.keys())}")
     except Exception as e:
         logger.error(f"❌ load_collections: {e}")
 
@@ -286,6 +282,13 @@ async def fetch_market_gifts(gift_id: int, offset: str = "", limit: int = 100) -
                      or str(getattr(gift, 'num', '')))
             num   = getattr(gift, 'num', '?')
             price = extract_price(gift)
+
+            # Логируем поля первого подарка каждой коллекции для отладки цены
+            if not items:
+                d = getattr(gift, '__dict__', {})
+                safe = {k: v for k, v in d.items() if not k.startswith('_') and isinstance(v, (int, str, float, bool, type(None)))}
+                logger.info(f"[DEBUG] gid={gift_id} first gift fields: {safe}")
+
             items.append({
                 "owner": owner, "owner_id": opid,
                 "username": username, "name": name,
@@ -327,6 +330,8 @@ async def search_market(
         is_searching = False
         return 0
 
+    logger.info(f"🔍 Поиск: {len(gift_ids_list)} коллекций, price={price_min}-{price_max}, girls={girls_only}")
+
     try:
         for gid in gift_ids_list:
             if not is_searching or found >= max_results:
@@ -350,7 +355,10 @@ async def search_market(
                         continue
                     if slug:
                         seen_slugs.add(slug)
+
                     price = item.get("price")
+
+                    # Фильтр по цене
                     if price_min is not None or price_max is not None:
                         if price is None:
                             continue
@@ -358,6 +366,8 @@ async def search_market(
                             continue
                         if price_max is not None and price > price_max:
                             continue
+
+                    # Фильтр по девушкам
                     if girls_only:
                         owner = item.get("owner")
                         if not owner or not is_girl(owner):
@@ -367,6 +377,7 @@ async def search_market(
                             continue
                         if oid:
                             seen_girl_ids.add(oid)
+
                     found += 1
                     stats["found"] += 1
                     price_text = f"⭐️ {price:,}".replace(",", " ") if price else "цена неизвестна"
@@ -387,6 +398,7 @@ async def search_market(
                     except Exception as e:
                         logger.warning(f"send: {e}")
                     await asyncio.sleep(0.1)
+
                 try:
                     lbl = "👧 Девушек" if girls_only else "NFT"
                     await status_msg.edit_text(
@@ -823,15 +835,17 @@ async def auth_code(message: Message, state: FSMContext):
             parse_mode="HTML", reply_markup=main_kb()
         )
     except SessionPasswordNeededError:
-        # ИСПРАВЛЕНО: не сбрасываем state, ждём пароль
         await state.set_state(Auth.password)
         await message.answer(
             "🔐 Требуется пароль 2FA.\n\nВведи пароль следующим сообщением:",
             parse_mode="HTML"
         )
     except Exception as e:
-        await message.answer(f"❌ Неверный код: <code>{e}</code>\n\nПопробуй снова:", parse_mode="HTML")
-        # Не сбрасываем state — даём ввести код ещё раз
+        await message.answer(
+            f"❌ Неверный код: <code>{e}</code>\n\nПопробуй снова:",
+            parse_mode="HTML"
+        )
+        # Не сбрасываем state — ждём правильный код
 
 @dp.message(Auth.password)
 async def auth_password(message: Message, state: FSMContext):
@@ -849,7 +863,7 @@ async def auth_password(message: Message, state: FSMContext):
             parse_mode="HTML", reply_markup=main_kb()
         )
     except Exception as e:
-        # ИСПРАВЛЕНО: не сбрасываем state — даём попробовать пароль снова
+        # Не сбрасываем state — даём попробовать пароль снова
         await message.answer(
             f"❌ Неверный пароль 2FA: <code>{e}</code>\n\nПопробуй ещё раз:",
             parse_mode="HTML"
@@ -871,6 +885,18 @@ async def cmd_cancel(message: Message, state: FSMContext):
 @dp.message(Command("myid"))
 async def cmd_myid(message: Message):
     await message.answer(f"🆔 Твой ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
+
+@dp.message(Command("collections"))
+async def cmd_collections(message: Message):
+    """Показать загруженные коллекции — для отладки"""
+    if not is_admin(message.from_user.id):
+        return
+    if not NFT_COLLECTIONS:
+        await load_collections()
+    text = f"📦 <b>Коллекций: {len(NFT_COLLECTIONS)}</b>\n\n"
+    for name, gid in list(NFT_COLLECTIONS.items())[:30]:
+        text += f"• {name} (id={gid})\n"
+    await message.answer(text, parse_mode="HTML")
 
 
 # ===================== MAIN =====================
