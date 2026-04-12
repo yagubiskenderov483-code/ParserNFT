@@ -3,7 +3,6 @@ import logging
 import urllib.parse
 from telethon import TelegramClient
 from telethon.tl.functions.payments import GetResaleStarGiftsRequest, GetStarGiftsRequest
-from telethon.tl.types import PeerUser, StarsAmount
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -32,10 +31,10 @@ tg_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 stats = {"checks": 0, "found": 0}
 is_searching = False
-NFT_COLLECTIONS = {}  # title -> gift_id
+NFT_COLLECTIONS = {}
 
 PRICE_CATEGORIES = {
-    "cheap": {"label": "💚 Дешёвые",  "min": 0,     "max": 2000,  "desc": "до 2000 ⭐️"},
+    "cheap": {"label": "💚 Дешёвые",  "min": None,  "max": 2000,  "desc": "до 2000 ⭐️"},
     "mid":   {"label": "💛 Средние",  "min": 2001,  "max": 5000,  "desc": "2000–5000 ⭐️"},
     "hard":  {"label": "🟠 Сложные",  "min": 5001,  "max": 20000, "desc": "5000–20000 ⭐️"},
     "ultra": {"label": "🔴 Хард",     "min": 20001, "max": None,  "desc": "от 20000 ⭐️"},
@@ -82,7 +81,10 @@ class Broadcast(StatesGroup):
     message = State()
 
 
-# ===================== AUTH CHECK =====================
+# ===================== HELPERS =====================
+def is_admin(uid: int) -> bool:
+    return int(uid) == int(ADMIN_ID)
+
 async def check_authorized() -> bool:
     try:
         if not tg_client.is_connected():
@@ -90,11 +92,6 @@ async def check_authorized() -> bool:
         return await tg_client.is_user_authorized()
     except Exception:
         return False
-
-
-# ===================== HELPERS =====================
-def is_admin(uid: int) -> bool:
-    return int(uid) == int(ADMIN_ID)
 
 def is_girl(user) -> bool:
     first = (getattr(user, 'first_name', '') or '').lower().strip()
@@ -111,36 +108,96 @@ def is_girl(user) -> bool:
 
 def extract_price(gift) -> int | None:
     """
-    Цена хранится в resell_amount — список StarsAmount объектов.
-    Берём первый элемент у которого amount > 0.
+    Перебирает все возможные поля где может лежать цена.
+    Логирует структуру объекта один раз для отладки.
     """
+    d = vars(gift) if hasattr(gift, '__dict__') else {}
+
+    # Логируем один раз чтобы видеть реальные поля
+    if not hasattr(extract_price, '_logged'):
+        extract_price._logged = True
+        safe = {k: str(v)[:100] for k, v in d.items() if not k.startswith('_')}
+        logger.info(f"=== NFT gift fields ===\n{json.dumps(safe, ensure_ascii=False, indent=2)}")
+
+    # 1. resell_amount — список StarsAmount объектов (актуально для новых версий API)
     resell_amount = getattr(gift, 'resell_amount', None)
     if resell_amount:
-        for sa in resell_amount:
-            amt = getattr(sa, 'amount', None)
+        if isinstance(resell_amount, list):
+            for sa in resell_amount:
+                amt = getattr(sa, 'amount', None)
+                if amt is not None:
+                    try:
+                        v = int(amt)
+                        if v > 0:
+                            return v
+                    except Exception:
+                        pass
+        else:
+            # Может быть одним объектом
+            amt = getattr(resell_amount, 'amount', None)
             if amt is not None:
                 try:
-                    iv = int(amt)
-                    if iv > 0:
-                        return iv
+                    v = int(amt)
+                    if v > 0:
+                        return v
                 except Exception:
                     pass
+
+    # 2. Простые числовые поля
+    for field in [
+        'resell_stars', 'resale_stars', 'stars', 'price',
+        'cost', 'amount', 'star_count', 'convert_stars',
+        'total_amount', 'availability_resale_stars',
+    ]:
+        val = getattr(gift, field, None)
+        if val is not None:
+            try:
+                v = int(val)
+                if v > 0:
+                    return v
+            except Exception:
+                pass
+
+    # 3. Fallback — любое числовое поле > 100 (чтобы не поймать num/id)
+    SKIP = {'id', 'num', 'hash', 'date', 'access_hash', 'dc_id', 'flags', 'flags2',
+            'gift_id', 'sticker_id', 'pattern_id', 'backdrop_id'}
+    for k, v in d.items():
+        if k.startswith('_') or k in SKIP:
+            continue
+        if isinstance(v, int) and v > 100:
+            logger.info(f"Fallback цена: поле='{k}' значение={v}")
+            return v
+
     return None
 
 
-def extract_owner_id(gift) -> int | None:
-    """Достаём user_id из owner_id (PeerUser объект)."""
-    owner_id = getattr(gift, 'owner_id', None)
-    if owner_id is None:
-        return None
-    # PeerUser имеет .user_id
-    uid = getattr(owner_id, 'user_id', None)
-    if uid is not None:
-        return int(uid)
-    # На случай если просто int
-    if isinstance(owner_id, int):
-        return owner_id
-    return None
+def extract_owner(gift, users_map: dict):
+    """Извлекает owner из gift и users_map."""
+    owner_id_obj = getattr(gift, 'owner_id', None)
+    if owner_id_obj is None:
+        return None, None
+
+    # PeerUser
+    uid = getattr(owner_id_obj, 'user_id', None)
+    if uid is None:
+        uid = getattr(owner_id_obj, 'id', None)
+    if uid is None and isinstance(owner_id_obj, int):
+        uid = owner_id_obj
+
+    if uid is None:
+        return None, None
+
+    owner = users_map.get(int(uid))
+    return owner, int(uid)
+
+
+def format_name(owner) -> str:
+    """Возвращает имя пользователя или пустую строку."""
+    if not owner:
+        return ""
+    first = getattr(owner, 'first_name', '') or ''
+    last  = getattr(owner, 'last_name', '')  or ''
+    return f"{first} {last}".strip()
 
 
 # ===================== KEYBOARDS =====================
@@ -220,10 +277,8 @@ def girls_col_kb():
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="search_girls_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def user_nft_kb(username: str, slug: str):
-    """
-    Кнопки: профиль владельца, открыть NFT, написать (только ссылка на NFT).
-    """
+def user_nft_kb(username: str | None, slug: str | None, title: str, num) -> InlineKeyboardMarkup | None:
+    """Кнопки: профиль, открыть NFT, написать с готовым текстом."""
     buttons = []
     nft_url = f"https://t.me/nft/{slug}" if slug else None
 
@@ -232,8 +287,13 @@ def user_nft_kb(username: str, slug: str):
     if nft_url:
         buttons.append([InlineKeyboardButton(text="🎁 Открыть NFT", url=nft_url)])
     if username and nft_url:
-        msg_text = f"Привет! Хочу купить твой NFT 👉 {nft_url}"
-        encoded = urllib.parse.quote(msg_text)
+        text = f"Привет! Я хочу купить твой NFT {title} #{num} 👉 {nft_url}"
+        encoded = urllib.parse.quote(text)
+        buttons.append([InlineKeyboardButton(text="✉️ Написать", url=f"https://t.me/{username}?text={encoded}")])
+    elif username:
+        # Нет ссылки на NFT — просто открываем чат
+        text = f"Привет! Я хочу купить твой NFT {title} #{num}"
+        encoded = urllib.parse.quote(text)
         buttons.append([InlineKeyboardButton(text="✉️ Написать", url=f"https://t.me/{username}?text={encoded}")])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
@@ -250,58 +310,48 @@ async def load_collections():
             gift_id = getattr(gift, 'id',    None)
             if title and gift_id:
                 NFT_COLLECTIONS[title] = gift_id
-        logger.info(f"✅ Коллекций загружено: {len(NFT_COLLECTIONS)} — {list(NFT_COLLECTIONS.keys())}")
+        logger.info(f"✅ Коллекций: {len(NFT_COLLECTIONS)} — {list(NFT_COLLECTIONS.keys())}")
     except Exception as e:
         logger.error(f"❌ load_collections: {e}")
 
 
 # ===================== FETCH =====================
 async def fetch_market_gifts(gift_id: int, offset: str = "", limit: int = 100) -> tuple:
-    """
-    Получает список NFT на продажу для одной коллекции.
-    Возвращает (список items, next_offset).
-    """
     try:
         result = await tg_client(GetResaleStarGiftsRequest(
             gift_id=gift_id,
             offset=offset,
             limit=limit,
-            sort_by_price=True,   # сортировка по цене
         ))
 
-        # Строим словарь пользователей из ответа
         users_map = {}
         for u in (getattr(result, 'users', None) or []):
-            users_map[u.id] = u
+            users_map[int(u.id)] = u
 
         gifts = getattr(result, 'gifts', None) or []
         items = []
 
         for gift in gifts:
-            # Достаём owner_id
-            opid = extract_owner_id(gift)
-            owner = users_map.get(opid) if opid else None
+            owner, owner_uid = extract_owner(gift, users_map)
             username = getattr(owner, 'username', None) if owner else None
-            name = ""
-            if owner:
-                name = f"{owner.first_name or ''} {owner.last_name or ''}".strip()
+            name     = format_name(owner)
 
             title = getattr(gift, 'title', '?')
-            slug  = getattr(gift, 'slug', None) or str(getattr(gift, 'num', ''))
+            slug  = (getattr(gift, 'slug', None)
+                     or getattr(gift, 'unique_id', None)
+                     or str(getattr(gift, 'num', '')))
             num   = getattr(gift, 'num', '?')
-
-            # ПРАВИЛЬНОЕ извлечение цены из resell_amount
             price = extract_price(gift)
 
             items.append({
-                "owner": owner,
-                "owner_id": opid,
+                "owner":    owner,
+                "owner_id": owner_uid,
                 "username": username,
-                "name": name,
-                "title": title,
-                "slug": slug,
-                "num": num,
-                "price": price,
+                "name":     name,
+                "title":    title,
+                "slug":     slug,
+                "num":      num,
+                "price":    price,
             })
 
         next_offset = getattr(result, 'next_offset', "") or ""
@@ -331,16 +381,18 @@ async def search_market(
     seen_slugs    = set()
     seen_girl_ids = set()
 
+    # Берём ВСЕ коллекции если список не передан
     if not gift_ids_list:
         if not NFT_COLLECTIONS:
             await load_collections()
         gift_ids_list = list(NFT_COLLECTIONS.values())
 
     if not gift_ids_list:
+        logger.warning("Нет коллекций!")
         is_searching = False
         return 0
 
-    logger.info(f"🔍 Старт поиска: {len(gift_ids_list)} коллекций, цена={price_min}-{price_max}, девушки={girls_only}")
+    logger.info(f"Поиск: {len(gift_ids_list)} коллекций, цена={price_min}-{price_max}, девушки={girls_only}")
 
     try:
         for gid in gift_ids_list:
@@ -367,6 +419,8 @@ async def search_market(
                         break
 
                     slug = item.get("slug", "")
+
+                    # Дедупликация
                     if slug and slug in seen_slugs:
                         continue
                     if slug:
@@ -397,10 +451,26 @@ async def search_market(
                     found += 1
                     stats["found"] += 1
 
-                    price_text = f"⭐️ {price:,}".replace(",", " ") if price else "цена неизвестна"
-                    owner_text = f"@{item['username']}" if item['username'] else f"👤 {item['name'] or 'Скрыт'}"
+                    # Форматируем цену
+                    if price:
+                        price_text = f"⭐️ {price:,}".replace(",", " ")
+                    else:
+                        price_text = "цена неизвестна"
+
+                    # Форматируем владельца — показываем имя И юзернейм если есть
+                    username = item.get("username")
+                    name     = item.get("name", "")
+                    if username and name:
+                        owner_text = f"{name} (@{username})"
+                    elif username:
+                        owner_text = f"@{username}"
+                    elif name:
+                        owner_text = f"👤 {name}"
+                    else:
+                        owner_text = "👤 Скрыт"
+
                     prefix = "👧 " if girls_only else ""
-                    kb = user_nft_kb(item['username'], slug)
+                    kb = user_nft_kb(username, slug, item['title'], item['num'])
 
                     try:
                         await status_msg.bot.send_message(
@@ -436,7 +506,7 @@ async def search_market(
                 await asyncio.sleep(0.3)
 
     except Exception as e:
-        logger.error(f"search_market error: {e}")
+        logger.error(f"search_market: {e}")
     finally:
         is_searching = False
 
@@ -453,7 +523,7 @@ async def run_nft_search(callback: CallbackQuery, cat_key: str = None, gift_ids_
     price_min, price_max, label = None, None, "🎁 Все NFT"
     if cat_key and cat_key in PRICE_CATEGORIES:
         cat = PRICE_CATEGORIES[cat_key]
-        price_min = cat["min"] if cat["min"] > 0 else None
+        price_min = cat["min"]
         price_max = cat["max"]
         label = f"🎁 {cat['label']} ({cat['desc']})"
 
@@ -494,7 +564,7 @@ async def run_girl_search(callback: CallbackQuery, cat_key: str = None, gift_ids
     price_min, price_max, label = None, None, "👧 Девушки — все цены"
     if cat_key and cat_key in PRICE_CATEGORIES:
         cat = PRICE_CATEGORIES[cat_key]
-        price_min = cat["min"] if cat["min"] > 0 else None
+        price_min = cat["min"]
         price_max = cat["max"]
         label = f"👧 Девушки — {cat['label']} ({cat['desc']})"
 
@@ -537,7 +607,7 @@ async def cmd_start(message: Message, state: FSMContext):
         if is_admin(message.from_user.id):
             await message.answer(
                 "⚙️ <b>Нужна авторизация Telegram</b>\n\n"
-                "Введи номер телефона:\n<code>+79001234567</code>",
+                "Введи номер телефона аккаунта для парсинга:\n<code>+79001234567</code>",
                 parse_mode="HTML"
             )
             await state.set_state(Auth.phone)
@@ -570,7 +640,7 @@ async def cmd_admin(message: Message, state: FSMContext):
     )
 
 
-# ===================== MENU CALLBACKS =====================
+# ===================== CALLBACKS =====================
 @dp.callback_query(F.data == "menu")
 async def cb_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -578,15 +648,6 @@ async def cb_menu(callback: CallbackQuery, state: FSMContext):
         "🎁 <b>NFT Market Parser</b>\n\n👇 Выбери действие:",
         parse_mode="HTML", reply_markup=main_kb()
     )
-    await callback.answer()
-
-@dp.callback_query(F.data == "do_auth")
-async def cb_do_auth(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Только для администратора", show_alert=True)
-        return
-    await state.set_state(Auth.phone)
-    await callback.message.answer("📱 Введи номер телефона: <code>+79001234567</code>", parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data == "search_nft_menu")
@@ -600,44 +661,34 @@ async def cb_search_girls_menu(callback: CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(F.data == "nft_all")
-async def cb_nft_all(callback: CallbackQuery):
-    await run_nft_search(callback)
+async def cb_nft_all(c: CallbackQuery): await run_nft_search(c)
 
 @dp.callback_query(F.data == "nft_cheap")
-async def cb_nft_cheap(callback: CallbackQuery):
-    await run_nft_search(callback, "cheap")
+async def cb_nft_cheap(c: CallbackQuery): await run_nft_search(c, "cheap")
 
 @dp.callback_query(F.data == "nft_mid")
-async def cb_nft_mid(callback: CallbackQuery):
-    await run_nft_search(callback, "mid")
+async def cb_nft_mid(c: CallbackQuery): await run_nft_search(c, "mid")
 
 @dp.callback_query(F.data == "nft_hard")
-async def cb_nft_hard(callback: CallbackQuery):
-    await run_nft_search(callback, "hard")
+async def cb_nft_hard(c: CallbackQuery): await run_nft_search(c, "hard")
 
 @dp.callback_query(F.data == "nft_ultra")
-async def cb_nft_ultra(callback: CallbackQuery):
-    await run_nft_search(callback, "ultra")
+async def cb_nft_ultra(c: CallbackQuery): await run_nft_search(c, "ultra")
 
 @dp.callback_query(F.data == "girl_all")
-async def cb_girl_all(callback: CallbackQuery):
-    await run_girl_search(callback)
+async def cb_girl_all(c: CallbackQuery): await run_girl_search(c)
 
 @dp.callback_query(F.data == "girl_cheap")
-async def cb_girl_cheap(callback: CallbackQuery):
-    await run_girl_search(callback, "cheap")
+async def cb_girl_cheap(c: CallbackQuery): await run_girl_search(c, "cheap")
 
 @dp.callback_query(F.data == "girl_mid")
-async def cb_girl_mid(callback: CallbackQuery):
-    await run_girl_search(callback, "mid")
+async def cb_girl_mid(c: CallbackQuery): await run_girl_search(c, "mid")
 
 @dp.callback_query(F.data == "girl_hard")
-async def cb_girl_hard(callback: CallbackQuery):
-    await run_girl_search(callback, "hard")
+async def cb_girl_hard(c: CallbackQuery): await run_girl_search(c, "hard")
 
 @dp.callback_query(F.data == "girl_ultra")
-async def cb_girl_ultra(callback: CallbackQuery):
-    await run_girl_search(callback, "ultra")
+async def cb_girl_ultra(c: CallbackQuery): await run_girl_search(c, "ultra")
 
 @dp.callback_query(F.data == "girl_col")
 async def cb_girl_col(callback: CallbackQuery):
@@ -708,27 +759,24 @@ async def cb_stats(callback: CallbackQuery):
 # ===================== ADMIN CALLBACKS =====================
 @dp.callback_query(F.data == "admin_broadcast")
 async def cb_admin_broadcast(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
+    if not is_admin(callback.from_user.id): return
     await state.set_state(Broadcast.message)
     await callback.message.answer(
-        "📢 <b>Рассылка</b>\n\nОтправь сообщение.\n/cancel — отмена",
+        "📢 <b>Рассылка</b>\n\nОтправь сообщение (текст, фото, видео).\n/cancel — отмена",
         parse_mode="HTML", reply_markup=cancel_kb()
     )
     await callback.answer()
 
 @dp.message(Broadcast.message)
 async def broadcast_get_msg(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
+    if not is_admin(message.from_user.id): return
     await state.update_data(broadcast_msg_id=message.message_id, broadcast_chat_id=message.chat.id)
     await state.set_state(None)
     await message.answer("✅ Подтверди рассылку:", reply_markup=confirm_broadcast_kb())
 
 @dp.callback_query(F.data == "admin_broadcast_confirm")
 async def cb_broadcast_confirm(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
+    if not is_admin(callback.from_user.id): return
     data = await state.get_data()
     msg_id  = data.get("broadcast_msg_id")
     chat_id = data.get("broadcast_chat_id")
@@ -736,9 +784,7 @@ async def cb_broadcast_confirm(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Сообщение не найдено", show_alert=True)
         return
     users = load_users()
-    status = await callback.message.answer(
-        f"📢 Рассылка для <b>{len(users)}</b> пользователей...", parse_mode="HTML"
-    )
+    status = await callback.message.answer(f"📢 Рассылка для <b>{len(users)}</b> пользователей...", parse_mode="HTML")
     await callback.answer()
     ok, fail = 0, 0
     for i, uid in enumerate(users):
@@ -749,10 +795,8 @@ async def cb_broadcast_confirm(callback: CallbackQuery, state: FSMContext):
             logger.warning(f"Broadcast {uid}: {e}")
             fail += 1
         if (i + 1) % 20 == 0:
-            try:
-                await status.edit_text(f"📢 Отправляю... ({i+1}/{len(users)})")
-            except Exception:
-                pass
+            try: await status.edit_text(f"📢 Отправляю... ({i+1}/{len(users)})")
+            except Exception: pass
         await asyncio.sleep(0.05)
     await status.edit_text(
         f"✅ <b>Готово!</b>\n✅ Отправлено: <b>{ok}</b>\n❌ Ошибок: <b>{fail}</b>",
@@ -762,16 +806,14 @@ async def cb_broadcast_confirm(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "admin_users")
 async def cb_admin_users(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
+    if not is_admin(callback.from_user.id): return
     users = load_users()
     await callback.message.answer(f"👥 <b>Пользователей: {len(users)}</b>", parse_mode="HTML", reply_markup=admin_kb())
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_stats")
 async def cb_admin_stats(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
+    if not is_admin(callback.from_user.id): return
     users = load_users()
     await callback.message.answer(
         f"📊 <b>Статистика</b>\n\n👥 Пользователей: <b>{len(users)}</b>\n"
@@ -782,8 +824,7 @@ async def cb_admin_stats(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "admin_auth")
 async def cb_admin_auth(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
+    if not is_admin(callback.from_user.id): return
     await state.clear()
     await callback.message.answer("📱 Введи номер: <code>+79001234567</code>", parse_mode="HTML")
     await state.set_state(Auth.phone)
@@ -791,8 +832,7 @@ async def cb_admin_auth(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "admin_logout")
 async def cb_admin_logout(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
+    if not is_admin(callback.from_user.id): return
     try:
         await tg_client.log_out()
     except Exception:
@@ -802,18 +842,16 @@ async def cb_admin_logout(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "admin_cancel")
 async def cb_admin_cancel(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
+    if not is_admin(callback.from_user.id): return
     await state.clear()
     await callback.message.answer("❌ Отменено", reply_markup=admin_kb())
     await callback.answer()
 
 
-# ===================== AUTH HANDLERS =====================
+# ===================== AUTH =====================
 @dp.message(Auth.phone)
 async def auth_phone(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
+    if not is_admin(message.from_user.id): return
     phone = message.text.strip()
     if not phone.startswith("+"):
         await message.answer("❌ Формат: <code>+79001234567</code>", parse_mode="HTML")
@@ -825,18 +863,14 @@ async def auth_phone(message: Message, state: FSMContext):
         result = await tg_client.send_code_request(phone)
         await state.update_data(phone=phone, phone_code_hash=result.phone_code_hash)
         await state.set_state(Auth.code)
-        await message.answer(
-            "📨 Код отправлен в Telegram.\n\nВведи без пробелов: <code>12345</code>",
-            parse_mode="HTML"
-        )
+        await message.answer("📨 Код отправлен в Telegram.\n\nВведи без пробелов: <code>12345</code>", parse_mode="HTML")
     except Exception as e:
         await message.answer(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
         await state.clear()
 
 @dp.message(Auth.code)
 async def auth_code(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
+    if not is_admin(message.from_user.id): return
     code = message.text.strip().replace(" ", "")
     data = await state.get_data()
     try:
@@ -851,14 +885,13 @@ async def auth_code(message: Message, state: FSMContext):
         )
     except SessionPasswordNeededError:
         await state.set_state(Auth.password)
-        await message.answer("🔐 Требуется пароль 2FA.\n\nВведи пароль:", parse_mode="HTML")
+        await message.answer("🔐 Требуется пароль 2FA:\n\nВведи пароль:")
     except Exception as e:
-        await message.answer(f"❌ Неверный код: <code>{e}</code>\n\nПопробуй снова:", parse_mode="HTML")
+        await message.answer(f"❌ Неверный код: <code>{e}</code>", parse_mode="HTML")
 
 @dp.message(Auth.password)
 async def auth_password(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
+    if not is_admin(message.from_user.id): return
     try:
         await tg_client.sign_in(password=message.text.strip())
         me = await tg_client.get_me()
@@ -870,15 +903,11 @@ async def auth_password(message: Message, state: FSMContext):
             parse_mode="HTML", reply_markup=main_kb()
         )
     except Exception as e:
-        await message.answer(
-            f"❌ Неверный пароль 2FA: <code>{e}</code>\n\nПопробуй ещё раз:",
-            parse_mode="HTML"
-        )
+        await message.answer(f"❌ Неверный пароль 2FA: <code>{e}</code>\n\nПопробуй ещё раз:", parse_mode="HTML")
 
 @dp.message(Command("auth"))
 async def cmd_auth(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
+    if not is_admin(message.from_user.id): return
     await state.clear()
     await message.answer("📱 Введи номер: <code>+79001234567</code>", parse_mode="HTML")
     await state.set_state(Auth.phone)
@@ -894,8 +923,7 @@ async def cmd_myid(message: Message):
 
 @dp.message(Command("collections"))
 async def cmd_collections(message: Message):
-    if not is_admin(message.from_user.id):
-        return
+    if not is_admin(message.from_user.id): return
     if not NFT_COLLECTIONS:
         await load_collections()
     text = f"📦 <b>Коллекций: {len(NFT_COLLECTIONS)}</b>\n\n"
