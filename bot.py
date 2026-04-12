@@ -14,12 +14,17 @@ import json
 import os
 
 # ========================
-API_ID = 28687552
-API_HASH = "1abf9a58d0c22f62437bec89bd6b27a3"
-BOT_TOKEN = "8406363273:AAF36kxfkOJiLvYPs1FBBWmPUgNcd_kX140"
-ADMIN_ID = 8726084830
-SESSION_NAME = "nft_session"
-USERS_FILE = "users.json"
+from dotenv import load_dotenv
+load_dotenv()
+
+# ========================
+API_ID       = int(os.getenv("API_ID"))
+API_HASH     = os.getenv("API_HASH")
+BOT_TOKEN    = os.getenv("BOT_TOKEN")
+ADMIN_ID     = int(os.getenv("ADMIN_ID"))
+SESSION_NAME = os.getenv("SESSION_NAME", "nft_session")
+USERS_FILE   = os.getenv("USERS_FILE",   "users.json")
+# ========================
 # ========================
 
 logging.basicConfig(level=logging.INFO)
