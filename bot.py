@@ -13,13 +13,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ======================== CONFIG ========================
-API_ID       = 28687552
-API_HASH     = "1abf9a58d0c22f62437bec89bd6b27a3"
-BOT_TOKEN    = "8406363273:AAF36kxfkOJiLvYPs1FBBWmPUgNcd_kX140"
-ADMIN_ID     = 8726084830
+# ===== ВАШИ ДАННЫЕ (вставьте сюда) =====
+API_ID = 28687552
+API_HASH = "1abf9a58d0c22f62437bec89bd6b27a3"
+BOT_TOKEN = "8406363273:AAF2L-LfRhUVMrbVLeZBLLI7IgkFoMtyfGM"
+ADMIN_ID = 8726084830
 SESSION_NAME = "nft_session"
-USERS_FILE   = "users.json"
+USERS_FILE = "users.json"
 # ========================================================
 
 logging.basicConfig(level=logging.INFO)
