@@ -52,15 +52,21 @@ PRICE_CATEGORIES = {
     },
     "hard": {
         "label": "Сложные",
-        "desc": "5000-100000 звёзд",
-        "min": 5000, "max": 100000,
-        "tol_min": 2000, "tol_max": 103000,
+        "desc": "5000-20000 звёзд",
+        "min": 5000, "max": 20000,
+        "tol_min": 4500, "tol_max": 21000,
     },
     "ultra": {
         "label": "Хард",
+        "desc": "20000-100000 звёзд",
+        "min": 20000, "max": 100000,
+        "tol_min": 19000, "tol_max": 103000,
+    },
+    "extreme": {
+        "label": "Экстрим",
         "desc": "от 100000 звёзд",
         "min": 100000, "max": None,
-        "tol_min": 93000, "tol_max": None,
+        "tol_min": 95000, "tol_max": None,
     },
 }
 
@@ -414,26 +420,28 @@ def main_kb():
 
 def market_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Все NFT на продаже",       callback_data="mkt_all")],
-        [InlineKeyboardButton(text="Дешёвые (до 2000 звёзд)",  callback_data="mkt_cheap")],
-        [InlineKeyboardButton(text="Средние (2000-5000 звёзд)", callback_data="mkt_mid")],
-        [InlineKeyboardButton(text="Сложные (5000-100000 звёзд)", callback_data="mkt_hard")],
-        [InlineKeyboardButton(text="Хард (100000+ звёзд)",     callback_data="mkt_ultra")],
-        [InlineKeyboardButton(text="По коллекции",             callback_data="mkt_col")],
-        [InlineKeyboardButton(text="Только девушки",           callback_data="mkt_girls")],
-        [InlineKeyboardButton(text="Назад",                    callback_data="menu")],
+        [InlineKeyboardButton(text="Все NFT на продаже (2+ гифта)",  callback_data="mkt_all")],
+        [InlineKeyboardButton(text="Дешёвые (до 2000 звёзд)",        callback_data="mkt_cheap")],
+        [InlineKeyboardButton(text="Средние (2000-5000 звёзд)",      callback_data="mkt_mid")],
+        [InlineKeyboardButton(text="Сложные (5000-20000 звёзд)",     callback_data="mkt_hard")],
+        [InlineKeyboardButton(text="Хард (20000-100000 звёзд)",      callback_data="mkt_ultra")],
+        [InlineKeyboardButton(text="Экстрим (100000+ звёзд)",        callback_data="mkt_extreme")],
+        [InlineKeyboardButton(text="По коллекции",                   callback_data="mkt_col")],
+        [InlineKeyboardButton(text="Только девушки",                 callback_data="mkt_girls")],
+        [InlineKeyboardButton(text="Назад",                          callback_data="menu")],
     ])
 
 def profile_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Все профили",               callback_data="prf_all")],
-        [InlineKeyboardButton(text="Дешёвые (до 2000 звёзд)",  callback_data="prf_cheap")],
-        [InlineKeyboardButton(text="Средние (2000-5000 звёзд)", callback_data="prf_mid")],
-        [InlineKeyboardButton(text="Сложные (5000-100000 звёзд)", callback_data="prf_hard")],
-        [InlineKeyboardButton(text="Хард (100000+ звёзд)",     callback_data="prf_ultra")],
-        [InlineKeyboardButton(text="По коллекции",             callback_data="prf_col")],
-        [InlineKeyboardButton(text="Только девушки",           callback_data="prf_girls")],
-        [InlineKeyboardButton(text="Назад",                    callback_data="menu")],
+        [InlineKeyboardButton(text="Все профили (2+ гифта)",         callback_data="prf_all")],
+        [InlineKeyboardButton(text="Дешёвые (до 2000 звёзд)",        callback_data="prf_cheap")],
+        [InlineKeyboardButton(text="Средние (2000-5000 звёзд)",      callback_data="prf_mid")],
+        [InlineKeyboardButton(text="Сложные (5000-20000 звёзд)",     callback_data="prf_hard")],
+        [InlineKeyboardButton(text="Хард (20000-100000 звёзд)",      callback_data="prf_ultra")],
+        [InlineKeyboardButton(text="Экстрим (100000+ звёзд)",        callback_data="prf_extreme")],
+        [InlineKeyboardButton(text="По коллекции",                   callback_data="prf_col")],
+        [InlineKeyboardButton(text="Только девушки",                 callback_data="prf_girls")],
+        [InlineKeyboardButton(text="Назад",                          callback_data="menu")],
     ])
 
 def stop_kb():
@@ -524,57 +532,140 @@ async def do_market_search(
 ) -> int:
     """
     Поиск гифтов на рынке.
-    Round-robin по коллекциям: берём по одному гифту из каждой коллекции
-    поочерёдно, чтобы результаты чередовались.
-    Реальная цена из resell_amount.
+    Режим "все NFT" (cat=None): показываем только владельцев у которых 2+ гифта на продаже,
+    выводим все их гифты. NFT ссылка в тексте сообщения.
+    Режим с категорией: обычная фильтрация по цене, показываем каждый гифт.
+    Round-robin по коллекциям.
     """
     global is_searching
     is_searching = True
-    found        = 0
-    seen_slugs   = set()
-    owner_count: dict[int, int] = {}
-    MAX_PER_OWNER    = 2
+    found            = 0
+    seen_slugs       = set()
     has_price_filter = cat is not None
 
-    async def send_nft(item):
-        price     = item["price"]
-        owner_str = fmt_owner(item["owner"], item["username"], item["name"])
-        price_str = f"{price:,} звёзд".replace(",", " ") if price else "цена неизвестна"
-        kb = nft_kb(item, has_price_filter=has_price_filter)
+    # Для режима "все NFT" — собираем гифты по владельцам
+    # owner_id -> {"owner": obj, "username": str, "name": str, "profile_url": str, "items": []}
+    owner_buckets: dict[int, dict] = {}
+    # Для режима с ценой — просто показываем каждый подходящий гифт
+    owner_count_cat: dict[int, int] = {}
+    MAX_PER_OWNER_CAT = 3  # в режиме по цене — не более 3 с одного
+
+    async def send_owner_block(owner_uid: int, bucket: dict):
+        """Отправляет все гифты владельца одним или несколькими сообщениями"""
+        nonlocal found
+        items       = bucket["items"]
+        owner_str   = fmt_owner(bucket["owner"], bucket["username"], bucket["name"])
+        profile_url = bucket["profile_url"]
+        username    = bucket["username"]
+
+        # Формируем список ссылок на NFT
+        nft_lines = []
+        for it in items:
+            title   = it.get("title", "?")
+            num     = it.get("num", "?")
+            price   = it.get("price")
+            nft_url = it.get("nft_url")
+            price_str = f"{price:,}".replace(",", " ") if price else "?"
+            if nft_url:
+                nft_lines.append(f'<a href="{nft_url}">{title} #{num}</a> - {price_str} звёзд')
+            else:
+                nft_lines.append(f"{title} #{num} - {price_str} звёзд")
+
+        nft_block = "\n".join(nft_lines)
+
+        btns = []
+        if profile_url:
+            label = f"@{username}" if username else "Профиль"
+            btns.append([InlineKeyboardButton(text=label, url=profile_url)])
+        if username:
+            write_text = f"Привет! Хочу купить твои NFT"
+            btns.append([InlineKeyboardButton(
+                text="Написать",
+                url=f"https://t.me/{username}?text={urllib.parse.quote(write_text)}"
+            )])
+        kb = InlineKeyboardMarkup(inline_keyboard=btns) if btns else None
+
         try:
             await status_msg.bot.send_message(
                 chat_id=status_msg.chat.id,
                 text=(
-                    f"<b>{item['title']} #{item['num']}</b>\n"
-                    f"Владелец: {owner_str}\n"
+                    f"<b>Владелец: {owner_str}</b>\n"
+                    f"Гифтов на продаже: {len(items)}\n\n"
+                    f"{nft_block}"
+                ),
+                parse_mode="HTML",
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            found += len(items)
+            stats["found"] += len(items)
+        except Exception as e:
+            logger.warning(f"send_owner_block: {e}")
+
+    async def send_nft_single(item: dict):
+        """Отправляет один гифт с ценовым фильтром"""
+        nonlocal found
+        price     = item["price"]
+        owner_str = fmt_owner(item["owner"], item["username"], item["name"])
+        price_str = f"{price:,} звёзд".replace(",", " ") if price else "цена неизвестна"
+        nft_url   = item.get("nft_url")
+        title     = item.get("title", "?")
+        num       = item.get("num", "?")
+
+        nft_link = f'\n<a href="{nft_url}">{title} #{num}</a>' if nft_url else f"\n{title} #{num}"
+
+        username    = item.get("username")
+        profile_url = item.get("profile_url")
+        btns = []
+        if nft_url:
+            btns.append([InlineKeyboardButton(text="Открыть NFT", url=nft_url)])
+        if profile_url:
+            label = f"@{username}" if username else "Профиль"
+            btns.append([InlineKeyboardButton(text=label, url=profile_url)])
+        if username:
+            write_text = f"Привет! Хочу купить твой NFT {nft_url or title}"
+            btns.append([InlineKeyboardButton(
+                text="Написать",
+                url=f"https://t.me/{username}?text={urllib.parse.quote(write_text)}"
+            )])
+        kb = InlineKeyboardMarkup(inline_keyboard=btns) if btns else None
+
+        try:
+            await status_msg.bot.send_message(
+                chat_id=status_msg.chat.id,
+                text=(
+                    f"<b>Владелец: {owner_str}</b>"
+                    f"{nft_link}\n"
                     f"Цена: {price_str} (на продаже)"
                 ),
                 parse_mode="HTML",
                 reply_markup=kb,
+                disable_web_page_preview=True,
             )
+            found         += 1
+            stats["found"] += 1
         except Exception as e:
-            logger.warning(f"send: {e}")
+            logger.warning(f"send_nft_single: {e}")
 
     try:
-        # Состояние каждой коллекции: offset или None (закончилась)
         offsets: dict[int, str | None] = {gid: "" for gid in gift_ids}
-        # Буфер отфильтрованных элементов на отправку по каждой коллекции
-        buffers: dict[int, list] = {gid: [] for gid in gift_ids}
+        buffers: dict[int, list]       = {gid: [] for gid in gift_ids}
         last_status_update = 0
 
-        while is_searching and found < max_results:
+        while is_searching and (found < max_results if has_price_filter else True):
             active_gids = [gid for gid, off in offsets.items() if off is not None or buffers[gid]]
             if not active_gids:
                 break
 
             made_progress = False
 
-            # Round-robin: берём по одному из каждой активной коллекции
             for gid in list(active_gids):
-                if not is_searching or found >= max_results:
+                if not is_searching:
+                    break
+                if has_price_filter and found >= max_results:
                     break
 
-                # Если буфер пустой и ещё есть страницы — подгружаем
+                # Подгружаем страницу если буфер пуст
                 if not buffers[gid] and offsets.get(gid) is not None:
                     items, next_offset = await fetch_market_page(gid, offsets[gid], limit=50)
                     offsets[gid] = next_offset if next_offset else None
@@ -586,40 +677,73 @@ async def do_market_search(
                         if slug:
                             seen_slugs.add(slug)
 
-                        owner_id = item["owner_id"]
-                        if owner_id:
-                            cnt = owner_count.get(owner_id, 0)
-                            if cnt >= MAX_PER_OWNER:
-                                continue
-                            owner_count[owner_id] = cnt + 1
-
                         if girls_only and not is_girl(item["owner"]):
                             continue
 
                         price = item.get("price")
-                        if cat and price is not None:
-                            if not price_in_category(price, cat):
+
+                        if has_price_filter:
+                            # Режим по цене: фильтруем и сразу в буфер
+                            if price is not None and not price_in_category(price, cat):
                                 continue
+                            owner_id = item["owner_id"]
+                            if owner_id:
+                                cnt = owner_count_cat.get(owner_id, 0)
+                                if cnt >= MAX_PER_OWNER_CAT:
+                                    continue
+                                owner_count_cat[owner_id] = cnt + 1
+                            buffers[gid].append(item)
+                        else:
+                            # Режим "все NFT": группируем по владельцу
+                            owner_id = item["owner_id"]
+                            if owner_id:
+                                if owner_id not in owner_buckets:
+                                    profile_url = None
+                                    username = item.get("username")
+                                    if username:
+                                        profile_url = f"https://t.me/{username}"
+                                    elif owner_id:
+                                        profile_url = f"tg://user?id={owner_id}"
+                                    owner_buckets[owner_id] = {
+                                        "owner": item["owner"],
+                                        "username": username,
+                                        "name": item["name"],
+                                        "profile_url": profile_url,
+                                        "items": [],
+                                    }
+                                owner_buckets[owner_id]["items"].append(item)
 
-                        buffers[gid].append(item)
-
-                # Берём один элемент из буфера этой коллекции
-                if buffers[gid]:
+                if has_price_filter and buffers[gid]:
                     item = buffers[gid].pop(0)
-                    found         += 1
-                    stats["found"] += 1
-                    made_progress  = True
-                    await send_nft(item)
+                    made_progress = True
+                    await send_nft_single(item)
                     await asyncio.sleep(0.05)
+
+            # В режиме "все NFT" — после каждого прохода по всем коллекциям
+            # отправляем владельцев у которых уже 2+ гифта
+            if not has_price_filter:
+                to_send = [
+                    (uid, bucket) for uid, bucket in list(owner_buckets.items())
+                    if len(bucket["items"]) >= 2
+                ]
+                for uid, bucket in to_send:
+                    if not is_searching:
+                        break
+                    await send_owner_block(uid, bucket)
+                    del owner_buckets[uid]
+                    made_progress = True
+                    await asyncio.sleep(0.1)
 
             now = asyncio.get_event_loop().time()
             if now - last_status_update > 3:
                 try:
                     active_count = sum(1 for v in offsets.values() if v is not None)
                     lbl = "девушек" if girls_only else "NFT"
+                    pending = sum(len(b["items"]) for b in owner_buckets.values())
                     await status_msg.edit_text(
-                        f"Ищу на рынке... (коллекций активно: {active_count})\n"
-                        f"Найдено {lbl}: <b>{found}</b>",
+                        f"Ищу на рынке... (коллекций: {active_count})\n"
+                        f"Найдено {lbl}: <b>{found}</b>"
+                        + (f"\nВ ожидании: {pending}" if not has_price_filter else ""),
                         parse_mode="HTML", reply_markup=stop_kb(),
                     )
                     last_status_update = now
@@ -628,6 +752,15 @@ async def do_market_search(
 
             if not made_progress:
                 break
+
+        # В режиме "все NFT" — в конце отправляем оставшихся с 2+ гифтами
+        if not has_price_filter and is_searching:
+            for uid, bucket in list(owner_buckets.items()):
+                if not is_searching:
+                    break
+                if len(bucket["items"]) >= 2:
+                    await send_owner_block(uid, bucket)
+                    await asyncio.sleep(0.1)
 
     except Exception as e:
         logger.error(f"do_market_search error: {e}")
@@ -1046,17 +1179,19 @@ async def cb_profile_menu(cb: CallbackQuery):
 
 # ===================== CALLBACKS — РЫНОК =====================
 @dp.callback_query(F.data == "mkt_all")
-async def cb_mkt_all(cb: CallbackQuery):   await start_market_search(cb)
+async def cb_mkt_all(cb: CallbackQuery):     await start_market_search(cb)
 @dp.callback_query(F.data == "mkt_cheap")
-async def cb_mkt_cheap(cb: CallbackQuery): await start_market_search(cb, "cheap")
+async def cb_mkt_cheap(cb: CallbackQuery):   await start_market_search(cb, "cheap")
 @dp.callback_query(F.data == "mkt_mid")
-async def cb_mkt_mid(cb: CallbackQuery):   await start_market_search(cb, "mid")
+async def cb_mkt_mid(cb: CallbackQuery):     await start_market_search(cb, "mid")
 @dp.callback_query(F.data == "mkt_hard")
-async def cb_mkt_hard(cb: CallbackQuery):  await start_market_search(cb, "hard")
+async def cb_mkt_hard(cb: CallbackQuery):    await start_market_search(cb, "hard")
 @dp.callback_query(F.data == "mkt_ultra")
-async def cb_mkt_ultra(cb: CallbackQuery): await start_market_search(cb, "ultra")
+async def cb_mkt_ultra(cb: CallbackQuery):   await start_market_search(cb, "ultra")
+@dp.callback_query(F.data == "mkt_extreme")
+async def cb_mkt_extreme(cb: CallbackQuery): await start_market_search(cb, "extreme")
 @dp.callback_query(F.data == "mkt_girls")
-async def cb_mkt_girls(cb: CallbackQuery): await start_market_search(cb, girls=True)
+async def cb_mkt_girls(cb: CallbackQuery):   await start_market_search(cb, girls=True)
 
 @dp.callback_query(F.data == "mkt_col")
 async def cb_mkt_col(cb: CallbackQuery):
@@ -1080,17 +1215,19 @@ async def cb_mktcol(cb: CallbackQuery):
 
 # ===================== CALLBACKS — ПРОФИЛИ =====================
 @dp.callback_query(F.data == "prf_all")
-async def cb_prf_all(cb: CallbackQuery):   await start_profile_search(cb)
+async def cb_prf_all(cb: CallbackQuery):     await start_profile_search(cb)
 @dp.callback_query(F.data == "prf_cheap")
-async def cb_prf_cheap(cb: CallbackQuery): await start_profile_search(cb, "cheap")
+async def cb_prf_cheap(cb: CallbackQuery):   await start_profile_search(cb, "cheap")
 @dp.callback_query(F.data == "prf_mid")
-async def cb_prf_mid(cb: CallbackQuery):   await start_profile_search(cb, "mid")
+async def cb_prf_mid(cb: CallbackQuery):     await start_profile_search(cb, "mid")
 @dp.callback_query(F.data == "prf_hard")
-async def cb_prf_hard(cb: CallbackQuery):  await start_profile_search(cb, "hard")
+async def cb_prf_hard(cb: CallbackQuery):    await start_profile_search(cb, "hard")
 @dp.callback_query(F.data == "prf_ultra")
-async def cb_prf_ultra(cb: CallbackQuery): await start_profile_search(cb, "ultra")
+async def cb_prf_ultra(cb: CallbackQuery):   await start_profile_search(cb, "ultra")
+@dp.callback_query(F.data == "prf_extreme")
+async def cb_prf_extreme(cb: CallbackQuery): await start_profile_search(cb, "extreme")
 @dp.callback_query(F.data == "prf_girls")
-async def cb_prf_girls(cb: CallbackQuery): await start_profile_search(cb, girls=True)
+async def cb_prf_girls(cb: CallbackQuery):   await start_profile_search(cb, girls=True)
 
 @dp.callback_query(F.data == "prf_col")
 async def cb_prf_col(cb: CallbackQuery):
