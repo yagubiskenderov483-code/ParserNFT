@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import urllib.parse
@@ -876,9 +877,7 @@ async def cmd_start(message: Message, state: FSMContext):
                 parse_mode="HTML"
             )
             await state.set_state(Auth.phone)
-        else:
-            await message.answer("⏳ <b>Бот настраивается</b>\n\nПопробуй позже.", parse_mode="HTML")
-        return
+            return
     await message.answer(
         "🎁 <b>NFT Market Parser</b>\n\n"
         "🏪 <b>Рынок</b> — гифты выставленные на продажу\n"
