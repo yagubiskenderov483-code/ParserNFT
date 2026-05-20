@@ -411,70 +411,106 @@ async def fetch_saved_gifts_page(user_id: int, offset: str, limit: int = 50) -> 
 
 
 # ===================== KEYBOARDS =====================
+
+# Главное меню
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Поиск по рынку",    callback_data="search_market_menu")],
-        [InlineKeyboardButton(text="Поиск по профилям", callback_data="search_profile_menu")],
-        [InlineKeyboardButton(text="Статистика",         callback_data="stats")],
+        [InlineKeyboardButton(text="🔍 Поиск", callback_data="search_menu")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
     ])
 
+# Меню поиска — выбор режима
+def search_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 По ценам",      callback_data="mode_price")],
+        [InlineKeyboardButton(text="👧 Девушки",       callback_data="mode_girls")],
+        [InlineKeyboardButton(text="🏪 По рынку",      callback_data="mode_market")],
+        [InlineKeyboardButton(text="👤 С профиля",     callback_data="mode_profile")],
+        [InlineKeyboardButton(text="🗂 По коллекции",  callback_data="mode_col")],
+        [InlineKeyboardButton(text="◀️ Назад",         callback_data="menu")],
+    ])
+
+# По ценам — выбор диапазона (рынок + профиль вместе)
+def price_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💚 Дешёвые (до 2000)",       callback_data="price_cheap")],
+        [InlineKeyboardButton(text="💛 Средние (2000-5000)",     callback_data="price_mid")],
+        [InlineKeyboardButton(text="🟠 Сложные (5000-20000)",    callback_data="price_hard")],
+        [InlineKeyboardButton(text="🔴 Хард (20000-100000)",     callback_data="price_ultra")],
+        [InlineKeyboardButton(text="💀 Экстрим (100000+)",       callback_data="price_extreme")],
+        [InlineKeyboardButton(text="◀️ Назад",                   callback_data="search_menu")],
+    ])
+
+# Девушки — выбор источника
+def girls_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏪 Девушки на рынке",    callback_data="girls_market")],
+        [InlineKeyboardButton(text="👤 Девушки в профилях",  callback_data="girls_profile")],
+        [InlineKeyboardButton(text="◀️ Назад",               callback_data="search_menu")],
+    ])
+
+# По рынку — выбор фильтра
 def market_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Все NFT на продаже (2+ гифта)",  callback_data="mkt_all")],
-        [InlineKeyboardButton(text="Дешёвые (до 2000 звёзд)",        callback_data="mkt_cheap")],
-        [InlineKeyboardButton(text="Средние (2000-5000 звёзд)",      callback_data="mkt_mid")],
-        [InlineKeyboardButton(text="Сложные (5000-20000 звёзд)",     callback_data="mkt_hard")],
-        [InlineKeyboardButton(text="Хард (20000-100000 звёзд)",      callback_data="mkt_ultra")],
-        [InlineKeyboardButton(text="Экстрим (100000+ звёзд)",        callback_data="mkt_extreme")],
-        [InlineKeyboardButton(text="По коллекции",                   callback_data="mkt_col")],
-        [InlineKeyboardButton(text="Только девушки",                 callback_data="mkt_girls")],
-        [InlineKeyboardButton(text="Назад",                          callback_data="menu")],
+        [InlineKeyboardButton(text="📦 Все NFT (2+ гифта)",      callback_data="mkt_all")],
+        [InlineKeyboardButton(text="💚 Дешёвые (до 2000)",       callback_data="mkt_cheap")],
+        [InlineKeyboardButton(text="💛 Средние (2000-5000)",     callback_data="mkt_mid")],
+        [InlineKeyboardButton(text="🟠 Сложные (5000-20000)",    callback_data="mkt_hard")],
+        [InlineKeyboardButton(text="🔴 Хард (20000-100000)",     callback_data="mkt_ultra")],
+        [InlineKeyboardButton(text="💀 Экстрим (100000+)",       callback_data="mkt_extreme")],
+        [InlineKeyboardButton(text="◀️ Назад",                   callback_data="search_menu")],
     ])
 
+# С профиля — выбор фильтра
 def profile_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Все профили (2+ гифта)",         callback_data="prf_all")],
-        [InlineKeyboardButton(text="Дешёвые (до 2000 звёзд)",        callback_data="prf_cheap")],
-        [InlineKeyboardButton(text="Средние (2000-5000 звёзд)",      callback_data="prf_mid")],
-        [InlineKeyboardButton(text="Сложные (5000-20000 звёзд)",     callback_data="prf_hard")],
-        [InlineKeyboardButton(text="Хард (20000-100000 звёзд)",      callback_data="prf_ultra")],
-        [InlineKeyboardButton(text="Экстрим (100000+ звёзд)",        callback_data="prf_extreme")],
-        [InlineKeyboardButton(text="По коллекции",                   callback_data="prf_col")],
-        [InlineKeyboardButton(text="Только девушки",                 callback_data="prf_girls")],
-        [InlineKeyboardButton(text="Назад",                          callback_data="menu")],
+        [InlineKeyboardButton(text="📦 Все профили (2+ гифта)",  callback_data="prf_all")],
+        [InlineKeyboardButton(text="💚 Дешёвые (до 2000)",       callback_data="prf_cheap")],
+        [InlineKeyboardButton(text="💛 Средние (2000-5000)",     callback_data="prf_mid")],
+        [InlineKeyboardButton(text="🟠 Сложные (5000-20000)",    callback_data="prf_hard")],
+        [InlineKeyboardButton(text="🔴 Хард (20000-100000)",     callback_data="prf_ultra")],
+        [InlineKeyboardButton(text="💀 Экстрим (100000+)",       callback_data="prf_extreme")],
+        [InlineKeyboardButton(text="◀️ Назад",                   callback_data="search_menu")],
+    ])
+
+# По коллекции — выбор источника
+def col_source_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏪 Рынок по коллекции",   callback_data="col_market")],
+        [InlineKeyboardButton(text="👤 Профиль по коллекции", callback_data="col_profile")],
+        [InlineKeyboardButton(text="◀️ Назад",                callback_data="search_menu")],
     ])
 
 def stop_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="СТОП", callback_data="stop_search")],
+        [InlineKeyboardButton(text="⏹ СТОП", callback_data="stop_search")],
     ])
 
 def menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Рынок",   callback_data="search_market_menu")],
-        [InlineKeyboardButton(text="Профили", callback_data="search_profile_menu")],
-        [InlineKeyboardButton(text="Меню",    callback_data="menu")],
+        [InlineKeyboardButton(text="🔍 Поиск", callback_data="search_menu")],
+        [InlineKeyboardButton(text="🏠 Меню",  callback_data="menu")],
     ])
 
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Рассылка",       callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="Пользователи",   callback_data="admin_users")],
-        [InlineKeyboardButton(text="Статистика",     callback_data="admin_stats")],
-        [InlineKeyboardButton(text="Авторизация TG", callback_data="admin_auth")],
-        [InlineKeyboardButton(text="Выйти из TG",    callback_data="admin_logout")],
-        [InlineKeyboardButton(text="В меню",         callback_data="menu")],
+        [InlineKeyboardButton(text="📢 Рассылка",       callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="👥 Пользователи",   callback_data="admin_users")],
+        [InlineKeyboardButton(text="📊 Статистика",     callback_data="admin_stats")],
+        [InlineKeyboardButton(text="🔐 Авторизация TG", callback_data="admin_auth")],
+        [InlineKeyboardButton(text="🚪 Выйти из TG",    callback_data="admin_logout")],
+        [InlineKeyboardButton(text="◀️ В меню",         callback_data="menu")],
     ])
 
 def cancel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Отмена", callback_data="admin_cancel")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")],
     ])
 
 def confirm_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Отправить", callback_data="admin_broadcast_confirm")],
-        [InlineKeyboardButton(text="Отмена",    callback_data="admin_cancel")],
+        [InlineKeyboardButton(text="✅ Отправить", callback_data="admin_broadcast_confirm")],
+        [InlineKeyboardButton(text="❌ Отмена",    callback_data="admin_cancel")],
     ])
 
 def col_kb(names: list, prefix: str, back: str) -> InlineKeyboardMarkup:
@@ -484,41 +520,42 @@ def col_kb(names: list, prefix: str, back: str) -> InlineKeyboardMarkup:
         if i + 1 < len(names):
             row.append(InlineKeyboardButton(text=names[i+1], callback_data=f"{prefix}{i+1}"))
         rows.append(row)
-    rows.append([InlineKeyboardButton(text="Назад", callback_data=back)])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=back)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def nft_kb(item: dict, has_price_filter: bool = False) -> InlineKeyboardMarkup | None:
+def owner_gifts_kb(items: list, username: str | None, profile_url: str | None) -> InlineKeyboardMarkup | None:
+    """Клавиатура для блока владельца с несколькими гифтами"""
+    btns = []
+    if profile_url:
+        label = f"👤 @{username}" if username else "👤 Профиль"
+        btns.append([InlineKeyboardButton(text=label, url=profile_url)])
+    if username:
+        write_text = "Привет! Хочу купить твои NFT"
+        btns.append([InlineKeyboardButton(
+            text="✉️ Написать",
+            url=f"https://t.me/{username}?text={urllib.parse.quote(write_text)}"
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=btns) if btns else None
+
+def nft_single_kb(item: dict) -> InlineKeyboardMarkup | None:
+    """Клавиатура для одного гифта (поиск по цене)"""
     username    = item.get("username")
     nft_url     = item.get("nft_url")
     profile_url = item.get("profile_url")
     title       = item.get("title", "")
     num         = item.get("num", "")
     btns        = []
-
-    if has_price_filter:
-        if nft_url:
-            btns.append([InlineKeyboardButton(text="Открыть NFT", url=nft_url)])
-        elif title:
-            fragment_url = f"https://fragment.com/gifts/{urllib.parse.quote(title)}"
-            btns.append([InlineKeyboardButton(text="Найти на Fragment", url=fragment_url)])
-    else:
-        if profile_url:
-            btns.append([InlineKeyboardButton(text="Все гифты владельца", url=profile_url)])
-
+    if nft_url:
+        btns.append([InlineKeyboardButton(text="🎁 Открыть NFT", url=nft_url)])
     if profile_url:
-        label = f"@{username}" if username else "Профиль"
+        label = f"👤 @{username}" if username else "👤 Профиль"
         btns.append([InlineKeyboardButton(text=label, url=profile_url)])
-
     if username:
-        if nft_url and has_price_filter:
-            write_text = f"Привет! Хочу купить твой NFT {nft_url}"
-        else:
-            write_text = f"Привет! Хочу купить твой NFT {title} #{num}"
+        write_text = f"Привет! Хочу купить твой NFT {nft_url or (title + ' #' + str(num))}"
         btns.append([InlineKeyboardButton(
-            text="Написать",
+            text="✉️ Написать",
             url=f"https://t.me/{username}?text={urllib.parse.quote(write_text)}"
         )])
-
     return InlineKeyboardMarkup(inline_keyboard=btns) if btns else None
 
 
@@ -583,14 +620,14 @@ async def do_market_search(
                 text="Написать",
                 url=f"https://t.me/{username}?text={urllib.parse.quote(write_text)}"
             )])
-        kb = InlineKeyboardMarkup(inline_keyboard=btns) if btns else None
+        kb = owner_gifts_kb(items, username, profile_url)
 
         try:
             await status_msg.bot.send_message(
                 chat_id=status_msg.chat.id,
                 text=(
-                    f"<b>Владелец: {owner_str}</b>\n"
-                    f"Гифтов на продаже: {len(items)}\n\n"
+                    f"<b>👤 {owner_str}</b>\n"
+                    f"Гифтов на продаже: <b>{len(items)}</b>\n\n"
                     f"{nft_block}"
                 ),
                 parse_mode="HTML",
@@ -628,15 +665,15 @@ async def do_market_search(
                 text="Написать",
                 url=f"https://t.me/{username}?text={urllib.parse.quote(write_text)}"
             )])
-        kb = InlineKeyboardMarkup(inline_keyboard=btns) if btns else None
+        kb = nft_single_kb(item)
 
         try:
             await status_msg.bot.send_message(
                 chat_id=status_msg.chat.id,
                 text=(
-                    f"<b>Владелец: {owner_str}</b>"
+                    f"<b>👤 {owner_str}</b>"
                     f"{nft_link}\n"
-                    f"Цена: {price_str} (на продаже)"
+                    f"💰 Цена: <b>{price_str}</b>"
                 ),
                 parse_mode="HTML",
                 reply_markup=kb,
@@ -1097,10 +1134,9 @@ async def cmd_start(message: Message, state: FSMContext):
             await state.set_state(Auth.phone)
             return
     await message.answer(
-        "<b>NFT Market Parser</b>\n\n"
-        "<b>Рынок</b> - гифты выставленные на продажу\n"
-        "<b>Профили</b> - сохранённые гифты владельцев (не на продаже)\n\n"
-        "Выбери режим:",
+        "<b>🌊 Neptun Parser</b>\n"
+        "<i>лучший парсер для поиска мамонтёнка!</i>\n\n"
+        "Нажми кнопку ниже чтобы начать поиск NFT гифтов:",
         parse_mode="HTML", reply_markup=main_kb()
     )
 
@@ -1158,26 +1194,55 @@ async def cmd_cancel(message: Message, state: FSMContext):
 async def cb_menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.answer(
-        "<b>NFT Market Parser</b>\n\n"
-        "<b>Рынок</b> - гифты на продаже\n"
-        "<b>Профили</b> - сохранённые гифты владельцев\n\n"
-        "Выбери режим:",
+        "<b>🌊 Neptun Parser</b>\n"
+        "<i>лучший парсер для поиска мамонтёнка!</i>\n\n"
+        "Нажми кнопку ниже чтобы начать поиск NFT гифтов:",
         parse_mode="HTML", reply_markup=main_kb()
     )
     await cb.answer()
 
-@dp.callback_query(F.data == "search_market_menu")
-async def cb_market_menu(cb: CallbackQuery):
-    await cb.message.answer("<b>Поиск по рынку</b>\n\nВыбери категорию:", parse_mode="HTML", reply_markup=market_menu_kb())
+@dp.callback_query(F.data == "search_menu")
+async def cb_search_menu(cb: CallbackQuery):
+    await cb.message.answer(
+        "<b>🔍 Выбери режим поиска:</b>",
+        parse_mode="HTML", reply_markup=search_menu_kb()
+    )
     await cb.answer()
 
-@dp.callback_query(F.data == "search_profile_menu")
-async def cb_profile_menu(cb: CallbackQuery):
-    await cb.message.answer("<b>Поиск по профилям</b>\n\nВыбери категорию:", parse_mode="HTML", reply_markup=profile_menu_kb())
+# --- По ценам ---
+@dp.callback_query(F.data == "mode_price")
+async def cb_mode_price(cb: CallbackQuery):
+    await cb.message.answer("<b>💰 Поиск по ценам</b>\n\nВыбери диапазон:", parse_mode="HTML", reply_markup=price_menu_kb())
     await cb.answer()
 
+@dp.callback_query(F.data == "price_cheap")
+async def cb_price_cheap(cb: CallbackQuery):   await start_market_search(cb, "cheap")
+@dp.callback_query(F.data == "price_mid")
+async def cb_price_mid(cb: CallbackQuery):     await start_market_search(cb, "mid")
+@dp.callback_query(F.data == "price_hard")
+async def cb_price_hard(cb: CallbackQuery):    await start_market_search(cb, "hard")
+@dp.callback_query(F.data == "price_ultra")
+async def cb_price_ultra(cb: CallbackQuery):   await start_market_search(cb, "ultra")
+@dp.callback_query(F.data == "price_extreme")
+async def cb_price_extreme(cb: CallbackQuery): await start_market_search(cb, "extreme")
 
-# ===================== CALLBACKS — РЫНОК =====================
+# --- Девушки ---
+@dp.callback_query(F.data == "mode_girls")
+async def cb_mode_girls(cb: CallbackQuery):
+    await cb.message.answer("<b>👧 Поиск девушек</b>\n\nВыбери источник:", parse_mode="HTML", reply_markup=girls_menu_kb())
+    await cb.answer()
+
+@dp.callback_query(F.data == "girls_market")
+async def cb_girls_market(cb: CallbackQuery):  await start_market_search(cb, girls=True)
+@dp.callback_query(F.data == "girls_profile")
+async def cb_girls_profile(cb: CallbackQuery): await start_profile_search(cb, girls=True)
+
+# --- По рынку ---
+@dp.callback_query(F.data == "mode_market")
+async def cb_mode_market(cb: CallbackQuery):
+    await cb.message.answer("<b>🏪 Поиск по рынку</b>\n\nВыбери фильтр:", parse_mode="HTML", reply_markup=market_menu_kb())
+    await cb.answer()
+
 @dp.callback_query(F.data == "mkt_all")
 async def cb_mkt_all(cb: CallbackQuery):     await start_market_search(cb)
 @dp.callback_query(F.data == "mkt_cheap")
@@ -1190,30 +1255,13 @@ async def cb_mkt_hard(cb: CallbackQuery):    await start_market_search(cb, "hard
 async def cb_mkt_ultra(cb: CallbackQuery):   await start_market_search(cb, "ultra")
 @dp.callback_query(F.data == "mkt_extreme")
 async def cb_mkt_extreme(cb: CallbackQuery): await start_market_search(cb, "extreme")
-@dp.callback_query(F.data == "mkt_girls")
-async def cb_mkt_girls(cb: CallbackQuery):   await start_market_search(cb, girls=True)
 
-@dp.callback_query(F.data == "mkt_col")
-async def cb_mkt_col(cb: CallbackQuery):
-    if not NFT_COLLECTIONS:
-        await load_collections()
-    if not NFT_COLLECTIONS:
-        await cb.message.answer("Коллекции не загружены", reply_markup=menu_kb())
-        await cb.answer()
-        return
-    await cb.message.answer("Выбери коллекцию:", parse_mode="HTML",
-                             reply_markup=col_kb(list(NFT_COLLECTIONS.keys()), "mktcol_", "search_market_menu"))
+# --- С профиля ---
+@dp.callback_query(F.data == "mode_profile")
+async def cb_mode_profile(cb: CallbackQuery):
+    await cb.message.answer("<b>👤 Поиск по профилям</b>\n\nВыбери фильтр:", parse_mode="HTML", reply_markup=profile_menu_kb())
     await cb.answer()
 
-@dp.callback_query(F.data.startswith("mktcol_"))
-async def cb_mktcol(cb: CallbackQuery):
-    idx = int(cb.data[7:])
-    lst = list(NFT_COLLECTIONS.items())
-    if idx >= len(lst): await cb.answer("Не найдено", show_alert=True); return
-    await start_market_search(cb, ids=[lst[idx][1]])
-
-
-# ===================== CALLBACKS — ПРОФИЛИ =====================
 @dp.callback_query(F.data == "prf_all")
 async def cb_prf_all(cb: CallbackQuery):     await start_profile_search(cb)
 @dp.callback_query(F.data == "prf_cheap")
@@ -1226,20 +1274,41 @@ async def cb_prf_hard(cb: CallbackQuery):    await start_profile_search(cb, "har
 async def cb_prf_ultra(cb: CallbackQuery):   await start_profile_search(cb, "ultra")
 @dp.callback_query(F.data == "prf_extreme")
 async def cb_prf_extreme(cb: CallbackQuery): await start_profile_search(cb, "extreme")
-@dp.callback_query(F.data == "prf_girls")
-async def cb_prf_girls(cb: CallbackQuery):   await start_profile_search(cb, girls=True)
 
-@dp.callback_query(F.data == "prf_col")
-async def cb_prf_col(cb: CallbackQuery):
+# --- По коллекции ---
+@dp.callback_query(F.data == "mode_col")
+async def cb_mode_col(cb: CallbackQuery):
     if not NFT_COLLECTIONS:
         await load_collections()
     if not NFT_COLLECTIONS:
         await cb.message.answer("Коллекции не загружены", reply_markup=menu_kb())
         await cb.answer()
         return
-    await cb.message.answer("Выбери коллекцию:",
-                             reply_markup=col_kb(list(NFT_COLLECTIONS.keys()), "prfcol_", "search_profile_menu"))
+    await cb.message.answer("<b>🗂 По коллекции</b>\n\nВыбери источник:", parse_mode="HTML", reply_markup=col_source_kb())
     await cb.answer()
+
+@dp.callback_query(F.data == "col_market")
+async def cb_col_market(cb: CallbackQuery):
+    if not NFT_COLLECTIONS:
+        await load_collections()
+    await cb.message.answer("🏪 <b>Выбери коллекцию (рынок):</b>", parse_mode="HTML",
+                             reply_markup=col_kb(list(NFT_COLLECTIONS.keys()), "mktcol_", "mode_col"))
+    await cb.answer()
+
+@dp.callback_query(F.data == "col_profile")
+async def cb_col_profile(cb: CallbackQuery):
+    if not NFT_COLLECTIONS:
+        await load_collections()
+    await cb.message.answer("👤 <b>Выбери коллекцию (профили):</b>", parse_mode="HTML",
+                             reply_markup=col_kb(list(NFT_COLLECTIONS.keys()), "prfcol_", "mode_col"))
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("mktcol_"))
+async def cb_mktcol(cb: CallbackQuery):
+    idx = int(cb.data[7:])
+    lst = list(NFT_COLLECTIONS.items())
+    if idx >= len(lst): await cb.answer("Не найдено", show_alert=True); return
+    await start_market_search(cb, ids=[lst[idx][1]])
 
 @dp.callback_query(F.data.startswith("prfcol_"))
 async def cb_prfcol(cb: CallbackQuery):
