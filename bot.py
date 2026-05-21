@@ -41,10 +41,11 @@ NFT_COLLECTIONS = {}   # title -> gid
 PRICE_FLOOR_CACHE: dict[int, int] = {}
 
 # Диапазон поиска для пользователей (user_id -> процент от floor)
-# По умолчанию 100% — показываем гифты в диапазоне floor*0.7 .. floor*1.5
-# Можно буст: от 10% до 200%
-USER_BOOST: dict[int, int] = {}  # user_id -> boost_percent (10..200)
-DEFAULT_BOOST = 100  # 100% = стандартный диапазон
+USER_BOOST: dict[int, int] = {}    # user_id -> boost_percent (50..200)
+DEFAULT_BOOST = 100
+# Минимум NFT у владельца для показа
+USER_MIN_NFT: dict[int, int] = {}  # user_id -> min_nft (2..10)
+DEFAULT_MIN_NFT = 2
 
 # Категории цен по floor
 PRICE_CATEGORIES = {
@@ -118,6 +119,9 @@ def get_user_count() -> int:
 
 def get_boost(uid: int) -> int:
     return USER_BOOST.get(uid, DEFAULT_BOOST)
+
+def get_min_nft(uid: int) -> int:
+    return USER_MIN_NFT.get(uid, DEFAULT_MIN_NFT)
 
 
 # ===================== STATES =====================
@@ -286,9 +290,12 @@ def floor_in_category(floor: int, cat: str) -> bool:
 def price_ok_for_floor(price: int, floor: int, boost: int) -> bool:
     """
     Проверяет что цена гифта в разумном диапазоне от floor коллекции.
-    boost=100 -> диапазон floor*0.7 .. floor*(1 + boost/100)
+    boost=100 -> диапазон floor*0.7 .. floor*2.0
     boost=200 -> диапазон floor*0.7 .. floor*3.0
+    floor=0 -> любая цена проходит
     """
+    if floor == 0:
+        return True
     factor = boost / 100.0
     low  = floor * 0.7
     high = floor * (1.0 + factor)
@@ -400,23 +407,39 @@ def main_kb():
 
 def search_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 По ценам",     callback_data="mode_price")],
-        [InlineKeyboardButton(text="👧 Девушки",      callback_data="mode_girls")],
-        [InlineKeyboardButton(text="🏪 По рынку",     callback_data="mode_market")],
-        [InlineKeyboardButton(text="👤 С профиля",    callback_data="mode_profile")],
-        [InlineKeyboardButton(text="🗂 По коллекции", callback_data="mode_col")],
-        [InlineKeyboardButton(text="◀️ Назад",        callback_data="menu")],
+        [InlineKeyboardButton(text="💰 По ценам — рынок",    callback_data="mode_price_market")],
+        [InlineKeyboardButton(text="💰 По ценам — профиль",  callback_data="mode_price_profile")],
+        [InlineKeyboardButton(text="👧 Девушки — рынок",     callback_data="girls_market")],
+        [InlineKeyboardButton(text="👧 Девушки — профиль",   callback_data="girls_profile")],
+        [InlineKeyboardButton(text="🏪 Все NFT с рынка",     callback_data="mkt_all")],
+        [InlineKeyboardButton(text="👤 Все NFT с профилей",  callback_data="prf_all")],
+        [InlineKeyboardButton(text="🗂 По коллекции",        callback_data="mode_col")],
+        [InlineKeyboardButton(text="◀️ Назад",               callback_data="menu")],
+    ])
+
+def price_market_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💚 Дешёвые (до 2 000)",       callback_data="mkt_cheap")],
+        [InlineKeyboardButton(text="💛 Средние (2 000-5 000)",    callback_data="mkt_mid")],
+        [InlineKeyboardButton(text="🟠 Сложные (5 000-20 000)",   callback_data="mkt_hard")],
+        [InlineKeyboardButton(text="🔴 Хард (20 000-100 000)",    callback_data="mkt_ultra")],
+        [InlineKeyboardButton(text="💀 Экстрим (100 000+)",       callback_data="mkt_extreme")],
+        [InlineKeyboardButton(text="◀️ Назад",                    callback_data="search_menu")],
+    ])
+
+def price_profile_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💚 Дешёвые (до 2 000)",       callback_data="prfcat_cheap")],
+        [InlineKeyboardButton(text="💛 Средние (2 000-5 000)",    callback_data="prfcat_mid")],
+        [InlineKeyboardButton(text="🟠 Сложные (5 000-20 000)",   callback_data="prfcat_hard")],
+        [InlineKeyboardButton(text="🔴 Хард (20 000-100 000)",    callback_data="prfcat_ultra")],
+        [InlineKeyboardButton(text="💀 Экстрим (100 000+)",       callback_data="prfcat_extreme")],
+        [InlineKeyboardButton(text="◀️ Назад",                    callback_data="search_menu")],
     ])
 
 def price_menu_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💚 Дешёвые (до 2 000)",       callback_data="price_cheap")],
-        [InlineKeyboardButton(text="💛 Средние (2 000-5 000)",    callback_data="price_mid")],
-        [InlineKeyboardButton(text="🟠 Сложные (5 000-20 000)",   callback_data="price_hard")],
-        [InlineKeyboardButton(text="🔴 Хард (20 000-100 000)",    callback_data="price_ultra")],
-        [InlineKeyboardButton(text="💀 Экстрим (100 000+)",       callback_data="price_extreme")],
-        [InlineKeyboardButton(text="◀️ Назад",                    callback_data="search_menu")],
-    ])
+    # Оставляем для совместимости
+    return price_market_kb()
 
 def girls_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -471,14 +494,20 @@ def admin_kb():
         [InlineKeyboardButton(text="◀️ В меню",         callback_data="menu")],
     ])
 
-def neptun_panel_kb():
+def neptun_panel_kb(boost: int = 100, min_nft: int = 2):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📈 Буст x1.5 (150%)", callback_data="boost_150")],
-        [InlineKeyboardButton(text="📈 Буст x2 (200%)",   callback_data="boost_200")],
-        [InlineKeyboardButton(text="📉 Стандарт (100%)",  callback_data="boost_100")],
-        [InlineKeyboardButton(text="📉 Мини (50%)",       callback_data="boost_50")],
-        [InlineKeyboardButton(text="📉 Мини (30%)",       callback_data="boost_30")],
-        [InlineKeyboardButton(text="◀️ В меню",           callback_data="menu")],
+        [InlineKeyboardButton(text=f"--- Диапазон цен (буст): {boost}% ---", callback_data="noop")],
+        [InlineKeyboardButton(text="📈 x1.5 (150%)", callback_data="boost_150"),
+         InlineKeyboardButton(text="📈 x2 (200%)",   callback_data="boost_200")],
+        [InlineKeyboardButton(text="✅ Стандарт (100%)", callback_data="boost_100"),
+         InlineKeyboardButton(text="📉 Мини (50%)",  callback_data="boost_50")],
+        [InlineKeyboardButton(text=f"--- Мин. NFT у владельца: {min_nft} ---", callback_data="noop")],
+        [InlineKeyboardButton(text="2 NFT", callback_data="minnft_2"),
+         InlineKeyboardButton(text="3 NFT", callback_data="minnft_3"),
+         InlineKeyboardButton(text="5 NFT", callback_data="minnft_5")],
+        [InlineKeyboardButton(text="7 NFT", callback_data="minnft_7"),
+         InlineKeyboardButton(text="10 NFT",callback_data="minnft_10")],
+        [InlineKeyboardButton(text="◀️ В меню", callback_data="menu")],
     ])
 
 def cancel_kb():
@@ -539,6 +568,7 @@ async def do_market_search(
     girls_only: bool = False,
     max_results: int = 150,
     boost: int = 100,
+    min_nft: int = 2,
 ) -> int:
     """
     Поиск на рынке.
@@ -554,27 +584,40 @@ async def do_market_search(
     seen_slugs    = set()
     has_cat       = cat is not None
 
-    # Шаг 1: загружаем floor и фильтруем коллекции
-    await status_msg.edit_text(
-        "Анализирую коллекции...", reply_markup=stop_kb()
-    )
+    # Шаг 1: если есть категория — грузим floor и фильтруем коллекции
+    #         если нет категории — берём все коллекции сразу без floor
     valid_gids: list[tuple[int, int]] = []  # (gid, floor)
-    for i in range(0, len(gift_ids), 5):
-        if not is_searching:
-            break
-        batch   = gift_ids[i:i+5]
-        floors  = await asyncio.gather(*[get_floor_price(g) for g in batch])
-        for gid, floor in zip(batch, floors):
-            if floor is None:
-                continue
-            if cat and not floor_in_category(floor, cat):
-                continue
-            valid_gids.append((gid, floor))
-        await asyncio.sleep(0.3)
+
+    if cat:
+        await status_msg.edit_text(
+            "Анализирую коллекции по цене...", reply_markup=stop_kb()
+        )
+        for i in range(0, len(gift_ids), 5):
+            if not is_searching:
+                break
+            batch  = gift_ids[i:i+5]
+            floors = await asyncio.gather(*[get_floor_price(g) for g in batch])
+            for gid, floor in zip(batch, floors):
+                if floor is None:
+                    # Нет floor — берём с floor=0 чтобы не пропускать коллекцию
+                    valid_gids.append((gid, 0))
+                    continue
+                if not floor_in_category(floor, cat):
+                    continue
+                valid_gids.append((gid, floor))
+            await asyncio.sleep(0.2)
+    else:
+        # Без категории — все коллекции, floor=0 (не используется)
+        valid_gids = [(gid, 0) for gid in gift_ids]
 
     if not valid_gids:
         is_searching = False
         return 0
+
+    await status_msg.edit_text(
+        f"Поиск запущен... (коллекций: {len(valid_gids)})\nНайдено: 0",
+        parse_mode="HTML", reply_markup=stop_kb()
+    )
 
     # Шаг 2: поиск round-robin
     offsets: dict[int, str | None] = {gid: "" for gid, _ in valid_gids}
@@ -594,16 +637,16 @@ async def do_market_search(
             if not is_searching:
                 break
             lines = []
-            for it in bucket["items"]:
+            for idx, it in enumerate(bucket["items"], 1):
                 title   = it.get("title", "?")
                 num     = it.get("num", "?")
                 price   = it.get("price")
                 nft_url = it.get("nft_url")
                 price_str = f"{price:,}".replace(",", " ") if price else "?"
                 if nft_url:
-                    lines.append(f'<a href="{nft_url}">{title} #{num}</a> - {price_str} zv')
+                    lines.append(f'{idx}. <a href="{nft_url}">{title} #{num}</a> — {price_str} zv')
                 else:
-                    lines.append(f"{title} #{num} - {price_str} zv")
+                    lines.append(f"{idx}. {title} #{num} — {price_str} zv")
             owner_str   = fmt_owner(bucket["owner"], bucket["username"], bucket["name"])
             profile_url = bucket["profile_url"]
             username    = bucket["username"]
@@ -629,8 +672,8 @@ async def do_market_search(
 
     try:
         while is_searching and found < max_results:
-            active = [gid for gid, off in offsets.items() if off is not None or buffers[gid]]
-            if not active:
+            active = [gid for gid, off in offsets.items() if off is not None]
+            if not active and not owner_buckets and not owner_buckets_cat:
                 break
             made = False
 
@@ -640,7 +683,7 @@ async def do_market_search(
                 floor = floor_map[gid]
 
                 # Подгружаем страницу
-                if not buffers[gid] and offsets.get(gid) is not None:
+                if offsets.get(gid) is not None:
                     items, nxt     = await fetch_market_page(gid, offsets[gid], limit=50)
                     offsets[gid]   = nxt if nxt else None
 
@@ -687,13 +730,14 @@ async def do_market_search(
                         if len(bucket_store[owner_id]["items"]) < MAX_PER_OWNER_CAT:
                             bucket_store[owner_id]["items"].append(item)
 
-            # Сбрасываем готовых владельцев (оба режима, минимум 2 гифта)
+            # Сбрасываем готовых владельцев (оба режима)
             if not has_cat:
-                await flush_bucket(owner_buckets, min_gifts=2)
+                await flush_bucket(owner_buckets, min_gifts=min_nft)
                 made = True
             else:
-                await flush_bucket(owner_buckets_cat, min_gifts=2)
-                made = bool([b for b in owner_buckets_cat.values() if b["items"]])
+                await flush_bucket(owner_buckets_cat, min_gifts=min_nft)
+                # made=True если ещё есть страницы или гифты в буфере
+                made = bool(active) or bool(owner_buckets_cat)
 
             now = asyncio.get_event_loop().time()
             if now - last_upd > 3:
@@ -711,17 +755,16 @@ async def do_market_search(
                 except Exception:
                     pass
 
+            # Выходим только если нет активных страниц И нечего ждать в буферах
             if not active:
-                break
-            if not made and has_cat:
                 break
 
         # Финальный сброс — оба режима
         if is_searching:
             if not has_cat:
-                await flush_bucket(owner_buckets, min_gifts=2)
+                await flush_bucket(owner_buckets, min_gifts=min_nft)
             else:
-                await flush_bucket(owner_buckets_cat, min_gifts=2)
+                await flush_bucket(owner_buckets_cat, min_gifts=min_nft)
 
     except Exception as e:
         logger.error(f"do_market_search: {e}")
@@ -736,6 +779,8 @@ async def do_profile_search(
     gift_ids: list[int],
     girls_only: bool = False,
     max_results: int = 150,
+    cat: str | None = None,
+    min_nft: int = 2,
 ) -> int:
     """
     Поиск по профилям:
@@ -825,20 +870,20 @@ async def do_profile_search(
                 # Только гифты с NFT ссылкой
                 nft_gifts = [g for g in all_gifts if g.get("nft_url")]
 
-                if len(nft_gifts) < 2:
-                    continue  # меньше 2 нфт — пропускаем
+                if len(nft_gifts) < min_nft:
+                    continue  # меньше min_nft — пропускаем
 
                 profile_url = (f"https://t.me/{username}" if username
                                else f"tg://user?id={uid}")
                 owner_str   = fmt_owner(owner_obj, username, name)
 
-                # Формируем список ссылок
+                # Формируем список ссылок с номерами
                 lines = []
-                for g in nft_gifts:
+                for i, g in enumerate(nft_gifts, 1):
                     title   = g.get("title", "?")
                     num     = g.get("num", "?")
                     nft_url = g.get("nft_url")
-                    lines.append(f'<a href="{nft_url}">{title} #{num}</a>')
+                    lines.append(f'{i}. <a href="{nft_url}">{title} #{num}</a>')
 
                 kb = owner_kb(username, profile_url)
                 try:
@@ -900,15 +945,16 @@ async def run_market(cb: CallbackQuery, cat: str | None = None,
     if not ids:
         await cb.message.answer("Коллекции не загружены.", reply_markup=menu_kb())
         return
-    boost = get_boost(cb.from_user.id)
-    label = "Девушки на рынке" if girls else (
-        PRICE_CATEGORIES[cat]["label"] if cat else "Все NFT (2+ гифта)"
+    boost   = get_boost(cb.from_user.id)
+    min_nft = get_min_nft(cb.from_user.id)
+    label   = "Девушки на рынке" if girls else (
+        PRICE_CATEGORIES[cat]["label"] if cat else f"Все NFT ({min_nft}+ гифта)"
     )
     status = await cb.message.answer(
-        f"<b>{label}</b>\nБуст: {boost}%\n\nНайдено: 0",
+        f"<b>{label}</b>\nБуст: {boost}% | Мин. NFT: {min_nft}\n\nНайдено: 0",
         parse_mode="HTML", reply_markup=stop_kb()
     )
-    found = await do_market_search(status, ids, cat=cat, girls_only=girls, boost=boost)
+    found = await do_market_search(status, ids, cat=cat, girls_only=girls, boost=boost, min_nft=min_nft)
     try:
         await status.edit_text(
             f"<b>Готово!</b> {label}\nНайдено: <b>{found}</b>",
@@ -917,7 +963,7 @@ async def run_market(cb: CallbackQuery, cat: str | None = None,
     except Exception:
         pass
 
-async def run_profile(cb: CallbackQuery, girls: bool = False, ids: list | None = None):
+async def run_profile(cb: CallbackQuery, girls: bool = False, ids: list | None = None, cat: str | None = None):
     global is_searching
     if is_searching:
         await cb.answer("Поиск уже идёт!", show_alert=True)
@@ -929,12 +975,14 @@ async def run_profile(cb: CallbackQuery, girls: bool = False, ids: list | None =
     if not ids:
         await cb.message.answer("Коллекции не загружены.", reply_markup=menu_kb())
         return
-    label = "Девушки (профили)" if girls else "Все профили (2+ NFT)"
+    min_nft = get_min_nft(cb.from_user.id)
+    cat_label = f" ({PRICE_CATEGORIES[cat]['desc']})" if cat else ""
+    label = f"Девушки (профили){cat_label}" if girls else f"Все профили ({min_nft}+ NFT){cat_label}"
     status = await cb.message.answer(
         f"<b>{label}</b>\n\nСобираю владельцев...",
         parse_mode="HTML", reply_markup=stop_kb()
     )
-    found = await do_profile_search(status, ids, girls_only=girls)
+    found = await do_profile_search(status, ids, girls_only=girls, cat=cat, min_nft=min_nft)
     try:
         await status.edit_text(
             f"<b>Готово!</b> {label}\nНайдено: <b>{found}</b>",
@@ -973,17 +1021,25 @@ async def cmd_clear(message: Message):
 
 @dp.message(Command("neptunteam"))
 async def cmd_neptunteam(message: Message):
-    boost = get_boost(message.from_user.id)
+    boost   = get_boost(message.from_user.id)
+    min_nft = get_min_nft(message.from_user.id)
     await message.answer(
         f"<b>🌊 Neptun Team Panel</b>\n\n"
-        f"Текущий буст диапазона: <b>{boost}%</b>\n\n"
-        f"Буст влияет на диапазон цен при поиске:\n"
-        f"100% = floor x1.0 .. floor x2.0\n"
-        f"150% = floor x1.0 .. floor x2.5\n"
-        f"200% = floor x1.0 .. floor x3.0\n"
-        f"50%  = floor x1.0 .. floor x1.5 (точнее)\n\n"
-        f"Выбери диапазон:",
-        parse_mode="HTML", reply_markup=neptun_panel_kb()
+        f"<b>Буст диапазона цен: {boost}%</b>\n"
+        f"Что это: floor — нижняя цена коллекции по первым 20 гифтам.\n"
+        f"Буст расширяет верхнюю границу поиска:\n"
+        f"  50%  = floor x0.7 .. floor x1.5\n"
+        f"  100% = floor x0.7 .. floor x2.0  (стандарт)\n"
+        f"  150% = floor x0.7 .. floor x2.5\n"
+        f"  200% = floor x0.7 .. floor x3.0\n\n"
+        f"<b>Мин. NFT у владельца: {min_nft}</b>\n"
+        f"Что это: сколько минимум NFT должно быть у одного\n"
+        f"владельца чтобы он появился в результатах.\n"
+        f"  2  = любой кто имеет 2+ гифта\n"
+        f"  5  = только с 5+ гифтами (реже, богаче)\n"
+        f"  10 = только серьёзные коллекционеры\n\n"
+        f"Выбери настройки:",
+        parse_mode="HTML", reply_markup=neptun_panel_kb(boost, min_nft)
     )
 
 @dp.message(Command("admin"))
@@ -1022,17 +1078,37 @@ async def cmd_cancel(message: Message, state: FSMContext):
 
 
 # ===================== NEPTUN PANEL BOOSTS =====================
+@dp.callback_query(F.data == "noop")
+async def cb_noop(cb: CallbackQuery):
+    await cb.answer()
+
 @dp.callback_query(F.data.startswith("boost_"))
 async def cb_boost(cb: CallbackQuery):
     val = int(cb.data.split("_")[1])
-    val = max(10, min(200, val))
+    val = max(50, min(200, val))
     USER_BOOST[cb.from_user.id] = val
-    await cb.answer(f"Буст установлен: {val}%", show_alert=True)
+    min_nft = get_min_nft(cb.from_user.id)
+    await cb.answer(f"Буст: {val}%")
     await cb.message.edit_text(
         f"<b>🌊 Neptun Team Panel</b>\n\n"
-        f"Буст установлен: <b>{val}%</b>\n\n"
-        f"Теперь поиск будет искать гифты с диапазоном цен: floor x1.0 .. floor x{1 + val/100:.1f}",
-        parse_mode="HTML", reply_markup=neptun_panel_kb()
+        f"Буст диапазона: <b>{val}%</b> (floor x0.7 .. floor x{1 + val/100:.1f})\n"
+        f"Мин. NFT у владельца: <b>{min_nft}</b>\n\n"
+        f"Выбери настройки:",
+        parse_mode="HTML", reply_markup=neptun_panel_kb(val, min_nft)
+    )
+
+@dp.callback_query(F.data.startswith("minnft_"))
+async def cb_minnft(cb: CallbackQuery):
+    val = int(cb.data.split("_")[1])
+    USER_MIN_NFT[cb.from_user.id] = val
+    boost = get_boost(cb.from_user.id)
+    await cb.answer(f"Мин. NFT: {val}")
+    await cb.message.edit_text(
+        f"<b>🌊 Neptun Team Panel</b>\n\n"
+        f"Буст диапазона: <b>{boost}%</b> (floor x0.7 .. floor x{1 + boost/100:.1f})\n"
+        f"Мин. NFT у владельца: <b>{val}</b>\n\n"
+        f"Выбери настройки:",
+        parse_mode="HTML", reply_markup=neptun_panel_kb(boost, val)
     )
 
 
@@ -1053,10 +1129,39 @@ async def cb_search_menu(cb: CallbackQuery):
 async def cb_mode_price(cb: CallbackQuery):
     boost = get_boost(cb.from_user.id)
     await cb.message.answer(
-        f"<b>💰 Поиск по ценам</b>\nБуст: {boost}%\n\nВыбери диапазон:",
-        parse_mode="HTML", reply_markup=price_menu_kb()
+        f"<b>💰 Поиск по ценам — рынок</b>\nБуст: {boost}%\n\nВыбери диапазон:",
+        parse_mode="HTML", reply_markup=price_market_kb()
     )
     await cb.answer()
+
+@dp.callback_query(F.data == "mode_price_market")
+async def cb_mode_price_market(cb: CallbackQuery):
+    boost = get_boost(cb.from_user.id)
+    await cb.message.answer(
+        f"<b>💰 По ценам — рынок</b>\nБуст: {boost}%\n\nВыбери диапазон:",
+        parse_mode="HTML", reply_markup=price_market_kb()
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data == "mode_price_profile")
+async def cb_mode_price_profile(cb: CallbackQuery):
+    await cb.message.answer(
+        "<b>💰 По ценам — профиль</b>\n\nВыбери диапазон:",
+        parse_mode="HTML", reply_markup=price_profile_kb()
+    )
+    await cb.answer()
+
+# prfcat_ — поиск по профилям с фильтром по цене
+@dp.callback_query(F.data == "prfcat_cheap")
+async def cb_prfcat_c(cb): await run_profile(cb, cat="cheap")
+@dp.callback_query(F.data == "prfcat_mid")
+async def cb_prfcat_m(cb): await run_profile(cb, cat="mid")
+@dp.callback_query(F.data == "prfcat_hard")
+async def cb_prfcat_h(cb): await run_profile(cb, cat="hard")
+@dp.callback_query(F.data == "prfcat_ultra")
+async def cb_prfcat_u(cb): await run_profile(cb, cat="ultra")
+@dp.callback_query(F.data == "prfcat_extreme")
+async def cb_prfcat_e(cb): await run_profile(cb, cat="extreme")
 
 @dp.callback_query(F.data == "price_cheap")
 async def cb_pc(cb): await run_market(cb, "cheap")
