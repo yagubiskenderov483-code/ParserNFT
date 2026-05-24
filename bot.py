@@ -136,6 +136,10 @@ class Onboarding(StatesGroup):
     max_gifts = State()
     boost     = State()
 
+class SetGifts(StatesGroup):
+    min_gifts = State()
+    max_gifts = State()
+
 
 def is_admin(uid): return int(uid) == int(ADMIN_ID)
 
@@ -426,71 +430,56 @@ def search_mode_select_kb():
     ])
 
 # Шаг 2а: категории рынка
-def market_cat_kb(girls=False):
-    prefix = "gmkt_" if girls else "mkt_"
+def market_cat_kb():
     rows = [
-        [InlineKeyboardButton(text="🌐 Все NFT",       callback_data=prefix + "all")],
-        [InlineKeyboardButton(text="💚 Дешевые (<2К)", callback_data=prefix + "cheap")],
-        [InlineKeyboardButton(text="💛 Средние (2-5К)", callback_data=prefix + "mid")],
-        [InlineKeyboardButton(text="🟠 Сложные (5-20К)", callback_data=prefix + "hard")],
-        [InlineKeyboardButton(text="🔴 Хард (20-100К)",  callback_data=prefix + "ultra")],
-        [InlineKeyboardButton(text="💜 Экстрим (>100К)", callback_data=prefix + "extreme")],
-        [InlineKeyboardButton(text="👩 Девушки",         callback_data="girls_market")],
-        [InlineKeyboardButton(text="🔙 Назад",            callback_data="search_mode_select")],
+        [InlineKeyboardButton(text="Все NFT",          callback_data="cat_all")],
+        [InlineKeyboardButton(text="Дешевые (до 2К)",  callback_data="cat_cheap")],
+        [InlineKeyboardButton(text="Средние (2-5К)",   callback_data="cat_mid")],
+        [InlineKeyboardButton(text="Сложные (5-20К)",  callback_data="cat_hard")],
+        [InlineKeyboardButton(text="Хард (20-100К)",   callback_data="cat_ultra")],
+        [InlineKeyboardButton(text="Экстрим (100К+)",  callback_data="cat_extreme")],
+        [InlineKeyboardButton(text="Назад",             callback_data="search_mode_select")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# Шаг 2б: категории профиля (без NFT на рынке)
+# Шаг 2б: категории профиля — те же что и рынок
 def profile_cat_kb():
+    rows = [
+        [InlineKeyboardButton(text="Все профили",      callback_data="pcat_all")],
+        [InlineKeyboardButton(text="Дешевые (до 2К)",  callback_data="pcat_cheap")],
+        [InlineKeyboardButton(text="Средние (2-5К)",   callback_data="pcat_mid")],
+        [InlineKeyboardButton(text="Сложные (5-20К)",  callback_data="pcat_hard")],
+        [InlineKeyboardButton(text="Хард (20-100К)",   callback_data="pcat_ultra")],
+        [InlineKeyboardButton(text="Экстрим (100К+)",  callback_data="pcat_extreme")],
+        [InlineKeyboardButton(text="Назад",             callback_data="search_mode_select")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+# Шаг 3: кого искать (после выбора категории)
+def who_search_kb(cat, mode):
+    # mode: "mkt" или "prf"
+    prefix = mode + "_" + cat + "_"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌐 Все профили",     callback_data="prf_all")],
-        [InlineKeyboardButton(text="👩 Девушки профили", callback_data="girls_profile")],
-        [InlineKeyboardButton(text="🔙 Назад",            callback_data="search_mode_select")],
+        [InlineKeyboardButton(text="Всех",    callback_data=prefix + "all")],
+        [InlineKeyboardButton(text="Девушек", callback_data=prefix + "girls")],
+        [InlineKeyboardButton(text="Назад",   callback_data="mode_" + ("market" if mode == "mkt" else "profile"))],
     ])
 
 def settings_menu_kb(uid):
     mg     = get_min_gifts(uid)
     mx     = get_max_gifts(uid)
     bst    = get_boost(uid)
-    mx_str = str(mx) if mx > 0 else "∞"
+    mx_str = str(mx) if mx > 0 else "без лимита"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📉 Мин. гифтов: " + str(mg),   callback_data="set_min_gifts")],
-        [InlineKeyboardButton(text="📈 Макс. гифтов: " + mx_str,   callback_data="set_max_gifts")],
-        [InlineKeyboardButton(text="🚀 Буст цен: " + str(bst) + "%", callback_data="set_boost")],
-        [InlineKeyboardButton(text="🔙 Назад",                       callback_data="menu")],
+        [InlineKeyboardButton(text="Мин. гифтов: " + str(mg),   callback_data="set_min_gifts")],
+        [InlineKeyboardButton(text="Макс. гифтов: " + mx_str,   callback_data="set_max_gifts")],
+        [InlineKeyboardButton(text="Буст цен: " + str(bst) + "%", callback_data="set_boost")],
+        [InlineKeyboardButton(text="Назад",                       callback_data="menu")],
     ])
 
-def min_gifts_picker_kb():
+def gifts_input_cancel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="1",  callback_data="mingifts_1"),
-            InlineKeyboardButton(text="2",  callback_data="mingifts_2"),
-            InlineKeyboardButton(text="3",  callback_data="mingifts_3"),
-            InlineKeyboardButton(text="5",  callback_data="mingifts_5"),
-        ],
-        [
-            InlineKeyboardButton(text="10", callback_data="mingifts_10"),
-            InlineKeyboardButton(text="15", callback_data="mingifts_15"),
-            InlineKeyboardButton(text="20", callback_data="mingifts_20"),
-            InlineKeyboardButton(text="50", callback_data="mingifts_50"),
-        ],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="settings_menu")],
-    ])
-
-def max_gifts_picker_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="∞ Без лимита", callback_data="maxgifts_0")],
-        [
-            InlineKeyboardButton(text="5",   callback_data="maxgifts_5"),
-            InlineKeyboardButton(text="10",  callback_data="maxgifts_10"),
-            InlineKeyboardButton(text="20",  callback_data="maxgifts_20"),
-        ],
-        [
-            InlineKeyboardButton(text="50",  callback_data="maxgifts_50"),
-            InlineKeyboardButton(text="100", callback_data="maxgifts_100"),
-            InlineKeyboardButton(text="200", callback_data="maxgifts_200"),
-        ],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="settings_menu")],
+        [InlineKeyboardButton(text="Отмена", callback_data="settings_menu")],
     ])
 
 def boost_picker_kb():
@@ -504,7 +493,7 @@ def boost_picker_kb():
             InlineKeyboardButton(text="150%", callback_data="boost_150"),
             InlineKeyboardButton(text="200%", callback_data="boost_200"),
         ],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="settings_menu")],
+        [InlineKeyboardButton(text="Назад", callback_data="settings_menu")],
     ])
 
 def stop_kb():
@@ -577,7 +566,7 @@ def nft_list_kb(nft_items, username, profile_url):
         if url:
             label = str(title) + " #" + str(num)
             if price:
-                label += " — " + str(price) + " ⭐"
+                label += " " + str(price) + " звезд"
             btns.append([InlineKeyboardButton(text=label, url=url)])
     if profile_url:
         label = "@" + username if username else "Профиль"
@@ -590,27 +579,13 @@ def nft_list_kb(nft_items, username, profile_url):
 # Онбординг кнопки
 def onboarding_min_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="1",  callback_data="ob_min_1"),
-            InlineKeyboardButton(text="2",  callback_data="ob_min_2"),
-            InlineKeyboardButton(text="3",  callback_data="ob_min_3"),
-            InlineKeyboardButton(text="5",  callback_data="ob_min_5"),
-        ],
-        [
-            InlineKeyboardButton(text="10", callback_data="ob_min_10"),
-            InlineKeyboardButton(text="20", callback_data="ob_min_20"),
-        ],
+        [InlineKeyboardButton(text="Пропустить (2 по умолчанию)", callback_data="ob_min_2")],
     ])
 
 def onboarding_max_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="∞ Без лимита", callback_data="ob_max_0")],
-        [
-            InlineKeyboardButton(text="5",   callback_data="ob_max_5"),
-            InlineKeyboardButton(text="10",  callback_data="ob_max_10"),
-            InlineKeyboardButton(text="20",  callback_data="ob_max_20"),
-            InlineKeyboardButton(text="50",  callback_data="ob_max_50"),
-        ],
+        [InlineKeyboardButton(text="Без лимита", callback_data="ob_max_0")],
+        [InlineKeyboardButton(text="Пропустить", callback_data="ob_max_0")],
     ])
 
 def onboarding_boost_kb():
@@ -648,7 +623,7 @@ async def do_market_search(
     await status_msg.edit_text("<b>Анализирую коллекции...</b>", reply_markup=stop_kb())
 
     # Параллельная загрузка флоров для скорости
-    async def batch_floors(gids, size=10):
+    async def batch_floors(gids, size=20):
         valid = []
         for i in range(0, len(gids), size):
             if not is_searching:
@@ -661,7 +636,7 @@ async def do_market_search(
                 if cat and not floor_in_category(floor, cat):
                     continue
                 valid.append((gid, floor))
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)
         return valid
 
     valid_gids = await batch_floors(gift_ids)
@@ -723,7 +698,7 @@ async def do_market_search(
                 if not buffers[gid] and offsets.get(gid) is not None:
                     fetch_tasks.append(fetch_market_page(gid, offsets[gid], limit=100))
                     fetch_gids.append(gid)
-                if len(fetch_tasks) >= 5:
+                if len(fetch_tasks) >= 10:
                     break
 
             if fetch_tasks:
@@ -801,7 +776,7 @@ async def do_market_search(
                         made = True
                     except Exception as e:
                         logger.warning("send: %s", e)
-                    await asyncio.sleep(0.03)
+                    await asyncio.sleep(0.01)
 
             if not has_cat:
                 await flush_owners()
@@ -862,7 +837,7 @@ async def do_profile_search(
         if not active:
             return False
 
-        fetch_gids  = active[:5]
+        fetch_gids  = active[:8]
         fetch_tasks = [fetch_market_page(gid, market_offsets[gid], limit=100) for gid in fetch_gids]
         results     = await asyncio.gather(*fetch_tasks)
 
@@ -906,7 +881,7 @@ async def do_profile_search(
         """Строим индекс: у кого сколько лотов на рынке."""
         active = [g for g, o in market_offsets.items() if o is not None]
         while active and is_searching:
-            fetch_gids  = active[:8]
+            fetch_gids  = active[:12]
             fetch_tasks = [fetch_market_page(gid, market_offsets[gid], limit=100) for gid in fetch_gids]
             results     = await asyncio.gather(*fetch_tasks)
             for gid, (items, nxt) in zip(fetch_gids, results):
@@ -1033,16 +1008,16 @@ async def run_market(cb, cat=None, girls=False, ids=None):
     boost  = get_boost(uid)
     mn     = get_min_gifts(uid)
     mx     = get_max_gifts(uid)
-    mx_str = str(mx) if mx > 0 else "∞"
+    mx_str = str(mx) if mx > 0 else "без лимита"
     if girls:
-        label = "👩 Девушки — рынок"
+        label = "Девушки — рынок"
     elif cat:
         label = PRICE_CATEGORIES[cat]["label"]
     else:
-        label = "🌐 Все NFT"
+        label = "Все NFT"
     txt = (
         "<b>" + label + "</b>\n"
-        "<b>Гифтов: от " + str(mn) + " до " + mx_str + " | Буст: " + str(boost) + "%</b>\n\n"
+        "<b>Гифтов: от " + str(mn) + " до " + mx_str + ", Буст: " + str(boost) + "%</b>\n\n"
         "<b>Найдено: 0</b>"
     )
     status = await cb.message.answer(txt, parse_mode="HTML", reply_markup=stop_kb())
@@ -1070,8 +1045,8 @@ async def run_profile(cb, girls=False, ids=None):
         return
     mn     = get_min_gifts(uid)
     mx     = get_max_gifts(uid)
-    mx_str = str(mx) if mx > 0 else "∞"
-    label  = "👩 Девушки — профили" if girls else "👤 Профили без листингов"
+    mx_str = str(mx) if mx > 0 else "без лимита"
+    label  = "Девушки — профили" if girls else "Профили без листингов"
     txt = (
         "<b>" + label + "</b>\n"
         "<b>Гифтов скрытых: от " + str(mn) + " до " + mx_str + "</b>\n\n"
@@ -1089,9 +1064,9 @@ async def run_profile(cb, girls=False, ids=None):
 
 
 WELCOME = (
-    "<b>🔱 Neptun Parser</b>\n\n"
-    "Ищу NFT-коллекционеров у которых есть гифты вне рынка.\n"
-    "Нажми <b>🔍 Поиск NFT</b> чтобы начать:"
+    "<b>Neptun Parser</b>\n\n"
+    "Ищу NFT коллекционеров у которых есть гифты вне рынка.\n"
+    "Нажми <b>Поиск NFT</b> чтобы начать:"
 )
 
 # ===================== ОНБОРДИНГ (первый запуск) =====================
@@ -1112,11 +1087,10 @@ async def cmd_start(message: Message, state: FSMContext):
     if is_new and message.from_user.id not in ONBOARDING_DONE:
         ONBOARDING_DONE.add(message.from_user.id)
         await message.answer(
-            "<b>👋 Привет! Добро пожаловать в Neptun Parser</b>\n\n"
-            "Давай быстро настроим поиск под тебя.\n\n"
-            "<b>Шаг 1/3 — Минимум гифтов у владельца:</b>\n"
-            "Сколько NFT минимум должно быть у человека чтобы попасть в результаты?\n"
-            "<i>Рекомендую: 2-5</i>",
+            "<b>Привет! Добро пожаловать в Neptun Parser</b>\n\n"
+            "Давай настроим поиск.\n\n"
+            "<b>Шаг 1/3. Минимум гифтов у владельца:</b>\n"
+            "Напиши число (например 2):",
             parse_mode="HTML",
             reply_markup=onboarding_min_kb()
         )
@@ -1125,23 +1099,42 @@ async def cmd_start(message: Message, state: FSMContext):
 
     await message.answer(WELCOME, parse_mode="HTML", reply_markup=main_kb())
 
-# Онбординг шаг 1 — мин гифтов
+# Онбординг шаг 1 — мин гифтов (кнопка)
 @dp.callback_query(F.data.startswith("ob_min_"))
 async def ob_min(cb: CallbackQuery, state: FSMContext):
     val = int(cb.data.split("_")[2])
     USER_MIN_GIFTS[cb.from_user.id] = val
     await cb.answer("Мин. гифтов: " + str(val))
     await cb.message.edit_text(
-        "<b>✅ Минимум гифтов: " + str(val) + "</b>\n\n"
-        "<b>Шаг 2/3 — Максимум гифтов у владельца:</b>\n"
-        "Если хочешь без лимита — выбери ∞\n"
-        "<i>Рекомендую: без лимита или 20</i>",
+        "<b>Минимум гифтов: " + str(val) + "</b>\n\n"
+        "<b>Шаг 2/3. Максимум гифтов:</b>\n"
+        "Напиши число или нажми кнопку (0 = без лимита):",
         parse_mode="HTML",
         reply_markup=onboarding_max_kb()
     )
     await state.set_state(Onboarding.max_gifts)
 
-# Онбординг шаг 2 — макс гифтов
+# Онбординг шаг 1 — мин гифтов (текст)
+@dp.message(Onboarding.min_gifts)
+async def ob_min_text(message: Message, state: FSMContext):
+    try:
+        val = int(message.text.strip())
+        if val < 1:
+            raise ValueError
+    except ValueError:
+        await message.answer("<b>Введи число от 1 и выше:</b>", parse_mode="HTML")
+        return
+    USER_MIN_GIFTS[message.from_user.id] = val
+    await message.answer(
+        "<b>Минимум гифтов: " + str(val) + "</b>\n\n"
+        "<b>Шаг 2/3. Максимум гифтов:</b>\n"
+        "Напиши число или нажми кнопку (0 = без лимита):",
+        parse_mode="HTML",
+        reply_markup=onboarding_max_kb()
+    )
+    await state.set_state(Onboarding.max_gifts)
+
+# Онбординг шаг 2 — макс гифтов (кнопка)
 @dp.callback_query(F.data.startswith("ob_max_"))
 async def ob_max(cb: CallbackQuery, state: FSMContext):
     val = int(cb.data.split("_")[2])
@@ -1149,12 +1142,34 @@ async def ob_max(cb: CallbackQuery, state: FSMContext):
     label = "без лимита" if val == 0 else str(val)
     await cb.answer("Макс. гифтов: " + label)
     await cb.message.edit_text(
-        "<b>✅ Максимум гифтов: " + label + "</b>\n\n"
-        "<b>Шаг 3/3 — Буст цен (для поиска по рынку):</b>\n"
+        "<b>Максимум гифтов: " + label + "</b>\n\n"
+        "<b>Шаг 3/3. Буст цен (для поиска по рынку):</b>\n"
         "Насколько выше флора ищем NFT?\n\n"
         "100% = цена до x2 от флора\n"
-        "200% = цена до x3 от флора\n"
-        "<i>Рекомендую: 100%</i>",
+        "200% = цена до x3 от флора",
+        parse_mode="HTML",
+        reply_markup=onboarding_boost_kb()
+    )
+    await state.set_state(Onboarding.boost)
+
+# Онбординг шаг 2 — макс гифтов (текст)
+@dp.message(Onboarding.max_gifts)
+async def ob_max_text(message: Message, state: FSMContext):
+    try:
+        val = int(message.text.strip())
+        if val < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("<b>Введи число (0 = без лимита):</b>", parse_mode="HTML")
+        return
+    USER_MAX_GIFTS[message.from_user.id] = val
+    label = "без лимита" if val == 0 else str(val)
+    await message.answer(
+        "<b>Максимум гифтов: " + label + "</b>\n\n"
+        "<b>Шаг 3/3. Буст цен (для поиска по рынку):</b>\n"
+        "Насколько выше флора ищем NFT?\n\n"
+        "100% = цена до x2 от флора\n"
+        "200% = цена до x3 от флора",
         parse_mode="HTML",
         reply_markup=onboarding_boost_kb()
     )
@@ -1169,7 +1184,7 @@ async def ob_boost(cb: CallbackQuery, state: FSMContext):
     uid = cb.from_user.id
     mn  = get_min_gifts(uid)
     mx  = get_max_gifts(uid)
-    mx_str = str(mx) if mx > 0 else "∞"
+    mx_str = str(mx) if mx > 0 else "без лимита"
     await state.clear()
     await cb.message.edit_text(
         "<b>✅ Настройка завершена!</b>\n\n"
@@ -1204,33 +1219,33 @@ async def cmd_neptunteam(message: Message):
     mn     = get_min_gifts(uid)
     mx     = get_max_gifts(uid)
     bst    = get_boost(uid)
-    mx_str = str(mx) if mx > 0 else "∞"
+    mx_str = str(mx) if mx > 0 else "без лимита"
     txt = (
-        "<b>🔱 Neptun Parser — Справка по настройкам</b>\n\n"
+        "<b>Neptun Parser. Справка по настройкам</b>\n\n"
 
-        "<b>📉 Мин. гифтов</b> — минимальное кол-во NFT у владельца\n"
-        "Если у человека меньше — он не попадёт в результаты\n"
-        "<i>Пример: мин=2 → пропускаем всех у кого 1 NFT</i>\n\n"
+        "<b>Мин. гифтов</b> — это минимальное кол-во NFT у владельца\n"
+        "У кого меньше — не попадёт в результаты\n"
+        "Пример: мин=2, пропускаем всех у кого 1 NFT\n\n"
 
-        "<b>📈 Макс. гифтов</b> — максимальное кол-во NFT у владельца\n"
-        "0 = без лимита. Полезно чтобы отсеять крупных коллекционеров\n"
-        "<i>Пример: макс=10 → не показываем тех у кого 11+ NFT</i>\n\n"
+        "<b>Макс. гифтов</b> — максимальное кол-во NFT у владельца\n"
+        "0 = без лимита\n"
+        "Пример: макс=10, не показываем тех у кого 11 и более\n\n"
 
-        "<b>🚀 Буст цен</b> — насколько выше флора ищем (только рынок)\n"
+        "<b>Буст цен</b> — насколько выше флора ищем (только рынок)\n"
         "Флор = минимальная цена в коллекции (нижние 25%)\n"
-        "Формула: цена от 0.7×флор до (1 + буст/100)×флор\n\n"
-        "<i>Примеры буста:</i>\n"
-        "• 30% → цена до 1.3×флор\n"
-        "• 100% → цена до 2.0×флор\n"
-        "• 200% → цена до 3.0×флор\n\n"
+        "Формула: цена от 0.7 флора до (1 + буст/100) флора\n\n"
+        "Примеры буста:\n"
+        "30% = цена до 1.3 флора\n"
+        "100% = цена до 2.0 флора\n"
+        "200% = цена до 3.0 флора\n\n"
 
-        "<b>📋 Режимы поиска:</b>\n"
-        "• <b>По рынку</b> — ищет NFT выставленные на продажу\n"
-        "• <b>По профилю</b> — ищет владельцев у которых есть NFT В ПРОФИЛЕ но НЕ выставленные на рынок (скрытые гифты)\n\n"
+        "<b>Режимы поиска:</b>\n"
+        "По рынку — ищет NFT выставленные на продажу\n"
+        "По профилю — ищет владельцев у которых NFT в профиле, но не на рынке\n\n"
 
         "<b>Текущие настройки:</b>\n"
-        "Мин: " + str(mn) + " | Макс: " + mx_str + " | Буст: " + str(bst) + "%\n\n"
-        "Меняй в ⚙️ Настройки или через /start"
+        "Мин: " + str(mn) + ", Макс: " + mx_str + ", Буст: " + str(bst) + "%\n\n"
+        "Меняй в Настройки или через /start"
     )
     await message.answer(txt, parse_mode="HTML", reply_markup=main_kb())
 
@@ -1285,9 +1300,9 @@ async def cb_show_nft(cb: CallbackQuery):
 @dp.callback_query(F.data == "search_mode_select")
 async def cb_search_mode_select(cb: CallbackQuery):
     await cb.message.answer(
-        "<b>🔍 Выберите как будет происходить поиск:</b>\n\n"
-        "🛒 <b>По рынку</b> — ищет NFT выставленные на продажу\n"
-        "👤 <b>По профилю</b> — ищет владельцев у которых NFT скрыты (не на рынке)",
+        "<b>Выберите режим поиска:</b>\n\n"
+        "<b>По рынку</b> — NFT выставленные на продажу\n"
+        "<b>По профилю</b> — владельцы у которых NFT скрыты (не на рынке)",
         parse_mode="HTML",
         reply_markup=search_mode_select_kb()
     )
@@ -1296,7 +1311,7 @@ async def cb_search_mode_select(cb: CallbackQuery):
 @dp.callback_query(F.data == "mode_market")
 async def cb_mode_market(cb: CallbackQuery):
     await cb.message.answer(
-        "<b>🛒 Поиск по рынку — выбери категорию:</b>",
+        "<b>Поиск по рынку. Выбери категорию:</b>",
         parse_mode="HTML",
         reply_markup=market_cat_kb()
     )
@@ -1305,7 +1320,7 @@ async def cb_mode_market(cb: CallbackQuery):
 @dp.callback_query(F.data == "mode_profile")
 async def cb_mode_profile(cb: CallbackQuery):
     await cb.message.answer(
-        "<b>👤 Поиск по профилю — ищет тех у кого NFT НЕ выставлены на рынок:</b>",
+        "<b>Поиск по профилю. Выбери категорию:</b>",
         parse_mode="HTML",
         reply_markup=profile_cat_kb()
     )
@@ -1319,7 +1334,7 @@ async def cb_settings(cb: CallbackQuery):
     bst    = get_boost(uid)
     mx_str = str(mx) if mx > 0 else "∞"
     txt = (
-        "<b>⚙️ Настройки поиска</b>\n\n"
+        "<b>Настройки поиска</b>\n\n"
         "<b>Мин. гифтов:</b> " + str(mn) + "\n"
         "<b>Макс. гифтов:</b> " + mx_str + "\n"
         "<b>Буст цен:</b> " + str(bst) + "%"
@@ -1328,35 +1343,67 @@ async def cb_settings(cb: CallbackQuery):
     await cb.answer()
 
 @dp.callback_query(F.data == "set_min_gifts")
-async def cb_set_min(cb: CallbackQuery):
-    await cb.message.answer("<b>Минимум гифтов у владельца:</b>", parse_mode="HTML", reply_markup=min_gifts_picker_kb())
+async def cb_set_min(cb: CallbackQuery, state: FSMContext):
+    await cb.message.answer(
+        "<b>Минимум гифтов у владельца:</b>\n"
+        "Напиши число (например 2):",
+        parse_mode="HTML",
+        reply_markup=gifts_input_cancel_kb()
+    )
+    await state.set_state(SetGifts.min_gifts)
     await cb.answer()
 
+@dp.message(SetGifts.min_gifts)
+async def set_min_text(message: Message, state: FSMContext):
+    try:
+        val = int(message.text.strip())
+        if val < 1:
+            raise ValueError
+    except ValueError:
+        await message.answer("<b>Введи число от 1 и выше:</b>", parse_mode="HTML")
+        return
+    USER_MIN_GIFTS[message.from_user.id] = val
+    await state.clear()
+    await message.answer(
+        "<b>Минимум гифтов установлен: " + str(val) + "</b>",
+        parse_mode="HTML",
+        reply_markup=settings_menu_kb(message.from_user.id)
+    )
+
 @dp.callback_query(F.data == "set_max_gifts")
-async def cb_set_max(cb: CallbackQuery):
-    await cb.message.answer("<b>Максимум гифтов (0 = без лимита):</b>", parse_mode="HTML", reply_markup=max_gifts_picker_kb())
+async def cb_set_max(cb: CallbackQuery, state: FSMContext):
+    await cb.message.answer(
+        "<b>Максимум гифтов у владельца:</b>\n"
+        "Напиши число (0 = без лимита):",
+        parse_mode="HTML",
+        reply_markup=gifts_input_cancel_kb()
+    )
+    await state.set_state(SetGifts.max_gifts)
     await cb.answer()
+
+@dp.message(SetGifts.max_gifts)
+async def set_max_text(message: Message, state: FSMContext):
+    try:
+        val = int(message.text.strip())
+        if val < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("<b>Введи число (0 = без лимита):</b>", parse_mode="HTML")
+        return
+    USER_MAX_GIFTS[message.from_user.id] = val
+    label = "без лимита" if val == 0 else str(val)
+    await state.clear()
+    await message.answer(
+        "<b>Максимум гифтов установлен: " + label + "</b>",
+        parse_mode="HTML",
+        reply_markup=settings_menu_kb(message.from_user.id)
+    )
 
 @dp.callback_query(F.data == "set_boost")
 async def cb_set_boost(cb: CallbackQuery):
-    txt = "<b>🚀 Буст цен</b>\n\n<b>100% = до x2 флора | 150% = до x2.5 | 200% = до x3</b>"
+    txt = "<b>Буст цен</b>\n\n<b>100% = до x2 флора, 150% = до x2.5, 200% = до x3</b>"
     await cb.message.answer(txt, parse_mode="HTML", reply_markup=boost_picker_kb())
     await cb.answer()
-
-@dp.callback_query(F.data.startswith("mingifts_"))
-async def cb_mingifts(cb: CallbackQuery):
-    val = int(cb.data.split("_")[1])
-    USER_MIN_GIFTS[cb.from_user.id] = val
-    await cb.answer("Мин. гифтов: " + str(val), show_alert=True)
-    await cb.message.edit_reply_markup(reply_markup=None)
-
-@dp.callback_query(F.data.startswith("maxgifts_"))
-async def cb_maxgifts(cb: CallbackQuery):
-    val   = int(cb.data.split("_")[1])
-    USER_MAX_GIFTS[cb.from_user.id] = val
-    label = "без лимита" if val == 0 else str(val)
-    await cb.answer("Макс. гифтов: " + label, show_alert=True)
-    await cb.message.edit_reply_markup(reply_markup=None)
 
 @dp.callback_query(F.data.startswith("boost_"))
 async def cb_boost(cb: CallbackQuery):
@@ -1371,27 +1418,59 @@ async def cb_menu(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer(WELCOME, parse_mode="HTML", reply_markup=main_kb())
     await cb.answer()
 
-# Рынок по категориям
-@dp.callback_query(F.data == "mkt_all")
-async def cb_ma(cb): await run_market(cb)
-@dp.callback_query(F.data == "mkt_cheap")
-async def cb_mc(cb): await run_market(cb, "cheap")
-@dp.callback_query(F.data == "mkt_mid")
-async def cb_mm(cb): await run_market(cb, "mid")
-@dp.callback_query(F.data == "mkt_hard")
-async def cb_mh(cb): await run_market(cb, "hard")
-@dp.callback_query(F.data == "mkt_ultra")
-async def cb_mu(cb): await run_market(cb, "ultra")
-@dp.callback_query(F.data == "mkt_extreme")
-async def cb_me(cb): await run_market(cb, "extreme")
+# Рынок — выбор категории -> показ "кого искать"
+@dp.callback_query(F.data.startswith("cat_"))
+async def cb_cat_select(cb: CallbackQuery):
+    cat = cb.data[4:]  # all, cheap, mid, hard, ultra, extreme
+    cat_labels = {
+        "all": "Все NFT", "cheap": "Дешевые (до 2К)", "mid": "Средние (2-5К)",
+        "hard": "Сложные (5-20К)", "ultra": "Хард (20-100К)", "extreme": "Экстрим (100К+)",
+    }
+    label = cat_labels.get(cat, cat)
+    await cb.message.answer(
+        "<b>" + label + " — кого искать?</b>",
+        parse_mode="HTML",
+        reply_markup=who_search_kb(cat, "mkt")
+    )
+    await cb.answer()
 
-# Профиль
-@dp.callback_query(F.data == "prf_all")
-async def cb_pa(cb): await run_profile(cb)
-@dp.callback_query(F.data == "girls_market")
-async def cb_gm(cb): await run_market(cb, girls=True)
-@dp.callback_query(F.data == "girls_profile")
-async def cb_gp(cb): await run_profile(cb, girls=True)
+# Профиль — выбор категории -> показ "кого искать"
+@dp.callback_query(F.data.startswith("pcat_"))
+async def cb_pcat_select(cb: CallbackQuery):
+    cat = cb.data[5:]  # all, cheap, mid, hard, ultra, extreme
+    cat_labels = {
+        "all": "Все профили", "cheap": "Дешевые (до 2К)", "mid": "Средние (2-5К)",
+        "hard": "Сложные (5-20К)", "ultra": "Хард (20-100К)", "extreme": "Экстрим (100К+)",
+    }
+    label = cat_labels.get(cat, cat)
+    await cb.message.answer(
+        "<b>" + label + " — кого искать?</b>",
+        parse_mode="HTML",
+        reply_markup=who_search_kb(cat, "prf")
+    )
+    await cb.answer()
+
+# Рынок — запуск после выбора "кого" (mkt_<cat>_all / mkt_<cat>_girls)
+@dp.callback_query(F.data.startswith("mkt_"))
+async def cb_mkt_who(cb: CallbackQuery):
+    parts = cb.data.split("_")  # ["mkt", cat, who]
+    if len(parts) < 3:
+        await cb.answer()
+        return
+    cat   = parts[1]
+    who   = parts[2]
+    real_cat = None if cat == "all" else cat
+    await run_market(cb, cat=real_cat, girls=(who == "girls"))
+
+# Профиль — запуск после выбора "кого" (prf_<cat>_all / prf_<cat>_girls)
+@dp.callback_query(F.data.startswith("prf_"))
+async def cb_prf_who(cb: CallbackQuery):
+    parts = cb.data.split("_")  # ["prf", cat, who]
+    if len(parts) < 3:
+        await cb.answer()
+        return
+    who   = parts[2]
+    await run_profile(cb, girls=(who == "girls"))
 
 # По коллекции
 @dp.callback_query(F.data == "mode_col")
