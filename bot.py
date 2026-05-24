@@ -150,6 +150,7 @@ class Onboarding(StatesGroup):
 class SetGifts(StatesGroup):
     min_gifts = State()
     max_gifts = State()
+    boost     = State()
 
 
 def is_admin(uid): return int(uid) == int(ADMIN_ID)
@@ -201,14 +202,24 @@ MODEL_KW = [
     "photo", "фото", "photoshoot", "фотосессия", "nsfw", "18+",
 ]
 
-def is_model(owner):
-    if not owner:
-        return False
-    bio   = (getattr(owner, "bio",        "") or "").lower()
-    uname = (getattr(owner, "username",   "") or "").lower()
-    first = (getattr(owner, "first_name", "") or "").lower()
-    last  = (getattr(owner, "last_name",  "") or "").lower()
-    full  = bio + " " + uname + " " + first + " " + last
+def is_model(owner, username=None, name=None):
+    bio   = ""
+    uname = ""
+    first = ""
+    last  = ""
+    if owner:
+        bio   = (getattr(owner, "bio",        "") or "").lower()
+        uname = (getattr(owner, "username",   "") or "").lower()
+        first = (getattr(owner, "first_name", "") or "").lower()
+        last  = (getattr(owner, "last_name",  "") or "").lower()
+    # Также проверяем переданные username/name (доступны даже без полного объекта)
+    if username:
+        uname = uname or username.lower()
+    if name:
+        parts = name.lower().strip().split()
+        first = first or (parts[0] if parts else "")
+        last  = last  or (parts[1] if len(parts) > 1 else "")
+    full = bio + " " + uname + " " + first + " " + last
     for kw in MODEL_KW:
         if kw in full:
             return True
@@ -449,10 +460,7 @@ async def fetch_saved_gifts_all(user_id, max_pages=5):
 
 
 async def get_profile_nfts(user_id, username):
-    if username:
-        nfts = await fetch_profile_via_pricenftbot(username)
-        if nfts:
-            return nfts
+    # Берём только гифты из профиля (НЕ с маркета)
     gifts = await fetch_saved_gifts_all(user_id)
     return [g for g in gifts if g.get("nft_url")]
 
@@ -540,7 +548,9 @@ def boost_picker_kb():
         [
             InlineKeyboardButton(text="150%", callback_data="boost_150"),
             InlineKeyboardButton(text="200%", callback_data="boost_200"),
+            InlineKeyboardButton(text="300%", callback_data="boost_300"),
         ],
+        [InlineKeyboardButton(text="✏️ Ввести вручную", callback_data="boost_custom")],
         [InlineKeyboardButton(text="Назад", callback_data="settings_menu")],
     ])
 
@@ -652,17 +662,25 @@ def nft_list_kb(nft_items, username, profile_url):
 # Онбординг кнопки
 def onboarding_min_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="2 гифта",  callback_data="ob_min_2")],
-        [InlineKeyboardButton(text="3 гифта",  callback_data="ob_min_3")],
-        [InlineKeyboardButton(text="5 гифтов", callback_data="ob_min_5")],
+        [
+            InlineKeyboardButton(text="2 гифта",  callback_data="ob_min_2"),
+            InlineKeyboardButton(text="3 гифта",  callback_data="ob_min_3"),
+            InlineKeyboardButton(text="5 гифтов", callback_data="ob_min_5"),
+        ],
+        [InlineKeyboardButton(text="✏️ Ввести своё число", callback_data="ob_min_custom")],
     ])
 
 def onboarding_max_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Без лимита", callback_data="ob_max_0")],
-        [InlineKeyboardButton(text="10",  callback_data="ob_max_10")],
-        [InlineKeyboardButton(text="20",  callback_data="ob_max_20")],
-        [InlineKeyboardButton(text="50",  callback_data="ob_max_50")],
+        [
+            InlineKeyboardButton(text="Без лимита", callback_data="ob_max_0"),
+            InlineKeyboardButton(text="10",  callback_data="ob_max_10"),
+        ],
+        [
+            InlineKeyboardButton(text="20",  callback_data="ob_max_20"),
+            InlineKeyboardButton(text="50",  callback_data="ob_max_50"),
+        ],
+        [InlineKeyboardButton(text="✏️ Ввести своё число", callback_data="ob_max_custom")],
     ])
 
 def onboarding_boost_kb():
@@ -675,7 +693,9 @@ def onboarding_boost_kb():
         [
             InlineKeyboardButton(text="150%", callback_data="ob_boost_150"),
             InlineKeyboardButton(text="200%", callback_data="ob_boost_200"),
+            InlineKeyboardButton(text="300%", callback_data="ob_boost_300"),
         ],
+        [InlineKeyboardButton(text="✏️ Ввести вручную", callback_data="ob_boost_custom")],
     ])
 
 
@@ -700,7 +720,7 @@ async def do_market_search(
     owner_seen    = {}
     last_upd      = 0.0
     START_TIME    = asyncio.get_event_loop().time()
-    DELAY         = 0.4   # задержка между запросами (сек)
+    DELAY         = 0.15  # задержка между запросами (сек, ускорено)
 
     has_cat = cat is not None
 
@@ -733,7 +753,7 @@ async def do_market_search(
             seen_slugs.add(slug)
         if girls_only and not is_girl(item["owner"], item.get("username"), item.get("name")):
             return
-        if model_only and not is_model(item["owner"]):
+        if model_only and not is_model(item["owner"], item.get("username"), item.get("name")):
             return
         price = item.get("price")
         if price is None:
@@ -898,7 +918,7 @@ async def do_profile_search(
             if asyncio.get_event_loop().time() - START_TIME > HARD_LIMIT * 0.4:
                 break
             items, _ = await fetch_market_page(gid, "", limit=100)
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.15)
             for item in items:
                 uid = item.get("owner_id")
                 if not uid:
@@ -935,7 +955,7 @@ async def do_profile_search(
         nonlocal found
         if girls_only and not is_girl(owner_obj, username, name):
             return
-        if model_only and not is_model(owner_obj):
+        if model_only and not is_model(owner_obj, username, name):
             return
         # Загружаем все гифты из профиля
         nft_gifts   = await fast_saved_gifts(uid)
@@ -1000,7 +1020,7 @@ async def do_profile_search(
                 if not is_searching:
                     break
                 await check_one(uid, obj, un, nm)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.1)
             checked += len(batch)
             now = asyncio.get_event_loop().time()
             if now - last_upd > 2.0:
@@ -1156,7 +1176,16 @@ async def cmd_start(message: Message, state: FSMContext):
 # Онбординг шаг 1 — мин гифтов (кнопка)
 @dp.callback_query(F.data.startswith("ob_min_"))
 async def ob_min(cb: CallbackQuery, state: FSMContext):
-    val = int(cb.data.split("_")[2])
+    raw = cb.data.split("_")[2]
+    if raw == "custom":
+        await cb.message.edit_text(
+            "<b>Шаг 1/3. Минимум гифтов:\nВведи своё число:</b>",
+            parse_mode="HTML"
+        )
+        await state.set_state(Onboarding.min_gifts)
+        await cb.answer()
+        return
+    val = int(raw)
     USER_MIN_GIFTS[cb.from_user.id] = val
     await cb.answer("Мин. гифтов: " + str(val))
     await cb.message.edit_text(
@@ -1191,7 +1220,16 @@ async def ob_min_text(message: Message, state: FSMContext):
 # Онбординг шаг 2 — макс гифтов (кнопка)
 @dp.callback_query(F.data.startswith("ob_max_"))
 async def ob_max(cb: CallbackQuery, state: FSMContext):
-    val = int(cb.data.split("_")[2])
+    raw = cb.data.split("_")[2]
+    if raw == "custom":
+        await cb.message.edit_text(
+            "<b>Шаг 2/3. Максимум гифтов:\nВведи своё число (0 = без лимита):</b>",
+            parse_mode="HTML"
+        )
+        await state.set_state(Onboarding.max_gifts)
+        await cb.answer()
+        return
+    val = int(raw)
     USER_MAX_GIFTS[cb.from_user.id] = val
     label = "без лимита" if val == 0 else str(val)
     await cb.answer("Макс. гифтов: " + label)
@@ -1232,7 +1270,16 @@ async def ob_max_text(message: Message, state: FSMContext):
 # Онбординг шаг 3 — буст
 @dp.callback_query(F.data.startswith("ob_boost_"))
 async def ob_boost(cb: CallbackQuery, state: FSMContext):
-    val = int(cb.data.split("_")[2])
+    raw = cb.data.split("_")[2]
+    if raw == "custom":
+        await cb.message.edit_text(
+            "<b>Шаг 3/3. Введи буст вручную (число от 1 до 9999):</b>",
+            parse_mode="HTML"
+        )
+        # остаёмся в state Onboarding.boost — текстовый хендлер ниже поймает
+        await cb.answer()
+        return
+    val = int(raw)
     USER_BOOST[cb.from_user.id] = val
     await cb.answer("Буст: " + str(val) + "%")
     uid = cb.from_user.id
@@ -1253,6 +1300,38 @@ async def ob_boost(cb: CallbackQuery, state: FSMContext):
     ONBOARDING_DONE.add(uid)
     save_onboarding(ONBOARDING_DONE)
     await cb.message.answer(
+        "<b>Neptun Parser\n\nВыбери действие:</b>",
+        parse_mode="HTML",
+        reply_markup=main_menu_kb()
+    )
+
+# Онбординг шаг 3 — буст вручную (текст)
+@dp.message(Onboarding.boost)
+async def ob_boost_text(message: Message, state: FSMContext):
+    try:
+        val = int(message.text.strip())
+        if val < 1 or val > 9999:
+            raise ValueError
+    except ValueError:
+        await message.answer("<b>Введи число от 1 до 9999:</b>", parse_mode="HTML")
+        return
+    uid = message.from_user.id
+    USER_BOOST[uid] = val
+    mn  = get_min_gifts(uid)
+    mx  = get_max_gifts(uid)
+    mx_str = str(mx) if mx > 0 else "без лимита"
+    await state.clear()
+    await message.answer(
+        "<b>Настройка завершена!\n\n"
+        "Мин. гифтов: " + str(mn) + "\n"
+        "Макс. гифтов: " + mx_str + "\n"
+        "Буст: " + str(val) + "%\n\n"
+        "Можно изменить в Настройки</b>",
+        parse_mode="HTML"
+    )
+    ONBOARDING_DONE.add(uid)
+    save_onboarding(ONBOARDING_DONE)
+    await message.answer(
         "<b>Neptun Parser\n\nВыбери действие:</b>",
         parse_mode="HTML",
         reply_markup=main_menu_kb()
@@ -1479,10 +1558,37 @@ async def set_max_text(message: Message, state: FSMContext):
     )
 
 @dp.callback_query(F.data == "set_boost")
-async def cb_set_boost(cb: CallbackQuery):
+async def cb_set_boost(cb: CallbackQuery, state: FSMContext):
     txt = "<b>Буст цен</b>\n\n<b>100% = до x2 флора, 150% = до x2.5, 200% = до x3</b>"
     await cb.message.answer(txt, parse_mode="HTML", reply_markup=boost_picker_kb())
     await cb.answer()
+
+@dp.callback_query(F.data == "boost_custom")
+async def cb_boost_custom(cb: CallbackQuery, state: FSMContext):
+    await cb.message.answer(
+        "<b>Введи буст цен вручную (число от 1 до 9999):</b>",
+        parse_mode="HTML",
+        reply_markup=gifts_input_cancel_kb()
+    )
+    await state.set_state(SetGifts.boost)
+    await cb.answer()
+
+@dp.message(SetGifts.boost)
+async def set_boost_text(message: Message, state: FSMContext):
+    try:
+        val = int(message.text.strip())
+        if val < 1 or val > 9999:
+            raise ValueError
+    except ValueError:
+        await message.answer("<b>Введи число от 1 до 9999:</b>", parse_mode="HTML")
+        return
+    USER_BOOST[message.from_user.id] = val
+    await state.clear()
+    await message.answer(
+        "<b>Буст установлен: " + str(val) + "%</b>",
+        parse_mode="HTML",
+        reply_markup=settings_menu_kb(message.from_user.id)
+    )
 
 @dp.callback_query(F.data.startswith("boost_"))
 async def cb_boost(cb: CallbackQuery):
