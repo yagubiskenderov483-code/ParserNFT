@@ -473,6 +473,7 @@ def search_mode_select_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Поиск по профилю", callback_data="mode_profile")],
         [InlineKeyboardButton(text="Поиск по маркету", callback_data="mode_market")],
+        [InlineKeyboardButton(text="Поиск по модели",  callback_data="mode_model")],
         [InlineKeyboardButton(text="Назад",             callback_data="menu")],
     ])
 
@@ -587,7 +588,32 @@ def col_kb(names, prefix, back):
         if i + 1 < len(names):
             row.append(InlineKeyboardButton(text=names[i+1], callback_data=prefix + str(i+1)))
         rows.append(row)
-    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=back)])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data=back)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+MODEL_COL_PAGE_SIZE = 20
+
+def model_col_kb(names, page=0):
+    """Клавиатура коллекций для поиска по модели с пагинацией."""
+    start = page * MODEL_COL_PAGE_SIZE
+    end   = min(start + MODEL_COL_PAGE_SIZE, len(names))
+    chunk = names[start:end]
+    rows  = []
+    for i in range(0, len(chunk), 2):
+        idx1 = start + i
+        row  = [InlineKeyboardButton(text=chunk[i], callback_data="mdlcol_" + str(idx1))]
+        if i + 1 < len(chunk):
+            idx2 = start + i + 1
+            row.append(InlineKeyboardButton(text=chunk[i+1], callback_data="mdlcol_" + str(idx2)))
+        rows.append(row)
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="Назад", callback_data="mdlpage_" + str(page - 1)))
+    if end < len(names):
+        nav.append(InlineKeyboardButton(text="Далее", callback_data="mdlpage_" + str(page + 1)))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="Назад в меню", callback_data="search_mode_select")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def owner_card_kb(username, profile_url, owner_uid):
@@ -624,13 +650,17 @@ def nft_list_kb(nft_items, username, profile_url):
 # Онбординг кнопки
 def onboarding_min_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Пропустить (2 по умолчанию)", callback_data="ob_min_2")],
+        [InlineKeyboardButton(text="2 гифта",  callback_data="ob_min_2")],
+        [InlineKeyboardButton(text="3 гифта",  callback_data="ob_min_3")],
+        [InlineKeyboardButton(text="5 гифтов", callback_data="ob_min_5")],
     ])
 
 def onboarding_max_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Без лимита", callback_data="ob_max_0")],
-        [InlineKeyboardButton(text="Пропустить", callback_data="ob_max_0")],
+        [InlineKeyboardButton(text="10",  callback_data="ob_max_10")],
+        [InlineKeyboardButton(text="20",  callback_data="ob_max_20")],
+        [InlineKeyboardButton(text="50",  callback_data="ob_max_50")],
     ])
 
 def onboarding_boost_kb():
@@ -848,41 +878,22 @@ async def do_profile_search(
     global is_searching
     is_searching = True
     found        = 0
-    seen_owners  = {}
+    # uid -> кол-во лотов на маркете
     owner_market_count = {}
+    # uid -> (owner_obj, username, name)
+    seen_owners  = {}
     last_upd     = 0.0
     START_TIME   = asyncio.get_event_loop().time()
-    HARD_LIMIT   = 25.0
+    HARD_LIMIT   = 60.0  # увеличили лимит для профилей
 
-    async def fast_saved_gifts(user_id):
-        try:
-            result = await tg_client(GetSavedStarGiftsRequest(
-                peer=await tg_client.get_input_entity(user_id),
-                offset="", limit=50,
-            ))
-            items = []
-            for gift in (getattr(result, "gifts", None) or []):
-                nft_url = make_nft_url(gift)
-                if not nft_url:
-                    inner = getattr(gift, "gift", None)
-                    if inner:
-                        nft_url = make_nft_url(inner)
-                if nft_url:
-                    inner = getattr(gift, "gift", None) or gift
-                    title = getattr(inner, "title", None) or getattr(gift, "title", "?")
-                    num   = getattr(gift, "convert_stars", None) or getattr(gift, "num", "?")
-                    items.append({"title": title, "num": num, "nft_url": nft_url, "price": None})
-            return items
-        except Exception:
-            return []
-
-    async def build_index_fast():
-        BATCH = 40
+    # Шаг 1: собираем всех владельцев с маркета + считаем сколько у них лотов
+    async def build_market_index():
+        BATCH = 30
         ids   = list(gift_ids)
         for i in range(0, len(ids), BATCH):
             if not is_searching:
                 break
-            if asyncio.get_event_loop().time() - START_TIME > HARD_LIMIT * 0.45:
+            if asyncio.get_event_loop().time() - START_TIME > HARD_LIMIT * 0.4:
                 break
             batch   = ids[i:i+BATCH]
             results = await asyncio.gather(*[fetch_market_page(gid, "", limit=100) for gid in batch])
@@ -895,43 +906,71 @@ async def do_profile_search(
                     if uid not in seen_owners:
                         seen_owners[uid] = (item["owner"], item["username"], item["name"])
 
+    # Шаг 2: для каждого владельца проверяем профиль
+    async def fast_saved_gifts(user_id):
+        try:
+            result = await tg_client(GetSavedStarGiftsRequest(
+                peer=await tg_client.get_input_entity(user_id),
+                offset="", limit=100,
+            ))
+            items = []
+            for gift in (getattr(result, "gifts", None) or []):
+                nft_url = make_nft_url(gift)
+                if not nft_url:
+                    inner = getattr(gift, "gift", None)
+                    if inner:
+                        nft_url = make_nft_url(inner)
+                if nft_url:
+                    inner = getattr(gift, "gift", None) or gift
+                    title = getattr(inner, "title", None) or getattr(gift, "title", "?")
+                    num   = getattr(gift, "num", "?")
+                    items.append({"title": title, "num": num, "nft_url": nft_url, "price": None})
+            return items
+        except Exception as e:
+            logger.debug("fast_saved_gifts uid=%s: %s", user_id, e)
+            return []
+
     async def check_one(uid, owner_obj, username, name):
         nonlocal found
         if girls_only and not is_girl(owner_obj, username, name):
             return
         if model_only and not is_model(owner_obj):
             return
+        # Загружаем все гифты из профиля
         nft_gifts   = await fast_saved_gifts(uid)
         profile_cnt = len(nft_gifts)
         if profile_cnt == 0:
             return
         market_cnt  = owner_market_count.get(uid, 0)
-        # Показываем только тех у кого НЕТ ни одного гифта на рынке
-        if market_cnt > 0:
+        # Скрытые = в профиле но не на рынке
+        hidden_cnt  = profile_cnt - market_cnt
+        if hidden_cnt <= 0:
             return
-        if not gifts_in_range(profile_cnt, min_gifts, max_gifts):
+        if not gifts_in_range(hidden_cnt, min_gifts, max_gifts):
             return
         profile_url = ("https://t.me/" + username) if username else ("tg://user?id=" + str(uid))
         owner_str   = fmt_owner(owner_obj, username, name)
-        cache_owner(uid, owner_obj, username, name, profile_url, nft_gifts)
+        # Показываем только скрытые (не выставленные) гифты
+        hidden_items = nft_gifts  # все гифты профиля
+        cache_owner(uid, owner_obj, username, name, profile_url, hidden_items)
         kb  = owner_card_kb(username, profile_url, uid)
         txt = (
             "<b>Владелец: " + owner_str + "\n"
-            "NFT в профиле: " + str(profile_cnt) + " (на рынке нет)</b>"
+            "В профиле: " + str(profile_cnt) + " | На рынке: " + str(market_cnt) + " | Скрытых: " + str(hidden_cnt) + "</b>"
         )
         try:
             await status_msg.bot.send_message(
                 chat_id=status_msg.chat.id, text=txt,
                 parse_mode="HTML", reply_markup=kb,
             )
-            found += profile_cnt
-            stats["found"] += profile_cnt
+            found += hidden_cnt
+            stats["found"] += hidden_cnt
         except Exception as e:
             logger.warning("profile block: %s", e)
 
     try:
-        await status_msg.edit_text("<b>Сканирую коллекции...</b>", reply_markup=stop_kb())
-        await build_index_fast()
+        await status_msg.edit_text("<b>Сканирую маркет...</b>", reply_markup=stop_kb())
+        await build_market_index()
 
         if not is_searching:
             is_searching = False
@@ -939,12 +978,16 @@ async def do_profile_search(
 
         all_owners = list(seen_owners.items())
         total      = len(all_owners)
+
+        if total == 0:
+            return 0
+
         await status_msg.edit_text(
-            "<b>Найдено владельцев: " + str(total) + ". Проверяю профили...</b>",
+            "<b>Найдено продавцов: " + str(total) + ". Проверяю профили...</b>",
             reply_markup=stop_kb()
         )
 
-        PBATCH  = 20
+        PBATCH  = 10  # меньший батч чтобы не флудить
         checked = 0
         for i in range(0, len(all_owners), PBATCH):
             if not is_searching or found >= max_results:
@@ -955,7 +998,7 @@ async def do_profile_search(
             await asyncio.gather(*[check_one(uid, obj, un, nm) for uid, (obj, un, nm) in batch])
             checked += len(batch)
             now = asyncio.get_event_loop().time()
-            if now - last_upd > 1.5:
+            if now - last_upd > 2.0:
                 try:
                     lbl = "девушек" if girls_only else "профилей"
                     await status_msg.edit_text(
@@ -966,6 +1009,7 @@ async def do_profile_search(
                 except Exception:
                     pass
                 last_upd = now
+            await asyncio.sleep(0.1)  # небольшая пауза между батчами
 
     except Exception as e:
         logger.error("do_profile_search: %s", e)
@@ -980,7 +1024,7 @@ async def ensure_collections():
         await load_collections()
     return [gid for gid, _ in ALL_GIFT_IDS]
 
-async def run_market(cb, cat=None, girls=False, model=False, ids=None):
+async def run_market(cb, cat=None, girls=False, model=False, ids=None, col_name=None):
     global is_searching
     if is_searching:
         await cb.answer("Поиск уже идет!", show_alert=True)
@@ -997,7 +1041,9 @@ async def run_market(cb, cat=None, girls=False, model=False, ids=None):
     mn     = get_min_gifts(uid)
     mx     = get_max_gifts(uid)
     mx_str = str(mx) if mx > 0 else "без лимита"
-    if girls:
+    if col_name and model:
+        label = "Модели. " + col_name
+    elif girls:
         label = "Девушки. Маркет"
     elif model:
         label = "По модели. Маркет"
@@ -1510,6 +1556,50 @@ async def cb_mode_col(cb: CallbackQuery):
         return
     await cb.message.answer("<b>По коллекции: выбери источник:</b>", parse_mode="HTML", reply_markup=col_source_kb())
     await cb.answer()
+
+# Поиск по модели — показываем список всех коллекций
+@dp.callback_query(F.data == "mode_model")
+async def cb_mode_model(cb: CallbackQuery):
+    if not NFT_COLLECTIONS:
+        await load_collections()
+    if not NFT_COLLECTIONS:
+        await cb.message.answer("<b>Коллекции не загружены</b>", parse_mode="HTML", reply_markup=menu_kb())
+        await cb.answer()
+        return
+    names = list(NFT_COLLECTIONS.keys())
+    total = len(names)
+    await cb.message.answer(
+        "<b>Поиск по модели. Выбери коллекцию NFT:\n"
+        "Всего коллекций: " + str(total) + "</b>",
+        parse_mode="HTML",
+        reply_markup=model_col_kb(names, page=0)
+    )
+    await cb.answer()
+
+# Пагинация списка коллекций для поиска по модели
+@dp.callback_query(F.data.startswith("mdlpage_"))
+async def cb_mdlpage(cb: CallbackQuery):
+    page  = int(cb.data[8:])
+    names = list(NFT_COLLECTIONS.keys())
+    total = len(names)
+    await cb.message.edit_text(
+        "<b>Поиск по модели. Выбери коллекцию NFT:\n"
+        "Всего коллекций: " + str(total) + "</b>",
+        parse_mode="HTML",
+        reply_markup=model_col_kb(names, page=page)
+    )
+    await cb.answer()
+
+# Выбор коллекции для поиска по модели — запускаем маркет с model_only=True
+@dp.callback_query(F.data.startswith("mdlcol_"))
+async def cb_mdlcol(cb: CallbackQuery):
+    idx  = int(cb.data[7:])
+    lst  = list(NFT_COLLECTIONS.items())
+    if idx >= len(lst):
+        await cb.answer("Не найдено", show_alert=True)
+        return
+    col_name, col_id = lst[idx]
+    await run_market(cb, ids=[col_id], model=True, col_name=col_name)
 
 @dp.callback_query(F.data == "col_market")
 async def cb_col_market(cb: CallbackQuery):
