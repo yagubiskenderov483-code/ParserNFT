@@ -49,8 +49,19 @@ DEFAULT_BOOST     = 100
 DEFAULT_MIN_GIFTS = 2
 DEFAULT_MAX_GIFTS = 0
 
-# Флаги онбординга (первый запуск)
+# Флаги онбординга (первый запуск) — хранится в памяти, заполняется из users.json
 ONBOARDING_DONE = set()
+ONBOARDING_FILE = "onboarding_done.json"
+
+def load_onboarding():
+    if os.path.exists(ONBOARDING_FILE):
+        with open(ONBOARDING_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+def save_onboarding(s):
+    with open(ONBOARDING_FILE, "w") as f:
+        json.dump(list(s), f)
 
 PRICE_CATEGORIES = {
     "cheap":   {"label": "Дешевые",  "floor_min": None,   "floor_max": 2000},
@@ -151,21 +162,34 @@ async def check_authorized():
     except Exception:
         return False
 
-def is_girl(owner):
-    if not owner:
+def is_girl(owner, username_str=None, name_str=None):
+    if not owner and not username_str and not name_str:
         return False
-    first = (getattr(owner, "first_name", "") or "").lower().strip()
-    last  = (getattr(owner, "last_name",  "") or "").lower().strip()
-    uname = (getattr(owner, "username",   "") or "").lower().strip()
-    full  = first + " " + last + " " + uname
+    if owner:
+        first = (getattr(owner, "first_name", "") or "").lower().strip()
+        last  = (getattr(owner, "last_name",  "") or "").lower().strip()
+        uname = (getattr(owner, "username",   "") or "").lower().strip()
+    else:
+        first = ""
+        last  = ""
+        uname = (username_str or "").lower().strip()
+    # Если есть name_str — парсим из него first/last
+    if name_str and not first and not last:
+        parts = name_str.lower().strip().split()
+        first = parts[0] if parts else ""
+        last  = parts[1] if len(parts) > 1 else ""
+    full = first + " " + last + " " + uname
+    # Проверяем мужские ключевые слова как отдельные слова
     for kw in BOY_KW:
-        if kw in full:
+        if re.search(r'\b' + re.escape(kw) + r'\b', full):
             return False
+    # Проверяем женские имена
     for name in GIRL_NAMES:
         if first.startswith(name) or last.startswith(name):
             return True
-        if len(name) >= 3 and name in uname:
+        if len(name) >= 4 and name in uname:
             return True
+    # Проверяем женские ключевые слова
     for kw in GIRL_KW:
         if kw in full:
             return True
@@ -690,7 +714,7 @@ async def do_market_search(
             return
         if slug:
             seen_slugs.add(slug)
-        if girls_only and not is_girl(item["owner"]):
+        if girls_only and not is_girl(item["owner"], item.get("username"), item.get("name")):
             return
         if model_only and not is_model(item["owner"]):
             return
@@ -873,7 +897,7 @@ async def do_profile_search(
 
     async def check_one(uid, owner_obj, username, name):
         nonlocal found
-        if girls_only and not is_girl(owner_obj):
+        if girls_only and not is_girl(owner_obj, username, name):
             return
         if model_only and not is_model(owner_obj):
             return
@@ -882,10 +906,10 @@ async def do_profile_search(
         if profile_cnt == 0:
             return
         market_cnt  = owner_market_count.get(uid, 0)
-        hidden_nfts = profile_cnt - market_cnt
-        if hidden_nfts <= 0:
+        # Показываем только тех у кого НЕТ ни одного гифта на рынке
+        if market_cnt > 0:
             return
-        if not gifts_in_range(hidden_nfts, min_gifts, max_gifts):
+        if not gifts_in_range(profile_cnt, min_gifts, max_gifts):
             return
         profile_url = ("https://t.me/" + username) if username else ("tg://user?id=" + str(uid))
         owner_str   = fmt_owner(owner_obj, username, name)
@@ -893,15 +917,15 @@ async def do_profile_search(
         kb  = owner_card_kb(username, profile_url, uid)
         txt = (
             "<b>Владелец: " + owner_str + "\n"
-            "NFT в профиле: " + str(profile_cnt) + ", На рынке: " + str(market_cnt) + ", Скрыто: " + str(hidden_nfts) + "</b>"
+            "NFT в профиле: " + str(profile_cnt) + " (на рынке нет)</b>"
         )
         try:
             await status_msg.bot.send_message(
                 chat_id=status_msg.chat.id, text=txt,
                 parse_mode="HTML", reply_markup=kb,
             )
-            found += hidden_nfts
-            stats["found"] += hidden_nfts
+            found += profile_cnt
+            stats["found"] += profile_cnt
         except Exception as e:
             logger.warning("profile block: %s", e)
 
@@ -1045,20 +1069,19 @@ async def cmd_start(message: Message, state: FSMContext):
 
     if not await check_authorized() and is_admin(uid):
         await message.answer(
-            "<b>Нужна авторизация Telegram\nВведи номер: +79001234567</b>",
+            "<b>Нужна авторизация Telegram\nВведи номер телефона:</b>",
             parse_mode="HTML"
         )
         await state.set_state(Auth.phone)
         return
 
-    # Онбординг обязателен — пока не пройден, никуда не пускаем
+    # Онбординг обязателен - пока не пройден, никуда не пускаем
     if uid not in ONBOARDING_DONE:
-        ONBOARDING_DONE.add(uid)
         await message.answer(
             "<b>Добро пожаловать в Neptun Parser\n\n"
             "Сначала настроим поиск под тебя.\n\n"
-            "Шаг 1 из 3. Сколько минимум гифтов должно быть у владельца?\n"
-            "Напиши число (например 2):</b>",
+            "Шаг 1 из 3. Минимум гифтов у владельца\n"
+            "Напиши число:</b>",
             parse_mode="HTML",
             reply_markup=onboarding_min_kb()
         )
@@ -1175,6 +1198,9 @@ async def ob_boost(cb: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
         reply_markup=None
     )
+    # Онбординг завершён - сохраняем
+    ONBOARDING_DONE.add(uid)
+    save_onboarding(ONBOARDING_DONE)
     await cb.message.answer(
         "<b>Neptun Parser\n\nВыбери действие:</b>",
         parse_mode="HTML",
@@ -1205,26 +1231,33 @@ async def cmd_neptunteam(message: Message):
     bst    = get_boost(uid)
     mx_str = str(mx) if mx > 0 else "без лимита"
     txt = (
-        "<b>Neptun Parser. Справка по настройкам\n\n"
-        "Мин. гифтов — минимальное кол-во NFT у владельца\n"
-        "У кого меньше — не попадёт в результаты\n"
-        "Пример: мин=2, пропускаем всех у кого 1 NFT\n\n"
-        "Макс. гифтов — максимальное кол-во NFT у владельца\n"
-        "0 = без лимита\n"
-        "Пример: макс=10, не показываем тех у кого 11 и более\n\n"
-        "Буст цен — насколько выше флора ищем (только рынок)\n"
-        "Флор = минимальная цена в коллекции (нижние 25%)\n"
-        "Формула: цена от 0.7 флора до (1 + буст/100) флора\n\n"
-        "Примеры буста:\n"
-        "30% = цена до 1.3 флора\n"
-        "100% = цена до 2.0 флора\n"
-        "200% = цена до 3.0 флора\n\n"
-        "Режимы поиска:\n"
-        "По рынку — ищет NFT выставленные на продажу\n"
-        "По профилю — ищет владельцев у которых NFT в профиле, но не на рынке\n\n"
-        "Текущие настройки:\n"
-        "Мин: " + str(mn) + ", Макс: " + mx_str + ", Буст: " + str(bst) + "%\n\n"
-        "Меняй в Настройки или через /start</b>"
+        "<b>Neptun Parser\n\n"
+        "Бот ищет владельцев NFT-гифтов в Telegram по заданным фильтрам.\n\n"
+        "РЕЖИМЫ ПОИСКА\n\n"
+        "Поиск по маркету\n"
+        "Ищет NFT которые сейчас выставлены на продажу.\n"
+        "Фильтрует по цене относительно флора коллекции.\n"
+        "Флор = минимальная цена в коллекции (нижние 25%).\n"
+        "Буст определяет насколько выше флора смотреть.\n\n"
+        "Поиск по профилю\n"
+        "Ищет владельцев у которых NFT есть в профиле, но НЕТ ни одного на рынке.\n"
+        "Это люди которые держат гифты и не продают.\n\n"
+        "ФИЛЬТРЫ\n\n"
+        "Всех\n"
+        "Показывает всех владельцев без фильтра по полу.\n\n"
+        "Девушек\n"
+        "Фильтрует по имени и ключевым словам в профиле.\n\n"
+        "По модели\n"
+        "Ищет по ключевым словам: onlyfans, model, content, nsfw и другим.\n\n"
+        "НАСТРОЙКИ\n\n"
+        "Мин. гифтов: " + str(mn) + "\n"
+        "Минимальное количество NFT у владельца. Те у кого меньше не показываются.\n\n"
+        "Макс. гифтов: " + mx_str + "\n"
+        "Максимальное количество. 0 означает без лимита.\n\n"
+        "Буст цен: " + str(bst) + "%\n"
+        "Только для поиска по маркету.\n"
+        "100% = ищем до x2 флора, 200% = до x3 флора.\n\n"
+        "Поменять настройки можно через кнопку Настройки в главном меню.</b>"
     )
     await message.answer(txt, parse_mode="HTML", reply_markup=main_menu_kb())
 
@@ -1273,7 +1306,7 @@ async def cb_show_nft(cb: CallbackQuery):
         await cb.answer("Список пуст", show_alert=True)
         return
     kb  = nft_list_kb(items, username, profile_url)
-    txt = "<b>NFT — " + owner_str + "\nВсего: " + str(len(items)) + "</b>"
+    txt = "<b>NFT: " + owner_str + "\nВсего: " + str(len(items)) + "</b>"
     await cb.message.answer(txt, parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data == "search_mode_select")
@@ -1341,7 +1374,7 @@ async def cb_settings(cb: CallbackQuery):
 async def cb_set_min(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer(
         "<b>Минимум гифтов у владельца:\n"
-        "Напиши число (например 2):</b>",
+        "Напиши число:</b>",
         parse_mode="HTML",
         reply_markup=gifts_input_cancel_kb()
     )
@@ -1475,7 +1508,7 @@ async def cb_mode_col(cb: CallbackQuery):
         await cb.message.answer("<b>Коллекции не загружены</b>", parse_mode="HTML", reply_markup=menu_kb())
         await cb.answer()
         return
-    await cb.message.answer("<b>По коллекции — выбери источник:</b>", parse_mode="HTML", reply_markup=col_source_kb())
+    await cb.message.answer("<b>По коллекции: выбери источник:</b>", parse_mode="HTML", reply_markup=col_source_kb())
     await cb.answer()
 
 @dp.callback_query(F.data == "col_market")
@@ -1617,7 +1650,7 @@ async def cb_admin_broadcast(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         return
     await state.set_state(Broadcast.message)
-    await cb.message.answer("<b>Отправь сообщение для рассылки. /cancel — отмена</b>", parse_mode="HTML", reply_markup=cancel_kb())
+    await cb.message.answer("<b>Отправь сообщение для рассылки. /cancel - отмена</b>", parse_mode="HTML", reply_markup=cancel_kb())
     await cb.answer()
 
 @dp.message(Broadcast.message)
@@ -1680,7 +1713,7 @@ async def cb_admin_auth(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         return
     await state.clear()
-    await cb.message.answer("<b>Введи номер:</b> <code>+79001234567</code>", parse_mode="HTML")
+    await cb.message.answer("<b>Введи номер телефона:</b>", parse_mode="HTML")
     await state.set_state(Auth.phone)
     await cb.answer()
 
@@ -1711,7 +1744,7 @@ async def auth_phone(message: Message, state: FSMContext):
         return
     phone = message.text.strip()
     if not phone.startswith("+"):
-        await message.answer("<b>Формат:</b> <code>+79001234567</code>", parse_mode="HTML")
+        await message.answer("<b>Формат: +71234567890</b>", parse_mode="HTML")
         return
     try:
         if not tg_client.is_connected():
@@ -1720,7 +1753,7 @@ async def auth_phone(message: Message, state: FSMContext):
         res = await tg_client.send_code_request(phone)
         await state.update_data(phone=phone, phone_code_hash=res.phone_code_hash)
         await state.set_state(Auth.code)
-        await message.answer("<b>Код отправлен. Введи:</b> <code>1 2 3 4 5</code>", parse_mode="HTML")
+        await message.answer("<b>Код отправлен. Введи код:</b>", parse_mode="HTML")
     except Exception as e:
         await message.answer("<b>Ошибка:</b> <code>" + str(e) + "</code>", parse_mode="HTML")
         await state.clear()
@@ -1764,6 +1797,8 @@ async def auth_password(message: Message, state: FSMContext):
 
 
 async def main():
+    global ONBOARDING_DONE
+    ONBOARDING_DONE = load_onboarding()
     if not tg_client.is_connected():
         await tg_client.connect()
     logger.info("Neptun Parser запущен!")
@@ -1775,7 +1810,7 @@ async def main():
             await load_collections()
             logger.info("Авторизован, коллекций: %d", len(ALL_GIFT_IDS))
         else:
-            logger.warning("Не авторизован — пройди /start")
+            logger.warning("Не авторизован, пройди /start")
     except Exception as e:
         logger.error("Ошибка старта: %s", e)
     try:
