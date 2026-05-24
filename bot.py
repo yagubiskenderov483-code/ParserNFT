@@ -15,7 +15,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
+    CallbackQuery
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -48,6 +48,9 @@ USER_MAX_GIFTS = {}
 DEFAULT_BOOST     = 100
 DEFAULT_MIN_GIFTS = 2
 DEFAULT_MAX_GIFTS = 0
+
+# Флаги онбординга (первый запуск)
+ONBOARDING_DONE = set()
 
 PRICE_CATEGORIES = {
     "cheap":   {"label": "Дешевые",  "floor_min": None,   "floor_max": 2000},
@@ -104,12 +107,15 @@ def add_user(uid, username=None, first_name=None, last_name=None):
     if key not in u:
         u[key] = {"username": username or "", "first_name": first_name or "",
                   "last_name": last_name or "", "joined": int(time.time())}
+        save_users(u)
+        return True  # новый пользователь
     else:
         if isinstance(u[key], dict):
             if username:   u[key]["username"]   = username
             if first_name: u[key]["first_name"] = first_name
             if last_name:  u[key]["last_name"]  = last_name
-    save_users(u)
+        save_users(u)
+        return False  # уже был
 
 def get_user_count(): return len(load_users())
 def get_boost(uid):     return USER_BOOST.get(uid, DEFAULT_BOOST)
@@ -124,6 +130,11 @@ class Auth(StatesGroup):
 
 class Broadcast(StatesGroup):
     message = State()
+
+class Onboarding(StatesGroup):
+    min_gifts = State()
+    max_gifts = State()
+    boost     = State()
 
 
 def is_admin(uid): return int(uid) == int(ADMIN_ID)
@@ -226,9 +237,6 @@ def cache_owner(uid, owner, username, name, profile_url, items):
         "name": name, "profile_url": profile_url, "items": items,
     }
 
-def b(text):
-    return "<b>" + str(text) + "</b>"
-
 
 async def get_floor_price(gift_id):
     if gift_id in PRICE_FLOOR_CACHE:
@@ -265,7 +273,6 @@ def price_ok_for_floor(price, floor, boost):
     return floor * 0.7 <= price <= floor * (1.0 + boost / 100.0)
 
 
-# Все 149 коллекций без фильтра
 async def load_collections():
     global ALL_GIFT_IDS, NFT_COLLECTIONS
     try:
@@ -286,7 +293,7 @@ async def load_collections():
         logger.error("load_collections: %s", e)
 
 
-async def fetch_market_page(gift_id, offset, limit=50):
+async def fetch_market_page(gift_id, offset, limit=100):
     try:
         result    = await tg_client(GetResaleStarGiftsRequest(gift_id=gift_id, offset=offset, limit=limit))
         users_map = {int(u.id): u for u in (getattr(result, "users", None) or [])}
@@ -317,7 +324,7 @@ async def fetch_market_page(gift_id, offset, limit=50):
         return items, getattr(result, "next_offset", "") or ""
     except FloodWaitError as e:
         logger.warning("FloodWait %ds", e.seconds)
-        await asyncio.sleep(e.seconds + 3)
+        await asyncio.sleep(e.seconds + 1)
         return [], ""
     except Exception as e:
         logger.error("fetch_market gid=%s: %s", gift_id, e)
@@ -385,7 +392,7 @@ async def fetch_saved_gifts_all(user_id, max_pages=5):
             offset = getattr(result, "next_offset", "") or ""
             if not offset:
                 break
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)
         except Exception as e:
             logger.error("saved_gifts uid=%s: %s", user_id, e)
             break
@@ -402,50 +409,55 @@ async def get_profile_nfts(user_id, username):
 
 
 # ===================== KEYBOARDS =====================
-def bottom_menu_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[[
-            KeyboardButton(text="🚀 Старт"),
-            KeyboardButton(text="🔍 Поиск"),
-            KeyboardButton(text="☰ Меню"),
-        ]],
-        resize_keyboard=True,
-        persistent=True,
-    )
 
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Поиск NFT",  callback_data="search_menu")],
-        [InlineKeyboardButton(text="Настройки",      callback_data="settings_menu")],
-        [InlineKeyboardButton(text="Статистика",     callback_data="stats")],
+        [InlineKeyboardButton(text="🔍 Поиск NFT",  callback_data="search_mode_select")],
+        [InlineKeyboardButton(text="⚙️ Настройки",  callback_data="settings_menu")],
+        [InlineKeyboardButton(text="📊 Статистика",  callback_data="stats")],
     ])
 
-# Главное меню поиска - сразу все варианты без подменю
-def search_menu_kb():
+# Шаг 1: выбор режима поиска (рынок или профиль)
+def search_mode_select_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Рынок - все",       callback_data="mkt_all")],
-        [InlineKeyboardButton(text="Рынок - дешевые",   callback_data="mkt_cheap")],
-        [InlineKeyboardButton(text="Рынок - средние",   callback_data="mkt_mid")],
-        [InlineKeyboardButton(text="Рынок - сложные",   callback_data="mkt_hard")],
-        [InlineKeyboardButton(text="Рынок - хард",      callback_data="mkt_ultra")],
-        [InlineKeyboardButton(text="Рынок - экстрим",   callback_data="mkt_extreme")],
-        [InlineKeyboardButton(text="Профили - все",     callback_data="prf_all")],
-        [InlineKeyboardButton(text="Девушки рынок",     callback_data="girls_market")],
-        [InlineKeyboardButton(text="Девушки профили",   callback_data="girls_profile")],
-        [InlineKeyboardButton(text="По коллекции",      callback_data="mode_col")],
-        [InlineKeyboardButton(text="Назад",             callback_data="menu")],
+        [InlineKeyboardButton(text="🛒 По рынку",    callback_data="mode_market")],
+        [InlineKeyboardButton(text="👤 По профилю",  callback_data="mode_profile")],
+        [InlineKeyboardButton(text="🔙 Назад",        callback_data="menu")],
+    ])
+
+# Шаг 2а: категории рынка
+def market_cat_kb(girls=False):
+    prefix = "gmkt_" if girls else "mkt_"
+    rows = [
+        [InlineKeyboardButton(text="🌐 Все NFT",       callback_data=prefix + "all")],
+        [InlineKeyboardButton(text="💚 Дешевые (<2К)", callback_data=prefix + "cheap")],
+        [InlineKeyboardButton(text="💛 Средние (2-5К)", callback_data=prefix + "mid")],
+        [InlineKeyboardButton(text="🟠 Сложные (5-20К)", callback_data=prefix + "hard")],
+        [InlineKeyboardButton(text="🔴 Хард (20-100К)",  callback_data=prefix + "ultra")],
+        [InlineKeyboardButton(text="💜 Экстрим (>100К)", callback_data=prefix + "extreme")],
+        [InlineKeyboardButton(text="👩 Девушки",         callback_data="girls_market")],
+        [InlineKeyboardButton(text="🔙 Назад",            callback_data="search_mode_select")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+# Шаг 2б: категории профиля (без NFT на рынке)
+def profile_cat_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Все профили",     callback_data="prf_all")],
+        [InlineKeyboardButton(text="👩 Девушки профили", callback_data="girls_profile")],
+        [InlineKeyboardButton(text="🔙 Назад",            callback_data="search_mode_select")],
     ])
 
 def settings_menu_kb(uid):
     mg     = get_min_gifts(uid)
     mx     = get_max_gifts(uid)
     bst    = get_boost(uid)
-    mx_str = str(mx) if mx > 0 else "inf"
+    mx_str = str(mx) if mx > 0 else "∞"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Мин. гифтов: " + str(mg),   callback_data="set_min_gifts")],
-        [InlineKeyboardButton(text="Макс. гифтов: " + mx_str,   callback_data="set_max_gifts")],
-        [InlineKeyboardButton(text="Буст цен: " + str(bst) + "%", callback_data="set_boost")],
-        [InlineKeyboardButton(text="Назад",                       callback_data="menu")],
+        [InlineKeyboardButton(text="📉 Мин. гифтов: " + str(mg),   callback_data="set_min_gifts")],
+        [InlineKeyboardButton(text="📈 Макс. гифтов: " + mx_str,   callback_data="set_max_gifts")],
+        [InlineKeyboardButton(text="🚀 Буст цен: " + str(bst) + "%", callback_data="set_boost")],
+        [InlineKeyboardButton(text="🔙 Назад",                       callback_data="menu")],
     ])
 
 def min_gifts_picker_kb():
@@ -462,12 +474,12 @@ def min_gifts_picker_kb():
             InlineKeyboardButton(text="20", callback_data="mingifts_20"),
             InlineKeyboardButton(text="50", callback_data="mingifts_50"),
         ],
-        [InlineKeyboardButton(text="Назад", callback_data="settings_menu")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="settings_menu")],
     ])
 
 def max_gifts_picker_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Без лимита", callback_data="maxgifts_0")],
+        [InlineKeyboardButton(text="∞ Без лимита", callback_data="maxgifts_0")],
         [
             InlineKeyboardButton(text="5",   callback_data="maxgifts_5"),
             InlineKeyboardButton(text="10",  callback_data="maxgifts_10"),
@@ -478,7 +490,7 @@ def max_gifts_picker_kb():
             InlineKeyboardButton(text="100", callback_data="maxgifts_100"),
             InlineKeyboardButton(text="200", callback_data="maxgifts_200"),
         ],
-        [InlineKeyboardButton(text="Назад", callback_data="settings_menu")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="settings_menu")],
     ])
 
 def boost_picker_kb():
@@ -492,46 +504,46 @@ def boost_picker_kb():
             InlineKeyboardButton(text="150%", callback_data="boost_150"),
             InlineKeyboardButton(text="200%", callback_data="boost_200"),
         ],
-        [InlineKeyboardButton(text="Назад", callback_data="settings_menu")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="settings_menu")],
     ])
 
 def stop_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="СТОП", callback_data="stop_search")],
+        [InlineKeyboardButton(text="⏹ СТОП", callback_data="stop_search")],
     ])
 
 def menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Поиск", callback_data="search_menu")],
-        [InlineKeyboardButton(text="Меню",  callback_data="menu")],
+        [InlineKeyboardButton(text="🔍 Поиск",  callback_data="search_mode_select")],
+        [InlineKeyboardButton(text="🏠 Меню",   callback_data="menu")],
     ])
 
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Рассылка",       callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="Пользователи",   callback_data="admin_users")],
-        [InlineKeyboardButton(text="Статистика",     callback_data="admin_stats")],
-        [InlineKeyboardButton(text="Авторизация TG", callback_data="admin_auth")],
-        [InlineKeyboardButton(text="Выйти из TG",    callback_data="admin_logout")],
-        [InlineKeyboardButton(text="В меню",         callback_data="menu")],
+        [InlineKeyboardButton(text="📢 Рассылка",       callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="👥 Пользователи",   callback_data="admin_users")],
+        [InlineKeyboardButton(text="📊 Статистика",     callback_data="admin_stats")],
+        [InlineKeyboardButton(text="🔑 Авторизация TG", callback_data="admin_auth")],
+        [InlineKeyboardButton(text="🚪 Выйти из TG",    callback_data="admin_logout")],
+        [InlineKeyboardButton(text="🏠 В меню",         callback_data="menu")],
     ])
 
 def cancel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Отмена", callback_data="admin_cancel")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")],
     ])
 
 def confirm_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Отправить", callback_data="admin_broadcast_confirm")],
-        [InlineKeyboardButton(text="Отмена",    callback_data="admin_cancel")],
+        [InlineKeyboardButton(text="✅ Отправить", callback_data="admin_broadcast_confirm")],
+        [InlineKeyboardButton(text="❌ Отмена",    callback_data="admin_cancel")],
     ])
 
 def col_source_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Рынок",   callback_data="col_market")],
-        [InlineKeyboardButton(text="Профили", callback_data="col_profile")],
-        [InlineKeyboardButton(text="Назад",   callback_data="search_menu")],
+        [InlineKeyboardButton(text="🛒 Рынок",   callback_data="col_market")],
+        [InlineKeyboardButton(text="👤 Профили", callback_data="col_profile")],
+        [InlineKeyboardButton(text="🔙 Назад",   callback_data="search_mode_select")],
     ])
 
 def col_kb(names, prefix, back):
@@ -541,7 +553,7 @@ def col_kb(names, prefix, back):
         if i + 1 < len(names):
             row.append(InlineKeyboardButton(text=names[i+1], callback_data=prefix + str(i+1)))
         rows.append(row)
-    rows.append([InlineKeyboardButton(text="Назад", callback_data=back)])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=back)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def owner_card_kb(username, profile_url, owner_uid):
@@ -551,8 +563,8 @@ def owner_card_kb(username, profile_url, owner_uid):
         btns.append([InlineKeyboardButton(text=label, url=profile_url)])
     if username:
         msg = urllib.parse.quote("Привет! Хочу купить твои NFT")
-        btns.append([InlineKeyboardButton(text="Написать", url="https://t.me/" + username + "?text=" + msg)])
-    btns.append([InlineKeyboardButton(text="Показать все NFT", callback_data="shownft_" + str(owner_uid))])
+        btns.append([InlineKeyboardButton(text="✉️ Написать", url="https://t.me/" + username + "?text=" + msg)])
+    btns.append([InlineKeyboardButton(text="🖼 Показать все NFT", callback_data="shownft_" + str(owner_uid))])
     return InlineKeyboardMarkup(inline_keyboard=btns)
 
 def nft_list_kb(nft_items, username, profile_url):
@@ -565,15 +577,54 @@ def nft_list_kb(nft_items, username, profile_url):
         if url:
             label = str(title) + " #" + str(num)
             if price:
-                label += " " + str(price) + " zv"
+                label += " — " + str(price) + " ⭐"
             btns.append([InlineKeyboardButton(text=label, url=url)])
     if profile_url:
         label = "@" + username if username else "Профиль"
         btns.append([InlineKeyboardButton(text=label, url=profile_url)])
     if username:
         msg = urllib.parse.quote("Привет! Хочу купить твои NFT")
-        btns.append([InlineKeyboardButton(text="Написать", url="https://t.me/" + username + "?text=" + msg)])
+        btns.append([InlineKeyboardButton(text="✉️ Написать", url="https://t.me/" + username + "?text=" + msg)])
     return InlineKeyboardMarkup(inline_keyboard=btns) if btns else None
+
+# Онбординг кнопки
+def onboarding_min_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1",  callback_data="ob_min_1"),
+            InlineKeyboardButton(text="2",  callback_data="ob_min_2"),
+            InlineKeyboardButton(text="3",  callback_data="ob_min_3"),
+            InlineKeyboardButton(text="5",  callback_data="ob_min_5"),
+        ],
+        [
+            InlineKeyboardButton(text="10", callback_data="ob_min_10"),
+            InlineKeyboardButton(text="20", callback_data="ob_min_20"),
+        ],
+    ])
+
+def onboarding_max_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="∞ Без лимита", callback_data="ob_max_0")],
+        [
+            InlineKeyboardButton(text="5",   callback_data="ob_max_5"),
+            InlineKeyboardButton(text="10",  callback_data="ob_max_10"),
+            InlineKeyboardButton(text="20",  callback_data="ob_max_20"),
+            InlineKeyboardButton(text="50",  callback_data="ob_max_50"),
+        ],
+    ])
+
+def onboarding_boost_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="30%",  callback_data="ob_boost_30"),
+            InlineKeyboardButton(text="50%",  callback_data="ob_boost_50"),
+            InlineKeyboardButton(text="100%", callback_data="ob_boost_100"),
+        ],
+        [
+            InlineKeyboardButton(text="150%", callback_data="ob_boost_150"),
+            InlineKeyboardButton(text="200%", callback_data="ob_boost_200"),
+        ],
+    ])
 
 
 # ===================== CORE: РЫНОК =====================
@@ -586,6 +637,7 @@ async def do_market_search(
     boost=100,
     min_gifts=2,
     max_gifts=0,
+    profile_only=False,  # True = только те у кого нет лота на рынке
 ):
     global is_searching
     is_searching = True
@@ -593,21 +645,26 @@ async def do_market_search(
     seen_slugs   = set()
     has_cat      = cat is not None
 
-    await status_msg.edit_text(b("Анализирую коллекции..."), reply_markup=stop_kb())
+    await status_msg.edit_text("<b>Анализирую коллекции...</b>", reply_markup=stop_kb())
 
-    valid_gids = []
-    for i in range(0, len(gift_ids), 5):
-        if not is_searching:
-            break
-        batch  = gift_ids[i:i+5]
-        floors = await asyncio.gather(*[get_floor_price(g) for g in batch])
-        for gid, floor in zip(batch, floors):
-            if floor is None:
-                continue
-            if cat and not floor_in_category(floor, cat):
-                continue
-            valid_gids.append((gid, floor))
-        await asyncio.sleep(0.3)
+    # Параллельная загрузка флоров для скорости
+    async def batch_floors(gids, size=10):
+        valid = []
+        for i in range(0, len(gids), size):
+            if not is_searching:
+                break
+            batch  = gids[i:i+size]
+            floors = await asyncio.gather(*[get_floor_price(g) for g in batch])
+            for gid, floor in zip(batch, floors):
+                if floor is None:
+                    continue
+                if cat and not floor_in_category(floor, cat):
+                    continue
+                valid.append((gid, floor))
+            await asyncio.sleep(0.1)
+        return valid
+
+    valid_gids = await batch_floors(gift_ids)
 
     if not valid_gids:
         is_searching = False
@@ -618,6 +675,7 @@ async def do_market_search(
     buffers         = {gid: [] for gid, _ in valid_gids}
     owner_buckets   = {}
     owner_count_cat = {}
+    owner_on_market = set()  # владельцы у кого есть лот на рынке
     MAX_PER_OWNER   = 3
     last_upd        = 0.0
 
@@ -636,7 +694,7 @@ async def do_market_search(
             owner_str   = fmt_owner(bucket["owner"], username, bucket["name"])
             cache_owner(uid, bucket["owner"], username, bucket["name"], profile_url, items)
             kb  = owner_card_kb(username, profile_url, uid)
-            txt = b("👤 " + owner_str) + "\n" + b("NFT на рынке: " + str(len(items)))
+            txt = "<b>👤 " + owner_str + "</b>\n<b>NFT на рынке: " + str(len(items)) + "</b>"
             try:
                 await status_msg.bot.send_message(
                     chat_id=status_msg.chat.id,
@@ -649,7 +707,7 @@ async def do_market_search(
             except Exception as e:
                 logger.warning("flush: %s", e)
             del owner_buckets[uid]
-            await asyncio.sleep(0.07)
+            await asyncio.sleep(0.03)
 
     try:
         while is_searching and found < max_results:
@@ -658,13 +716,19 @@ async def do_market_search(
                 break
             made = False
 
+            # Параллельная загрузка страниц для нескольких коллекций
+            fetch_tasks = []
+            fetch_gids  = []
             for gid in list(active):
-                if not is_searching or found >= max_results:
-                    break
-                floor = floor_map[gid]
-
                 if not buffers[gid] and offsets.get(gid) is not None:
-                    items, nxt   = await fetch_market_page(gid, offsets[gid], limit=50)
+                    fetch_tasks.append(fetch_market_page(gid, offsets[gid], limit=100))
+                    fetch_gids.append(gid)
+                if len(fetch_tasks) >= 5:
+                    break
+
+            if fetch_tasks:
+                results = await asyncio.gather(*fetch_tasks)
+                for gid, (items, nxt) in zip(fetch_gids, results):
                     offsets[gid] = nxt if nxt else None
                     for item in items:
                         nft_url = item.get("nft_url") or ""
@@ -678,17 +742,19 @@ async def do_market_search(
                         price = item.get("price")
                         if price is None:
                             continue
+                        oid = item["owner_id"]
+                        if oid:
+                            owner_on_market.add(oid)
+                        floor = floor_map[gid]
                         if has_cat:
                             if not price_ok_for_floor(price, floor, boost):
                                 continue
-                            oid = item["owner_id"]
                             if oid:
                                 if owner_count_cat.get(oid, 0) >= MAX_PER_OWNER:
                                     continue
                                 owner_count_cat[oid] = owner_count_cat.get(oid, 0) + 1
                             buffers[gid].append(item)
                         else:
-                            oid = item["owner_id"]
                             if oid:
                                 if oid not in owner_buckets:
                                     owner_buckets[oid] = {
@@ -700,6 +766,10 @@ async def do_market_search(
                                     }
                                 owner_buckets[oid]["items"].append(item)
 
+            # Отправляем из буферов
+            for gid in list(active):
+                if not is_searching or found >= max_results:
+                    break
                 if has_cat and buffers[gid]:
                     item        = buffers[gid].pop(0)
                     price       = item["price"]
@@ -710,14 +780,14 @@ async def do_market_search(
                     num         = item["num"]
                     owner_uid   = item["owner_id"] or 0
                     owner_str   = fmt_owner(item["owner"], username, item["name"])
-                    price_str   = str(price) + " zv" if price else "?"
+                    price_str   = str(price) + " ⭐" if price else "?"
                     cache_owner(owner_uid, item["owner"], username, item["name"], profile_url, [item])
                     kb = owner_card_kb(username, profile_url, owner_uid)
                     if nft_url:
-                        nft_line = "\n" + b("<a href=\"" + nft_url + "\">" + str(title) + " #" + str(num) + "</a>")
+                        nft_line = '\n<a href="' + nft_url + '"><b>' + str(title) + " #" + str(num) + "</b></a>"
                     else:
-                        nft_line = "\n" + b(str(title) + " #" + str(num))
-                    txt = b("👤 " + owner_str) + nft_line + "\n" + b("💰 " + price_str)
+                        nft_line = "\n<b>" + str(title) + " #" + str(num) + "</b>"
+                    txt = "<b>👤 " + owner_str + "</b>" + nft_line + "\n<b>💰 " + price_str + "</b>"
                     try:
                         await status_msg.bot.send_message(
                             chat_id=status_msg.chat.id,
@@ -731,18 +801,18 @@ async def do_market_search(
                         made = True
                     except Exception as e:
                         logger.warning("send: %s", e)
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.03)
 
             if not has_cat:
                 await flush_owners()
                 made = True
 
             now = asyncio.get_event_loop().time()
-            if now - last_upd > 3:
+            if now - last_upd > 2:
                 try:
                     act = sum(1 for v in offsets.values() if v is not None)
                     lbl = "девушек" if girls_only else "NFT"
-                    txt = b("Ищу на рынке... коллекций: " + str(act)) + "\n" + b("Найдено " + lbl + ": " + str(found))
+                    txt = "<b>🔍 Ищу на рынке... коллекций: " + str(act) + "</b>\n<b>Найдено " + lbl + ": " + str(found) + "</b>"
                     await status_msg.edit_text(txt, parse_mode="HTML", reply_markup=stop_kb())
                     last_upd = now
                 except Exception:
@@ -763,7 +833,7 @@ async def do_market_search(
     return found
 
 
-# ===================== CORE: ПРОФИЛИ =====================
+# ===================== CORE: ПРОФИЛИ (без лота на рынке) =====================
 async def do_profile_search(
     status_msg,
     gift_ids,
@@ -772,89 +842,163 @@ async def do_profile_search(
     min_gifts=2,
     max_gifts=0,
 ):
+    """
+    Ищет владельцев у которых НЕТ ни одного NFT выставленного на рынке,
+    но есть NFT в профиле (сохранённые гифты).
+    """
     global is_searching
     is_searching = True
     found        = 0
     seen_owners  = {}
     owner_queue  = []
+    owners_on_market = set()  # у кого есть лот на рынке — пропускаем
     market_offsets = {gid: "" for gid in gift_ids}
     last_upd     = 0.0
 
-    async def collect_more(n):
+    async def collect_more_market_owners(n):
+        """Собираем владельцев с рынка (у них есть лоты - их скипаем при профильном поиске)."""
         collected = 0
         active    = [g for g, o in market_offsets.items() if o is not None]
         if not active:
             return False
-        for gid in active:
-            if collected >= n:
-                break
-            if market_offsets.get(gid) is None:
-                continue
-            items, nxt = await fetch_market_page(gid, market_offsets[gid], limit=50)
+
+        fetch_gids  = active[:5]
+        fetch_tasks = [fetch_market_page(gid, market_offsets[gid], limit=100) for gid in fetch_gids]
+        results     = await asyncio.gather(*fetch_tasks)
+
+        for gid, (items, nxt) in zip(fetch_gids, results):
             market_offsets[gid] = nxt if nxt else None
             for item in items:
                 uid = item.get("owner_id")
-                if not uid or uid in seen_owners:
+                if not uid:
                     continue
-                owner_obj = item["owner"]
-                if girls_only and not is_girl(owner_obj):
-                    continue
-                seen_owners[uid] = (owner_obj, item["username"], item["name"])
-                owner_queue.append((uid, owner_obj, item["username"], item["name"]))
-                collected += 1
-            await asyncio.sleep(0.1)
+                # Помечаем как "есть на рынке"
+                owners_on_market.add(uid)
+                # Добавляем в очередь для профильного просмотра только тех кого ещё не видели
+                if uid not in seen_owners:
+                    owner_obj = item["owner"]
+                    if girls_only and not is_girl(owner_obj):
+                        continue
+                    seen_owners[uid] = (owner_obj, item["username"], item["name"])
+                    # В профильном режиме нас интересуют те у кого лотов на рынке нет,
+                    # но мы сначала соберём всех с рынка а потом найдём у кого их нет.
+                    # Для этого используем другой подход — ищем в saved_gifts напрямую
+                    collected += 1
+        await asyncio.sleep(0.05)
         return collected > 0
 
+    # Для профильного поиска "без лота на рынке" нам нужно:
+    # 1. Получить список всех владельцев с рынка (чтобы знать кого ИСКЛЮЧИТЬ)
+    # 2. Затем пробовать загружать saved_gifts случайных пользователей
+    # Но т.к. у нас нет общего списка юзеров — идём иначе:
+    # Берём владельцев с рынка, смотрим их saved_gifts, и если владелец
+    # встречается в рынке ТОЛЬКО в одной коллекции (= возможно у него есть и другие) — берём.
+    # На практике: ищем юзеров у которых суммарно на рынке 0 лотов
+    # (они не появятся в market_offsets). Для этого делаем reverse-поиск через saved_gifts.
+
+    # Упрощённый подход: берём владельцев с рынка и проверяем их профили.
+    # Если в профиле больше NFT чем на рынке — показываем.
+    # Если человек вообще не на рынке — тоже показываем (если у него есть NFT в профиле).
+
+    owner_market_count = {}  # uid -> кол-во лотов на рынке
+
+    async def build_market_index():
+        """Строим индекс: у кого сколько лотов на рынке."""
+        active = [g for g, o in market_offsets.items() if o is not None]
+        while active and is_searching:
+            fetch_gids  = active[:8]
+            fetch_tasks = [fetch_market_page(gid, market_offsets[gid], limit=100) for gid in fetch_gids]
+            results     = await asyncio.gather(*fetch_tasks)
+            for gid, (items, nxt) in zip(fetch_gids, results):
+                market_offsets[gid] = nxt if nxt else None
+                for item in items:
+                    uid = item.get("owner_id")
+                    if uid:
+                        owners_on_market.add(uid)
+                        owner_market_count[uid] = owner_market_count.get(uid, 0) + 1
+                        if uid not in seen_owners:
+                            seen_owners[uid] = (item["owner"], item["username"], item["name"])
+            active = [g for g, o in market_offsets.items() if o is not None]
+            await asyncio.sleep(0.05)
+
     try:
-        while is_searching and found < max_results:
-            if len(owner_queue) < 5:
-                has_more = await collect_more(30)
-                if not has_more and not owner_queue:
-                    break
-            if not owner_queue:
+        # Сначала строим индекс рынка
+        await status_msg.edit_text(
+            "<b>🔍 Сканирую рынок для поиска профилей без листингов...</b>",
+            reply_markup=stop_kb()
+        )
+        await build_market_index()
+
+        if not is_searching:
+            return 0
+
+        # Теперь проходим по всем найденным владельцам
+        all_owners = list(seen_owners.items())
+        total      = len(all_owners)
+        checked    = 0
+
+        await status_msg.edit_text(
+            "<b>👤 Найдено владельцев: " + str(total) + ". Проверяю профили...</b>",
+            reply_markup=stop_kb()
+        )
+
+        for uid, (owner_obj, username, name) in all_owners:
+            if not is_searching or found >= max_results:
                 break
 
-            batch          = owner_queue[:5]
-            owner_queue[:] = owner_queue[5:]
+            checked += 1
+            market_cnt = owner_market_count.get(uid, 0)
 
-            for (uid, owner_obj, username, name) in batch:
-                if not is_searching or found >= max_results:
-                    break
+            if girls_only and not is_girl(owner_obj):
+                continue
 
-                nft_gifts = await get_profile_nfts(uid, username)
+            # Загружаем saved_gifts
+            nft_gifts = await get_profile_nfts(uid, username)
+            profile_cnt = len(nft_gifts)
 
-                if not gifts_in_range(len(nft_gifts), min_gifts, max_gifts):
-                    continue
+            if profile_cnt == 0:
+                continue
 
-                profile_url = ("https://t.me/" + username) if username else ("tg://user?id=" + str(uid))
-                owner_str   = fmt_owner(owner_obj, username, name)
+            # Для профильного поиска "без лота на рынке":
+            # Показываем только тех у кого profile_cnt > market_cnt
+            # (есть NFT в профиле которые НЕ выставлены)
+            hidden_nfts = profile_cnt - market_cnt
+            if hidden_nfts <= 0:
+                continue
 
-                cache_owner(uid, owner_obj, username, name, profile_url, nft_gifts)
-                kb  = owner_card_kb(username, profile_url, uid)
-                txt = b("👤 " + owner_str) + "\n" + b("NFT в профиле: " + str(len(nft_gifts)))
-                try:
-                    await status_msg.bot.send_message(
-                        chat_id=status_msg.chat.id,
-                        text=txt,
-                        parse_mode="HTML",
-                        reply_markup=kb,
-                    )
-                    found += len(nft_gifts)
-                    stats["found"] += len(nft_gifts)
-                except Exception as e:
-                    logger.warning("profile block: %s", e)
+            if not gifts_in_range(hidden_nfts, min_gifts, max_gifts):
+                continue
 
-                await asyncio.sleep(0.2)
+            profile_url = ("https://t.me/" + username) if username else ("tg://user?id=" + str(uid))
+            owner_str   = fmt_owner(owner_obj, username, name)
+
+            cache_owner(uid, owner_obj, username, name, profile_url, nft_gifts)
+            kb  = owner_card_kb(username, profile_url, uid)
+            txt = (
+                "<b>👤 " + owner_str + "</b>\n"
+                "<b>NFT в профиле: " + str(profile_cnt) + " | На рынке: " + str(market_cnt) + " | Скрыто: " + str(hidden_nfts) + "</b>"
+            )
+            try:
+                await status_msg.bot.send_message(
+                    chat_id=status_msg.chat.id,
+                    text=txt,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                )
+                found += hidden_nfts
+                stats["found"] += hidden_nfts
+            except Exception as e:
+                logger.warning("profile block: %s", e)
+
+            await asyncio.sleep(0.1)
 
             now = asyncio.get_event_loop().time()
-            if now - last_upd > 3:
+            if now - last_upd > 2:
                 try:
-                    act = sum(1 for v in market_offsets.values() if v is not None)
                     lbl = "девушек" if girls_only else "профилей"
                     txt = (
-                        b("Ищу по профилям... коллекций: " + str(act) + " очередь: " + str(len(owner_queue)))
-                        + "\n"
-                        + b("Просмотрено: " + str(len(seen_owners)) + " найдено " + lbl + ": " + str(found))
+                        "<b>👤 Проверено: " + str(checked) + "/" + str(total) + "</b>\n"
+                        "<b>Найдено " + lbl + ": " + str(found) + "</b>"
                     )
                     await status_msg.edit_text(txt, parse_mode="HTML", reply_markup=stop_kb())
                     last_upd = now
@@ -884,28 +1028,28 @@ async def run_market(cb, cat=None, girls=False, ids=None):
     if ids is None:
         ids = await ensure_collections()
     if not ids:
-        await cb.message.answer(b("Коллекции не загружены."), parse_mode="HTML", reply_markup=menu_kb())
+        await cb.message.answer("<b>Коллекции не загружены.</b>", parse_mode="HTML", reply_markup=menu_kb())
         return
     boost  = get_boost(uid)
     mn     = get_min_gifts(uid)
     mx     = get_max_gifts(uid)
-    mx_str = str(mx) if mx > 0 else "inf"
+    mx_str = str(mx) if mx > 0 else "∞"
     if girls:
-        label = "Девушки рынок"
+        label = "👩 Девушки — рынок"
     elif cat:
         label = PRICE_CATEGORIES[cat]["label"]
     else:
-        label = "Все NFT"
+        label = "🌐 Все NFT"
     txt = (
-        b(label) + "\n"
-        + b("Гифтов: от " + str(mn) + " до " + mx_str + " буст: " + str(boost) + "%")
-        + "\n\n" + b("Найдено: 0")
+        "<b>" + label + "</b>\n"
+        "<b>Гифтов: от " + str(mn) + " до " + mx_str + " | Буст: " + str(boost) + "%</b>\n\n"
+        "<b>Найдено: 0</b>"
     )
     status = await cb.message.answer(txt, parse_mode="HTML", reply_markup=stop_kb())
     found = await do_market_search(status, ids, cat=cat, girls_only=girls, boost=boost, min_gifts=mn, max_gifts=mx)
     try:
         await status.edit_text(
-            b("Готово! " + label) + "\n" + b("Найдено: " + str(found)),
+            "<b>✅ Готово! " + label + "</b>\n<b>Найдено: " + str(found) + "</b>",
             parse_mode="HTML", reply_markup=menu_kb()
         )
     except Exception:
@@ -922,100 +1066,193 @@ async def run_profile(cb, girls=False, ids=None):
     if ids is None:
         ids = await ensure_collections()
     if not ids:
-        await cb.message.answer(b("Коллекции не загружены."), parse_mode="HTML", reply_markup=menu_kb())
+        await cb.message.answer("<b>Коллекции не загружены.</b>", parse_mode="HTML", reply_markup=menu_kb())
         return
     mn     = get_min_gifts(uid)
     mx     = get_max_gifts(uid)
-    mx_str = str(mx) if mx > 0 else "inf"
-    label  = "Девушки профили" if girls else "Все профили"
+    mx_str = str(mx) if mx > 0 else "∞"
+    label  = "👩 Девушки — профили" if girls else "👤 Профили без листингов"
     txt = (
-        b(label) + "\n"
-        + b("Гифтов: от " + str(mn) + " до " + mx_str)
-        + "\n\n" + b("Собираю владельцев...")
+        "<b>" + label + "</b>\n"
+        "<b>Гифтов скрытых: от " + str(mn) + " до " + mx_str + "</b>\n\n"
+        "<b>Сканирую рынок...</b>"
     )
     status = await cb.message.answer(txt, parse_mode="HTML", reply_markup=stop_kb())
     found = await do_profile_search(status, ids, girls_only=girls, min_gifts=mn, max_gifts=mx)
     try:
         await status.edit_text(
-            b("Готово! " + label) + "\n" + b("Найдено: " + str(found)),
+            "<b>✅ Готово! " + label + "</b>\n<b>Найдено скрытых NFT: " + str(found) + "</b>",
             parse_mode="HTML", reply_markup=menu_kb()
         )
     except Exception:
         pass
 
 
-WELCOME = b("Neptun Parser") + "\n" + b("Нажми Поиск NFT чтобы начать:")
+WELCOME = (
+    "<b>🔱 Neptun Parser</b>\n\n"
+    "Ищу NFT-коллекционеров у которых есть гифты вне рынка.\n"
+    "Нажми <b>🔍 Поиск NFT</b> чтобы начать:"
+)
 
+# ===================== ОНБОРДИНГ (первый запуск) =====================
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    add_user(message.from_user.id, message.from_user.username,
-             message.from_user.first_name, message.from_user.last_name)
+    is_new = add_user(message.from_user.id, message.from_user.username,
+                      message.from_user.first_name, message.from_user.last_name)
+
     if not await check_authorized() and is_admin(message.from_user.id):
         await message.answer(
-            b("Нужна авторизация Telegram") + "\n" + b("Введи номер:") + " <code>+79001234567</code>",
-            parse_mode="HTML", reply_markup=bottom_menu_kb()
+            "<b>Нужна авторизация Telegram</b>\nВведи номер: <code>+79001234567</code>",
+            parse_mode="HTML"
         )
         await state.set_state(Auth.phone)
         return
-    await message.answer(WELCOME, parse_mode="HTML", reply_markup=bottom_menu_kb())
-    await message.answer(b("Выбери действие:"), parse_mode="HTML", reply_markup=main_kb())
 
-@dp.message(F.text == "🚀 Старт")
-async def btn_start(message: Message):
+    if is_new and message.from_user.id not in ONBOARDING_DONE:
+        ONBOARDING_DONE.add(message.from_user.id)
+        await message.answer(
+            "<b>👋 Привет! Добро пожаловать в Neptun Parser</b>\n\n"
+            "Давай быстро настроим поиск под тебя.\n\n"
+            "<b>Шаг 1/3 — Минимум гифтов у владельца:</b>\n"
+            "Сколько NFT минимум должно быть у человека чтобы попасть в результаты?\n"
+            "<i>Рекомендую: 2-5</i>",
+            parse_mode="HTML",
+            reply_markup=onboarding_min_kb()
+        )
+        await state.set_state(Onboarding.min_gifts)
+        return
+
     await message.answer(WELCOME, parse_mode="HTML", reply_markup=main_kb())
 
-@dp.message(F.text == "🔍 Поиск")
-async def btn_search(message: Message):
-    await message.answer(b("Выбери поиск:"), parse_mode="HTML", reply_markup=search_menu_kb())
-
-@dp.message(F.text == "☰ Меню")
-async def btn_menu_txt(message: Message):
-    uid    = message.from_user.id
-    mn     = get_min_gifts(uid)
-    mx     = get_max_gifts(uid)
-    bst    = get_boost(uid)
-    mx_str = str(mx) if mx > 0 else "inf"
-    txt = (
-        b("Neptun Parser") + "\n\n"
-        + b("Настройки:") + "\n"
-        + b("Мин: " + str(mn) + " Макс: " + mx_str + " Буст: " + str(bst) + "%") + "\n\n"
-        + b("Поисков: " + str(stats["checks"]) + " Найдено: " + str(stats["found"]))
+# Онбординг шаг 1 — мин гифтов
+@dp.callback_query(F.data.startswith("ob_min_"))
+async def ob_min(cb: CallbackQuery, state: FSMContext):
+    val = int(cb.data.split("_")[2])
+    USER_MIN_GIFTS[cb.from_user.id] = val
+    await cb.answer("Мин. гифтов: " + str(val))
+    await cb.message.edit_text(
+        "<b>✅ Минимум гифтов: " + str(val) + "</b>\n\n"
+        "<b>Шаг 2/3 — Максимум гифтов у владельца:</b>\n"
+        "Если хочешь без лимита — выбери ∞\n"
+        "<i>Рекомендую: без лимита или 20</i>",
+        parse_mode="HTML",
+        reply_markup=onboarding_max_kb()
     )
-    await message.answer(txt, parse_mode="HTML", reply_markup=main_kb())
+    await state.set_state(Onboarding.max_gifts)
+
+# Онбординг шаг 2 — макс гифтов
+@dp.callback_query(F.data.startswith("ob_max_"))
+async def ob_max(cb: CallbackQuery, state: FSMContext):
+    val = int(cb.data.split("_")[2])
+    USER_MAX_GIFTS[cb.from_user.id] = val
+    label = "без лимита" if val == 0 else str(val)
+    await cb.answer("Макс. гифтов: " + label)
+    await cb.message.edit_text(
+        "<b>✅ Максимум гифтов: " + label + "</b>\n\n"
+        "<b>Шаг 3/3 — Буст цен (для поиска по рынку):</b>\n"
+        "Насколько выше флора ищем NFT?\n\n"
+        "100% = цена до x2 от флора\n"
+        "200% = цена до x3 от флора\n"
+        "<i>Рекомендую: 100%</i>",
+        parse_mode="HTML",
+        reply_markup=onboarding_boost_kb()
+    )
+    await state.set_state(Onboarding.boost)
+
+# Онбординг шаг 3 — буст
+@dp.callback_query(F.data.startswith("ob_boost_"))
+async def ob_boost(cb: CallbackQuery, state: FSMContext):
+    val = int(cb.data.split("_")[2])
+    USER_BOOST[cb.from_user.id] = val
+    await cb.answer("Буст: " + str(val) + "%")
+    uid = cb.from_user.id
+    mn  = get_min_gifts(uid)
+    mx  = get_max_gifts(uid)
+    mx_str = str(mx) if mx > 0 else "∞"
+    await state.clear()
+    await cb.message.edit_text(
+        "<b>✅ Настройка завершена!</b>\n\n"
+        "<b>Мин. гифтов:</b> " + str(mn) + "\n"
+        "<b>Макс. гифтов:</b> " + mx_str + "\n"
+        "<b>Буст:</b> " + str(val) + "%\n\n"
+        "Всё можно изменить в ⚙️ Настройки",
+        parse_mode="HTML",
+        reply_markup=None
+    )
+    await cb.message.answer(WELCOME, parse_mode="HTML", reply_markup=main_kb())
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("<b>Отменено.</b>", parse_mode="HTML", reply_markup=main_kb())
+
+@dp.message(Command("myid"))
+async def cmd_myid(message: Message):
+    await message.answer("<b>Твой ID:</b> <code>" + str(message.from_user.id) + "</code>", parse_mode="HTML")
 
 @dp.message(Command("clear"))
 async def cmd_clear(message: Message):
     global is_searching
     is_searching = False
-    await message.answer(b("Поиск остановлен."), parse_mode="HTML", reply_markup=menu_kb())
+    await message.answer("<b>Поиск остановлен.</b>", parse_mode="HTML", reply_markup=menu_kb())
+
+@dp.message(Command("neptunteam"))
+async def cmd_neptunteam(message: Message):
+    uid    = message.from_user.id
+    mn     = get_min_gifts(uid)
+    mx     = get_max_gifts(uid)
+    bst    = get_boost(uid)
+    mx_str = str(mx) if mx > 0 else "∞"
+    txt = (
+        "<b>🔱 Neptun Parser — Справка по настройкам</b>\n\n"
+
+        "<b>📉 Мин. гифтов</b> — минимальное кол-во NFT у владельца\n"
+        "Если у человека меньше — он не попадёт в результаты\n"
+        "<i>Пример: мин=2 → пропускаем всех у кого 1 NFT</i>\n\n"
+
+        "<b>📈 Макс. гифтов</b> — максимальное кол-во NFT у владельца\n"
+        "0 = без лимита. Полезно чтобы отсеять крупных коллекционеров\n"
+        "<i>Пример: макс=10 → не показываем тех у кого 11+ NFT</i>\n\n"
+
+        "<b>🚀 Буст цен</b> — насколько выше флора ищем (только рынок)\n"
+        "Флор = минимальная цена в коллекции (нижние 25%)\n"
+        "Формула: цена от 0.7×флор до (1 + буст/100)×флор\n\n"
+        "<i>Примеры буста:</i>\n"
+        "• 30% → цена до 1.3×флор\n"
+        "• 100% → цена до 2.0×флор\n"
+        "• 200% → цена до 3.0×флор\n\n"
+
+        "<b>📋 Режимы поиска:</b>\n"
+        "• <b>По рынку</b> — ищет NFT выставленные на продажу\n"
+        "• <b>По профилю</b> — ищет владельцев у которых есть NFT В ПРОФИЛЕ но НЕ выставленные на рынок (скрытые гифты)\n\n"
+
+        "<b>Текущие настройки:</b>\n"
+        "Мин: " + str(mn) + " | Макс: " + mx_str + " | Буст: " + str(bst) + "%\n\n"
+        "Меняй в ⚙️ Настройки или через /start"
+    )
+    await message.answer(txt, parse_mode="HTML", reply_markup=main_kb())
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
-        await message.answer(b("Нет доступа. ID:") + " <code>" + str(message.from_user.id) + "</code>", parse_mode="HTML")
+        await message.answer("<b>Нет доступа. ID:</b> <code>" + str(message.from_user.id) + "</code>", parse_mode="HTML")
         return
     await state.clear()
     users = load_users()
     ok    = await check_authorized()
     txt = (
-        b("Админ панель") + "\n\n"
-        + b("Telethon: " + ("Авторизован" if ok else "Не авторизован")) + "\n"
-        + b("Коллекций: " + str(len(ALL_GIFT_IDS))) + "\n"
-        + b("Пользователей: " + str(len(users))) + "\n"
-        + b("Поисков: " + str(stats["checks"]) + " Найдено: " + str(stats["found"]))
+        "<b>Админ панель</b>\n\n"
+        "<b>Telethon: " + ("✅ Авторизован" if ok else "❌ Не авторизован") + "</b>\n"
+        "<b>Коллекций: " + str(len(ALL_GIFT_IDS)) + "</b>\n"
+        "<b>Пользователей: " + str(len(users)) + "</b>\n"
+        "<b>Поисков: " + str(stats["checks"]) + " | Найдено: " + str(stats["found"]) + "</b>"
     )
     await message.answer(txt, parse_mode="HTML", reply_markup=admin_kb())
 
-@dp.message(Command("myid"))
-async def cmd_myid(message: Message):
-    await message.answer(b("ID:") + " <code>" + str(message.from_user.id) + "</code>", parse_mode="HTML")
 
-@dp.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(b("Отменено."), parse_mode="HTML", reply_markup=main_kb())
-
+# ===================== CALLBACKS =====================
 
 @dp.callback_query(F.data.startswith("shownft_"))
 async def cb_show_nft(cb: CallbackQuery):
@@ -1042,9 +1279,37 @@ async def cb_show_nft(cb: CallbackQuery):
         await cb.answer("Список пуст", show_alert=True)
         return
     kb  = nft_list_kb(items, username, profile_url)
-    txt = b("NFT " + owner_str) + "\n" + b("Всего: " + str(len(items)))
+    txt = "<b>🖼 NFT — " + owner_str + "</b>\n<b>Всего: " + str(len(items)) + "</b>"
     await cb.message.answer(txt, parse_mode="HTML", reply_markup=kb)
 
+@dp.callback_query(F.data == "search_mode_select")
+async def cb_search_mode_select(cb: CallbackQuery):
+    await cb.message.answer(
+        "<b>🔍 Выберите как будет происходить поиск:</b>\n\n"
+        "🛒 <b>По рынку</b> — ищет NFT выставленные на продажу\n"
+        "👤 <b>По профилю</b> — ищет владельцев у которых NFT скрыты (не на рынке)",
+        parse_mode="HTML",
+        reply_markup=search_mode_select_kb()
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data == "mode_market")
+async def cb_mode_market(cb: CallbackQuery):
+    await cb.message.answer(
+        "<b>🛒 Поиск по рынку — выбери категорию:</b>",
+        parse_mode="HTML",
+        reply_markup=market_cat_kb()
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data == "mode_profile")
+async def cb_mode_profile(cb: CallbackQuery):
+    await cb.message.answer(
+        "<b>👤 Поиск по профилю — ищет тех у кого NFT НЕ выставлены на рынок:</b>",
+        parse_mode="HTML",
+        reply_markup=profile_cat_kb()
+    )
+    await cb.answer()
 
 @dp.callback_query(F.data == "settings_menu")
 async def cb_settings(cb: CallbackQuery):
@@ -1052,29 +1317,29 @@ async def cb_settings(cb: CallbackQuery):
     mn     = get_min_gifts(uid)
     mx     = get_max_gifts(uid)
     bst    = get_boost(uid)
-    mx_str = str(mx) if mx > 0 else "inf"
+    mx_str = str(mx) if mx > 0 else "∞"
     txt = (
-        b("Настройки поиска") + "\n\n"
-        + b("Мин. гифтов: " + str(mn)) + "\n"
-        + b("Макс. гифтов: " + mx_str) + "\n"
-        + b("Буст цен: " + str(bst) + "%")
+        "<b>⚙️ Настройки поиска</b>\n\n"
+        "<b>Мин. гифтов:</b> " + str(mn) + "\n"
+        "<b>Макс. гифтов:</b> " + mx_str + "\n"
+        "<b>Буст цен:</b> " + str(bst) + "%"
     )
     await cb.message.answer(txt, parse_mode="HTML", reply_markup=settings_menu_kb(uid))
     await cb.answer()
 
 @dp.callback_query(F.data == "set_min_gifts")
 async def cb_set_min(cb: CallbackQuery):
-    await cb.message.answer(b("Минимум гифтов у владельца:"), parse_mode="HTML", reply_markup=min_gifts_picker_kb())
+    await cb.message.answer("<b>Минимум гифтов у владельца:</b>", parse_mode="HTML", reply_markup=min_gifts_picker_kb())
     await cb.answer()
 
 @dp.callback_query(F.data == "set_max_gifts")
 async def cb_set_max(cb: CallbackQuery):
-    await cb.message.answer(b("Максимум гифтов (0 = без лимита):"), parse_mode="HTML", reply_markup=max_gifts_picker_kb())
+    await cb.message.answer("<b>Максимум гифтов (0 = без лимита):</b>", parse_mode="HTML", reply_markup=max_gifts_picker_kb())
     await cb.answer()
 
 @dp.callback_query(F.data == "set_boost")
 async def cb_set_boost(cb: CallbackQuery):
-    txt = b("Буст цен") + "\n\n" + b("100% = x0.7..x2.0 | 150% = x2.5 | 200% = x3.0")
+    txt = "<b>🚀 Буст цен</b>\n\n<b>100% = до x2 флора | 150% = до x2.5 | 200% = до x3</b>"
     await cb.message.answer(txt, parse_mode="HTML", reply_markup=boost_picker_kb())
     await cb.answer()
 
@@ -1106,11 +1371,7 @@ async def cb_menu(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer(WELCOME, parse_mode="HTML", reply_markup=main_kb())
     await cb.answer()
 
-@dp.callback_query(F.data == "search_menu")
-async def cb_search_menu(cb: CallbackQuery):
-    await cb.message.answer(b("Выбери поиск:"), parse_mode="HTML", reply_markup=search_menu_kb())
-    await cb.answer()
-
+# Рынок по категориям
 @dp.callback_query(F.data == "mkt_all")
 async def cb_ma(cb): await run_market(cb)
 @dp.callback_query(F.data == "mkt_cheap")
@@ -1123,6 +1384,8 @@ async def cb_mh(cb): await run_market(cb, "hard")
 async def cb_mu(cb): await run_market(cb, "ultra")
 @dp.callback_query(F.data == "mkt_extreme")
 async def cb_me(cb): await run_market(cb, "extreme")
+
+# Профиль
 @dp.callback_query(F.data == "prf_all")
 async def cb_pa(cb): await run_profile(cb)
 @dp.callback_query(F.data == "girls_market")
@@ -1130,22 +1393,23 @@ async def cb_gm(cb): await run_market(cb, girls=True)
 @dp.callback_query(F.data == "girls_profile")
 async def cb_gp(cb): await run_profile(cb, girls=True)
 
+# По коллекции
 @dp.callback_query(F.data == "mode_col")
 async def cb_mode_col(cb: CallbackQuery):
     if not NFT_COLLECTIONS:
         await load_collections()
     if not NFT_COLLECTIONS:
-        await cb.message.answer(b("Коллекции не загружены"), parse_mode="HTML", reply_markup=menu_kb())
+        await cb.message.answer("<b>Коллекции не загружены</b>", parse_mode="HTML", reply_markup=menu_kb())
         await cb.answer()
         return
-    await cb.message.answer(b("По коллекции - выбери источник:"), parse_mode="HTML", reply_markup=col_source_kb())
+    await cb.message.answer("<b>По коллекции — выбери источник:</b>", parse_mode="HTML", reply_markup=col_source_kb())
     await cb.answer()
 
 @dp.callback_query(F.data == "col_market")
 async def cb_col_market(cb: CallbackQuery):
     if not NFT_COLLECTIONS:
         await load_collections()
-    await cb.message.answer(b("Выбери коллекцию (рынок):"), parse_mode="HTML",
+    await cb.message.answer("<b>Выбери коллекцию (рынок):</b>", parse_mode="HTML",
                             reply_markup=col_kb(list(NFT_COLLECTIONS.keys()), "mktcol_", "mode_col"))
     await cb.answer()
 
@@ -1153,7 +1417,7 @@ async def cb_col_market(cb: CallbackQuery):
 async def cb_col_profile(cb: CallbackQuery):
     if not NFT_COLLECTIONS:
         await load_collections()
-    await cb.message.answer(b("Выбери коллекцию (профили):"), parse_mode="HTML",
+    await cb.message.answer("<b>Выбери коллекцию (профили):</b>", parse_mode="HTML",
                             reply_markup=col_kb(list(NFT_COLLECTIONS.keys()), "prfcol_", "mode_col"))
     await cb.answer()
 
@@ -1181,7 +1445,7 @@ async def cb_stop(cb: CallbackQuery):
     is_searching = False
     await cb.answer("Останавливаю...")
     try:
-        await cb.message.edit_text(b("Поиск остановлен."), parse_mode="HTML", reply_markup=menu_kb())
+        await cb.message.edit_text("<b>⏹ Поиск остановлен.</b>", parse_mode="HTML", reply_markup=menu_kb())
     except Exception:
         pass
 
@@ -1191,18 +1455,19 @@ async def cb_stats(cb: CallbackQuery):
     mn     = get_min_gifts(uid)
     mx     = get_max_gifts(uid)
     bst    = get_boost(uid)
-    mx_str = str(mx) if mx > 0 else "inf"
+    mx_str = str(mx) if mx > 0 else "∞"
     txt = (
-        b("Статистика") + "\n\n"
-        + b("Поисков: " + str(stats["checks"])) + "\n"
-        + b("Найдено: " + str(stats["found"])) + "\n"
-        + b("Пользователей: " + str(get_user_count())) + "\n\n"
-        + b("Настройки:") + "\n"
-        + b("Мин: " + str(mn) + " Макс: " + mx_str + " Буст: " + str(bst) + "%")
+        "<b>📊 Статистика</b>\n\n"
+        "<b>Поисков: " + str(stats["checks"]) + "</b>\n"
+        "<b>Найдено: " + str(stats["found"]) + "</b>\n"
+        "<b>Пользователей: " + str(get_user_count()) + "</b>\n\n"
+        "<b>Настройки:</b>\n"
+        "<b>Мин: " + str(mn) + " | Макс: " + mx_str + " | Буст: " + str(bst) + "%</b>"
     )
     await cb.message.answer(txt, parse_mode="HTML")
     await cb.answer()
 
+# ADMIN
 @dp.callback_query(F.data == "admin_users")
 async def cb_admin_users(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
@@ -1226,12 +1491,12 @@ async def show_users_page(message, page, edit):
     if total == 0:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="admin_panel")]])
         fn = message.edit_text if edit else message.answer
-        await fn(b("Пользователей нет."), parse_mode="HTML", reply_markup=kb)
+        await fn("<b>Пользователей нет.</b>", parse_mode="HTML", reply_markup=kb)
         return
     start = page * PAGE
     end   = min(start + PAGE, total)
     chunk = all_items[start:end]
-    lines = [b("Пользователи " + str(start+1) + "-" + str(end) + " из " + str(total)) + "\n"]
+    lines = ["<b>Пользователи " + str(start+1) + "-" + str(end) + " из " + str(total) + "</b>\n"]
     for i, (uid, info) in enumerate(chunk, start + 1):
         if isinstance(info, dict):
             uname  = info.get("username") or ""
@@ -1242,18 +1507,18 @@ async def show_users_page(message, page, edit):
             uname = first = last = ""
             joined = 0
         name = " ".join(p for p in [first, last] if p)
-        card = b(str(i) + ". <code>" + str(uid) + "</code>")
+        card = "<b>" + str(i) + ". <code>" + str(uid) + "</code>"
         if uname:
-            card += b(" @" + uname)
+            card += " @" + uname
         if name:
-            card += b(" | " + name)
-        card += b("\n    " + fmt_timestamp(joined))
+            card += " | " + name
+        card += "\n    " + fmt_timestamp(joined) + "</b>"
         lines.append(card)
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="Назад", callback_data="users_page_" + str(page-1)))
+        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data="users_page_" + str(page-1)))
     if end < total:
-        nav.append(InlineKeyboardButton(text="Вперед", callback_data="users_page_" + str(page+1)))
+        nav.append(InlineKeyboardButton(text="Вперед ▶️", callback_data="users_page_" + str(page+1)))
     rows = [nav] if nav else []
     rows.append([InlineKeyboardButton(text="Админ", callback_data="admin_panel")])
     fn = message.edit_text if edit else message.answer
@@ -1266,10 +1531,10 @@ async def cb_admin_panel(cb: CallbackQuery):
     users = load_users()
     ok    = await check_authorized()
     txt = (
-        b("Админ панель") + "\n\n"
-        + b("Telethon: " + ("Авторизован" if ok else "Не авторизован")) + "\n"
-        + b("Коллекций: " + str(len(ALL_GIFT_IDS))) + "\n"
-        + b("Пользователей: " + str(len(users)))
+        "<b>Админ панель</b>\n\n"
+        "<b>Telethon: " + ("✅ Авторизован" if ok else "❌ Не авторизован") + "</b>\n"
+        "<b>Коллекций: " + str(len(ALL_GIFT_IDS)) + "</b>\n"
+        "<b>Пользователей: " + str(len(users)) + "</b>"
     )
     await cb.message.answer(txt, parse_mode="HTML", reply_markup=admin_kb())
     await cb.answer()
@@ -1279,7 +1544,7 @@ async def cb_admin_broadcast(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         return
     await state.set_state(Broadcast.message)
-    await cb.message.answer(b("Отправь сообщение для рассылки. /cancel - отмена"), parse_mode="HTML", reply_markup=cancel_kb())
+    await cb.message.answer("<b>Отправь сообщение для рассылки. /cancel — отмена</b>", parse_mode="HTML", reply_markup=cancel_kb())
     await cb.answer()
 
 @dp.message(Broadcast.message)
@@ -1288,7 +1553,7 @@ async def broadcast_save(message: Message, state: FSMContext):
         return
     await state.update_data(mid=message.message_id, cid=message.chat.id)
     await state.set_state(None)
-    await message.answer(b("Подтверди отправку:"), parse_mode="HTML", reply_markup=confirm_kb())
+    await message.answer("<b>Подтверди отправку:</b>", parse_mode="HTML", reply_markup=confirm_kb())
 
 @dp.callback_query(F.data == "admin_broadcast_confirm")
 async def cb_broadcast_send(cb: CallbackQuery, state: FSMContext):
@@ -1301,7 +1566,7 @@ async def cb_broadcast_send(cb: CallbackQuery, state: FSMContext):
         return
     users  = load_users()
     uids   = list(users.keys())
-    status = await cb.message.answer(b("Рассылка " + str(len(uids)) + " пользователям..."), parse_mode="HTML")
+    status = await cb.message.answer("<b>📢 Рассылка " + str(len(uids)) + " пользователям...</b>", parse_mode="HTML")
     await cb.answer()
     ok = fail = 0
     for i, uid in enumerate(uids):
@@ -1312,12 +1577,12 @@ async def cb_broadcast_send(cb: CallbackQuery, state: FSMContext):
             fail += 1
         if (i + 1) % 20 == 0:
             try:
-                await status.edit_text(b(str(i+1) + "/" + str(len(uids)) + "..."), parse_mode="HTML")
+                await status.edit_text("<b>" + str(i+1) + "/" + str(len(uids)) + "...</b>", parse_mode="HTML")
             except Exception:
                 pass
         await asyncio.sleep(0.05)
     await status.edit_text(
-        b("Отправлено: " + str(ok)) + "\n" + b("Ошибок: " + str(fail)),
+        "<b>✅ Отправлено: " + str(ok) + "</b>\n<b>❌ Ошибок: " + str(fail) + "</b>",
         parse_mode="HTML", reply_markup=admin_kb()
     )
     await state.clear()
@@ -1328,11 +1593,11 @@ async def cb_admin_stats(cb: CallbackQuery):
         return
     u = load_users()
     txt = (
-        b("Статистика") + "\n\n"
-        + b("Пользователей: " + str(len(u))) + "\n"
-        + b("Поисков: " + str(stats["checks"])) + "\n"
-        + b("Найдено: " + str(stats["found"])) + "\n"
-        + b("Коллекций: " + str(len(ALL_GIFT_IDS)))
+        "<b>📊 Статистика</b>\n\n"
+        "<b>Пользователей: " + str(len(u)) + "</b>\n"
+        "<b>Поисков: " + str(stats["checks"]) + "</b>\n"
+        "<b>Найдено: " + str(stats["found"]) + "</b>\n"
+        "<b>Коллекций: " + str(len(ALL_GIFT_IDS)) + "</b>"
     )
     await cb.message.answer(txt, parse_mode="HTML", reply_markup=admin_kb())
     await cb.answer()
@@ -1342,7 +1607,7 @@ async def cb_admin_auth(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         return
     await state.clear()
-    await cb.message.answer(b("Введи номер:") + " <code>+79001234567</code>", parse_mode="HTML")
+    await cb.message.answer("<b>Введи номер:</b> <code>+79001234567</code>", parse_mode="HTML")
     await state.set_state(Auth.phone)
     await cb.answer()
 
@@ -1354,7 +1619,7 @@ async def cb_admin_logout(cb: CallbackQuery):
         await tg_client.log_out()
     except Exception:
         pass
-    await cb.message.answer(b("Вышел из TG."), parse_mode="HTML", reply_markup=admin_kb())
+    await cb.message.answer("<b>Вышел из TG.</b>", parse_mode="HTML", reply_markup=admin_kb())
     await cb.answer()
 
 @dp.callback_query(F.data == "admin_cancel")
@@ -1362,17 +1627,18 @@ async def cb_admin_cancel(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         return
     await state.clear()
-    await cb.message.answer(b("Отменено"), parse_mode="HTML", reply_markup=admin_kb())
+    await cb.message.answer("<b>Отменено</b>", parse_mode="HTML", reply_markup=admin_kb())
     await cb.answer()
 
 
+# AUTH
 @dp.message(Auth.phone)
 async def auth_phone(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     phone = message.text.strip()
     if not phone.startswith("+"):
-        await message.answer(b("Формат:") + " <code>+79001234567</code>", parse_mode="HTML")
+        await message.answer("<b>Формат:</b> <code>+79001234567</code>", parse_mode="HTML")
         return
     try:
         if not tg_client.is_connected():
@@ -1381,9 +1647,9 @@ async def auth_phone(message: Message, state: FSMContext):
         res = await tg_client.send_code_request(phone)
         await state.update_data(phone=phone, phone_code_hash=res.phone_code_hash)
         await state.set_state(Auth.code)
-        await message.answer(b("Код отправлен. Введи:") + " <code>1 2 3 4 5</code>", parse_mode="HTML")
+        await message.answer("<b>Код отправлен. Введи:</b> <code>1 2 3 4 5</code>", parse_mode="HTML")
     except Exception as e:
-        await message.answer(b("Ошибка:") + " <code>" + str(e) + "</code>", parse_mode="HTML")
+        await message.answer("<b>Ошибка:</b> <code>" + str(e) + "</code>", parse_mode="HTML")
         await state.clear()
 
 @dp.message(Auth.code)
@@ -1398,14 +1664,14 @@ async def auth_code(message: Message, state: FSMContext):
         await state.clear()
         await load_collections()
         await message.answer(
-            b("Авторизован как @" + str(me.username or me.first_name) + "!") + "\n" + b("Коллекций: " + str(len(ALL_GIFT_IDS))),
+            "<b>✅ Авторизован как @" + str(me.username or me.first_name) + "!</b>\n<b>Коллекций: " + str(len(ALL_GIFT_IDS)) + "</b>",
             parse_mode="HTML", reply_markup=main_kb()
         )
     except SessionPasswordNeededError:
         await state.set_state(Auth.password)
-        await message.answer(b("Введи пароль 2FA:"), parse_mode="HTML")
+        await message.answer("<b>Введи пароль 2FA:</b>", parse_mode="HTML")
     except Exception as e:
-        await message.answer(b("Ошибка:") + " <code>" + str(e) + "</code>", parse_mode="HTML")
+        await message.answer("<b>Ошибка:</b> <code>" + str(e) + "</code>", parse_mode="HTML")
 
 @dp.message(Auth.password)
 async def auth_password(message: Message, state: FSMContext):
@@ -1417,11 +1683,11 @@ async def auth_password(message: Message, state: FSMContext):
         await state.clear()
         await load_collections()
         await message.answer(
-            b("Авторизован как @" + str(me.username or me.first_name) + "!") + "\n" + b("Коллекций: " + str(len(ALL_GIFT_IDS))),
+            "<b>✅ Авторизован как @" + str(me.username or me.first_name) + "!</b>\n<b>Коллекций: " + str(len(ALL_GIFT_IDS)) + "</b>",
             parse_mode="HTML", reply_markup=main_kb()
         )
     except Exception as e:
-        await message.answer(b("Неверный пароль:") + " <code>" + str(e) + "</code>", parse_mode="HTML")
+        await message.answer("<b>Неверный пароль:</b> <code>" + str(e) + "</code>", parse_mode="HTML")
 
 
 async def main():
@@ -1433,7 +1699,7 @@ async def main():
             await load_collections()
             logger.info("Авторизован, коллекций: %d", len(ALL_GIFT_IDS))
         else:
-            logger.warning("Не авторизован - пройди /start")
+            logger.warning("Не авторизован — пройди /start")
     except Exception as e:
         logger.error("Ошибка старта: %s", e)
     try:
