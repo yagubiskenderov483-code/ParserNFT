@@ -910,16 +910,16 @@ def col_kb(names, prefix, back, page=0):
     rows  = []
     for i in range(0, len(chunk), 2):
         idx1 = start + i
-        row  = [InlineKeyboardButton(text=chunk[i], callback_data=prefix + "i" + str(idx1))]
+        row  = [InlineKeyboardButton(text=chunk[i], callback_data=prefix + "c" + str(idx1))]
         if i + 1 < len(chunk):
             idx2 = start + i + 1
-            row.append(InlineKeyboardButton(text=chunk[i+1], callback_data=prefix + "i" + str(idx2)))
+            row.append(InlineKeyboardButton(text=chunk[i+1], callback_data=prefix + "c" + str(idx2)))
         rows.append(row)
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="◀", callback_data=prefix + "p" + str(page-1)))
+        nav.append(InlineKeyboardButton(text="◀", callback_data=prefix + "pg" + str(page-1)))
     if end < len(names):
-        nav.append(InlineKeyboardButton(text="▶", callback_data=prefix + "p" + str(page+1)))
+        nav.append(InlineKeyboardButton(text="▶", callback_data=prefix + "pg" + str(page+1)))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="Назад", callback_data=back)])
@@ -935,16 +935,16 @@ def model_col_kb(names, page=0, who="model"):
     rows  = []
     for i in range(0, len(chunk), 2):
         idx1 = start + i
-        row  = [InlineKeyboardButton(text=chunk[i], callback_data="mdlcol_" + str(idx1) + "_" + who)]
+        row  = [InlineKeyboardButton(text=chunk[i], callback_data="mdlci_" + str(idx1) + "_" + who)]
         if i + 1 < len(chunk):
             idx2 = start + i + 1
-            row.append(InlineKeyboardButton(text=chunk[i+1], callback_data="mdlcol_" + str(idx2) + "_" + who))
+            row.append(InlineKeyboardButton(text=chunk[i+1], callback_data="mdlci_" + str(idx2) + "_" + who))
         rows.append(row)
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="Назад", callback_data="mdlpage_" + str(page - 1) + "_" + who))
+        nav.append(InlineKeyboardButton(text="Назад", callback_data="mdlpg_" + str(page - 1) + "_" + who))
     if end < len(names):
-        nav.append(InlineKeyboardButton(text="Далее", callback_data="mdlpage_" + str(page + 1) + "_" + who))
+        nav.append(InlineKeyboardButton(text="Далее", callback_data="mdlpg_" + str(page + 1) + "_" + who))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="Назад в меню", callback_data="mode_model")])
@@ -2038,10 +2038,10 @@ async def cb_mdlwho(cb: CallbackQuery):
     await cb.answer()
 
 # Пагинация списка коллекций для поиска по модели
-@dp.callback_query(F.data.startswith("mdlpage_"))
+@dp.callback_query(F.data.startswith("mdlpg_"))
 async def cb_mdlpage(cb: CallbackQuery):
-    # format: mdlpage_{page}_{who_raw}
-    raw   = cb.data[8:]
+    # format: mdlpg_{page}_{who_raw}
+    raw   = cb.data[6:]   # skip "mdlpg_"
     under = raw.index("_")
     page  = int(raw[:under])
     who   = raw[under+1:]  # e.g. "market_girls"
@@ -2063,9 +2063,9 @@ async def cb_mdlpage(cb: CallbackQuery):
     await cb.answer()
 
 # Выбор коллекции - запускаем маркет или профиль
-@dp.callback_query(F.data.startswith("mdlcol_"))
+@dp.callback_query(F.data.startswith("mdlci_"))
 async def cb_mdlcol(cb: CallbackQuery, state: FSMContext):
-    parts    = cb.data[7:].split("_")
+    parts    = cb.data[5:].split("_")   # skip "mdlci_"
     idx      = int(parts[0])
     who_raw  = "_".join(parts[1:]) if len(parts) > 1 else "market_model"
     # who_raw: "market_all", "market_girls", "market_model", "profile_all" etc
@@ -2113,9 +2113,9 @@ async def cb_col_profile(cb: CallbackQuery):
     )
     await cb.answer()
 
-@dp.callback_query(F.data.startswith("mktcol_p"))
+@dp.callback_query(F.data.startswith("mktcol_pg"))
 async def cb_mktcol_page(cb: CallbackQuery):
-    page  = int(cb.data[8:])
+    page  = int(cb.data[9:])
     if not NFT_COLLECTIONS:
         await load_collections()
     names = list(NFT_COLLECTIONS.keys())
@@ -2126,9 +2126,9 @@ async def cb_mktcol_page(cb: CallbackQuery):
         await cb.message.answer(txt, parse_mode="HTML", reply_markup=col_kb(names, "mktcol_", "mode_col", page))
     await cb.answer()
 
-@dp.callback_query(F.data.startswith("prfcol_p"))
+@dp.callback_query(F.data.startswith("prfcol_pg"))
 async def cb_prfcol_page(cb: CallbackQuery):
-    page  = int(cb.data[8:])
+    page  = int(cb.data[9:])
     if not NFT_COLLECTIONS:
         await load_collections()
     names = list(NFT_COLLECTIONS.keys())
@@ -2139,7 +2139,7 @@ async def cb_prfcol_page(cb: CallbackQuery):
         await cb.message.answer(txt, parse_mode="HTML", reply_markup=col_kb(names, "prfcol_", "mode_col", page))
     await cb.answer()
 
-@dp.callback_query(F.data.startswith("mktcol_i"))
+@dp.callback_query(F.data.startswith("mktcol_c"))
 async def cb_mktcol(cb: CallbackQuery):
     idx = int(cb.data[8:])
     lst = list(NFT_COLLECTIONS.items())
@@ -2150,7 +2150,7 @@ async def cb_mktcol(cb: CallbackQuery):
     col_name, col_id = lst[idx]
     await run_market(cb, ids=[col_id], col_name=col_name)
 
-@dp.callback_query(F.data.startswith("prfcol_i"))
+@dp.callback_query(F.data.startswith("prfcol_c"))
 async def cb_prfcol(cb: CallbackQuery):
     idx = int(cb.data[8:])
     lst = list(NFT_COLLECTIONS.items())
