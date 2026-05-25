@@ -115,6 +115,9 @@ def region_match(owner, username, name, region_key):
         lname = parts[1] if len(parts) > 1 else ""
     name_text    = (fname + " " + lname).strip()
     full         = (bio + " " + name_text + " " + uname).strip()
+    # Если вообще нет данных о пользователе — не отсеиваем
+    if not full.strip():
+        return True
     name_script  = detect_script(name_text)
     uname_script = detect_script(uname)
     bio_script   = detect_script(bio)
@@ -193,8 +196,8 @@ def region_match(owner, username, name, region_key):
                 return True
         return False
 
-    # Для DE/FR/ES/TR/BR/IN - кириллица = стоп, проверяем ключевые слова
-    if region_key in ("de", "fr", "es", "tr", "br", "in"):
+    # Для DE/FR/ES/BR/IN - кириллица = стоп, проверяем ключевые слова
+    if region_key in ("de", "fr", "es", "br", "in"):
         if has_cyrillic:
             return False
         for kw in kws:
@@ -662,24 +665,25 @@ async def load_collections():
         ALL_GIFT_IDS    = []
         NFT_COLLECTIONS = {}
         seen = set()
-        # Пробуем несколько hash значений чтобы получить все коллекции
-        for hash_val in [0]:
-            try:
-                result = await tg_client(GetStarGiftsRequest(hash=hash_val))
-                gifts  = getattr(result, "gifts", None) or []
-                for gift in gifts:
-                    gid   = getattr(gift, "id",    None)
-                    title = getattr(gift, "title", None)
-                    if gid is None or gid in seen:
-                        continue
-                    seen.add(gid)
-                    # Берём только NFT (с title = название коллекции)
-                    if not title:
-                        continue
-                    ALL_GIFT_IDS.append((gid, title))
-                    NFT_COLLECTIONS[title] = gid
-            except Exception as e:
-                logger.warning("load_collections hash=%s: %s", hash_val, e)
+        try:
+            result = await tg_client(GetStarGiftsRequest(hash=0))
+            gifts  = getattr(result, "gifts", None) or []
+            for gift in gifts:
+                gid   = getattr(gift, "id", None)
+                if gid is None or gid in seen:
+                    continue
+                title = getattr(gift, "title", None)
+                # Берём NFT: есть title ИЛИ есть resale (availability_resale > 0)
+                resale = getattr(gift, "availability_resale", None)
+                if not title and not (resale and resale > 0):
+                    continue
+                if not title:
+                    title = "Gift #" + str(gid)
+                seen.add(gid)
+                ALL_GIFT_IDS.append((gid, title))
+                NFT_COLLECTIONS[title] = gid
+        except Exception as e:
+            logger.warning("load_collections: %s", e)
         logger.info("Коллекций загружено: %d", len(ALL_GIFT_IDS))
     except Exception as e:
         logger.error("load_collections: %s", e)
@@ -1314,7 +1318,7 @@ async def do_market_search(
 
 
 
-# ===================== CORE: ПРОФИЛИ (поиск владельцев у которых NFT НЕ на рынке) =====================
+# ===================== CORE: ПРОФИЛИ (поиск владельцев у которых NFT скрыты от рынка) =====================
 async def do_profile_search(
     status_msg,
     gift_ids,
@@ -1326,151 +1330,173 @@ async def do_profile_search(
     region="any",
     user_seen_owners=None,
 ):
+    """
+    Ищет людей у которых есть NFT В ПРОФИЛЕ но НЕ выставлены на рынок.
+    Алгоритм:
+      1. Сканируем маркет — собираем uid владельцев + их данные
+      2. Для каждого уникального владельца загружаем GetSavedStarGiftsRequest
+      3. Считаем NFT у которых НЕТ resell_amount (скрытые)
+      4. Показываем тех у кого скрытых >= min_gifts
+    """
     global is_searching
     is_searching = True
     found        = 0
     seen_uids    = set(user_seen_owners) if user_seen_owners is not None else set()
     last_upd     = 0.0
 
-    # Собираем uid тех кто торгует на маркете — их исключим
-    market_uids = set()
+    # uid -> {owner, username, name, profile_url}
+    owners_from_market = {}
 
-    async def collect_market_sellers():
-        """Собираем всех кто продаёт NFT на рынке."""
+    async def collect_owners(gid):
+        """Собираем владельцев из одной коллекции на маркете."""
+        try:
+            items, _ = await fetch_market_page(gid, "", limit=100)
+            for item in items:
+                uid = item.get("owner_id")
+                if not uid or uid in owners_from_market:
+                    continue
+                owners_from_market[uid] = {
+                    "owner":       item["owner"],
+                    "username":    item.get("username"),
+                    "name":        item.get("name", ""),
+                    "profile_url": item.get("profile_url"),
+                }
+        except Exception:
+            pass
+
+    async def check_owner_hidden(uid, info):
+        """Проверяем скрытые NFT у одного владельца."""
+        nonlocal found, last_upd
+        if not is_searching or found >= max_results:
+            return
+        if uid in seen_uids:
+            return
+        owner_obj   = info["owner"]
+        username    = info["username"]
+        name        = info["name"]
+        profile_url = info["profile_url"] or (("https://t.me/" + username) if username else ("tg://user?id=" + str(uid)))
+
+        # Фильтры
+        if not region_match(owner_obj, username, name, region):
+            return
+        if girls_only and not is_girl(owner_obj, username, name):
+            return
+
+        # Загружаем ВСЕ сохранённые гифты
+        try:
+            saved_result = await tg_client(GetSavedStarGiftsRequest(
+                peer=await tg_client.get_input_entity(uid),
+                offset="", limit=100,
+            ))
+            saved_gifts = getattr(saved_result, "gifts", None) or []
+        except Exception:
+            return
+
+        # Берём только те что НЕ на рынке (нет resell_amount)
+        hidden_nfts = []
+        for sg in saved_gifts:
+            on_market = bool(getattr(sg, "resell_amount", None))
+            if on_market:
+                continue  # этот NFT выставлен на продажу — пропускаем
+            inner   = getattr(sg, "gift", None)
+            nft_url = make_nft_url(sg) or (make_nft_url(inner) if inner else None)
+            if not nft_url:
+                continue  # не NFT (обычный гифт без slug)
+            title = getattr(inner, "title", None) or getattr(sg, "title", "?")
+            num   = getattr(sg, "num",   None) or getattr(sg, "gift_num", "?")
+            hidden_nfts.append({"title": title, "num": num, "nft_url": nft_url})
+
+        if not gifts_in_range(len(hidden_nfts), min_gifts, max_gifts):
+            return
+        if uid in seen_uids:
+            return
+
+        seen_uids.add(uid)
+        if user_seen_owners is not None:
+            user_seen_owners.add(uid)
+
+        owner_str = fmt_owner(owner_obj, username, name)
+        cache_owner(uid, owner_obj, username, name, profile_url, hidden_nfts)
+
+        nft_lines = ""
+        for g in hidden_nfts[:5]:
+            nu = g.get("nft_url")
+            t  = g.get("title", "?")
+            n  = g.get("num", "?")
+            if nu:
+                nft_lines += "\n<b>\u2022 <a href=\"" + nu + "\">" + str(t) + " #" + str(n) + "</a></b>"
+            else:
+                nft_lines += "\n<b>\u2022 " + str(t) + " #" + str(n) + "</b>"
+        if len(hidden_nfts) > 5:
+            nft_lines += "\n<b>  ... ещё " + str(len(hidden_nfts) - 5) + "</b>"
+
+        prof_link = "<b><a href=\"" + profile_url + "\">" + ("@" + username if username else "Профиль") + "</a></b>"
+        txt = (
+            "<b>Владелец: " + owner_str + "</b>\n"
+            + prof_link + "\n"
+            + "<b>Скрытых NFT: " + str(len(hidden_nfts)) + " шт.</b>"
+            + nft_lines
+        )
+        kb = owner_card_kb(username, profile_url, uid)
+        try:
+            await status_msg.bot.send_message(
+                chat_id=status_msg.chat.id, text=txt,
+                parse_mode="HTML", reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            found += 1
+            stats["found"] += 1
+        except Exception as e:
+            logger.warning("profile send: %s", e)
+
+    try:
+        await status_msg.edit_text("<b>Сканирую маркет...</b>", reply_markup=stop_kb())
+
         import random as _random
         ids = list(gift_ids)
         _random.shuffle(ids)
         BATCH = 64
-        search_start2 = asyncio.get_event_loop().time()
+        search_start = asyncio.get_event_loop().time()
+        COLLECT_TIMEOUT = 5.0  # 5 сек собираем владельцев с маркета
+
+        # Шаг 1: собираем всех владельцев с маркета
         for i in range(0, len(ids), BATCH):
-            if asyncio.get_event_loop().time() - search_start2 > 4.0:
+            if asyncio.get_event_loop().time() - search_start > COLLECT_TIMEOUT:
                 break
             batch = ids[i:i+BATCH]
-            async def _fetch_sellers(gid):
-                try:
-                    items, _ = await fetch_market_page(gid, "", limit=100)
-                    for item in items:
-                        uid = item.get("owner_id")
-                        if uid:
-                            market_uids.add(uid)
-                except Exception:
-                    pass
-            await asyncio.gather(*[_fetch_sellers(gid) for gid in batch])
+            await asyncio.gather(*[collect_owners(gid) for gid in batch])
 
-    async def scan_saved_gifts(gid):
-        """Сканируем сохранённые гифты одной коллекции через GetSavedStarGiftsRequest."""
-        nonlocal found, last_upd
-        if not is_searching or found >= max_results:
-            return
+        total_owners = len(owners_from_market)
+        logger.info("Владельцев на маркете: %d", total_owners)
+
         try:
-            # Получаем список продающихся в этой коллекции чтобы найти их uid
-            result = await tg_client(GetResaleStarGiftsRequest(gift_id=gid, offset="", limit=100))
-            users_map = {int(u.id): u for u in (getattr(result, "users", None) or [])}
-            gifts = getattr(result, "gifts", None) or []
-            for gift in gifts:
-                if not is_searching or found >= max_results:
-                    return
-                owner, owner_uid = get_owner(gift, users_map)
-                if not owner_uid:
-                    continue
-                if owner_uid in seen_uids or owner_uid in market_uids:
-                    continue
-                username = getattr(owner, "username", None) if owner else None
-                fn = (getattr(owner, "first_name", "") or "") if owner else ""
-                ln = (getattr(owner, "last_name",  "") or "") if owner else ""
-                name = (fn + " " + ln).strip()
-                if not region_match(owner, username, name, region):
-                    continue
-                if girls_only and not is_girl(owner, username, name):
-                    continue
-                # Загружаем сохранённые гифты этого пользователя
-                try:
-                    saved = await tg_client(GetSavedStarGiftsRequest(
-                        peer=await tg_client.get_input_entity(owner_uid),
-                        offset="", limit=100,
-                    ))
-                    saved_gifts = getattr(saved, "gifts", None) or []
-                except Exception:
-                    continue
-                # Оставляем только те что НЕ выставлены на продажу
-                hidden_nfts = []
-                for sg in saved_gifts:
-                    # unsaved=True или resell_amount отсутствует = не на рынке
-                    on_market = bool(getattr(sg, "resell_amount", None))
-                    inner = getattr(sg, "gift", None)
-                    nft_url = make_nft_url(sg) or (make_nft_url(inner) if inner else None)
-                    title = getattr(inner, "title", None) or getattr(sg, "title", "?")
-                    num   = getattr(sg, "num", "?")
-                    if not on_market and nft_url:
-                        hidden_nfts.append({"title": title, "num": num, "nft_url": nft_url})
-                if not gifts_in_range(len(hidden_nfts), min_gifts, max_gifts):
-                    continue
-                if owner_uid in seen_uids:
-                    continue
-                seen_uids.add(owner_uid)
-                if user_seen_owners is not None:
-                    user_seen_owners.add(owner_uid)
-                profile_url = ("https://t.me/" + username) if username else ("tg://user?id=" + str(owner_uid))
-                owner_str = fmt_owner(owner, username, name)
-                cache_owner(owner_uid, owner, username, name, profile_url, hidden_nfts)
-                nft_lines = ""
-                for g in hidden_nfts[:5]:
-                    nu = g.get("nft_url")
-                    t  = g.get("title","?")
-                    n  = g.get("num","?")
-                    if nu:
-                        nft_lines += "\n<b>• <a href=\"" + nu + "\">" + str(t) + " #" + str(n) + "</a></b>"
-                    else:
-                        nft_lines += "\n<b>• " + str(t) + " #" + str(n) + "</b>"
-                if len(hidden_nfts) > 5:
-                    nft_lines += "\n<b>  ... ещё " + str(len(hidden_nfts)-5) + "</b>"
-                prof_link = "<b><a href=\"" + profile_url + "\">" + ("@"+username if username else "Профиль") + "</a></b>"
-                txt = (
-                    "<b>Владелец: " + owner_str + "</b>\n"
-                    + prof_link + "\n"
-                    "<b>Скрытых NFT: " + str(len(hidden_nfts)) + " шт.</b>"
-                    + nft_lines
-                )
-                kb = owner_card_kb(username, profile_url, owner_uid)
-                try:
-                    await status_msg.bot.send_message(
-                        chat_id=status_msg.chat.id, text=txt,
-                        parse_mode="HTML", reply_markup=kb,
-                        disable_web_page_preview=True,
-                    )
-                    found += 1
-                    stats["found"] += 1
-                except Exception as e:
-                    logger.warning("profile send: %s", e)
-        except Exception as e:
-            logger.error("scan_saved gid=%s: %s", gid, e)
+            await status_msg.edit_text(
+                "<b>Проверяю скрытые NFT у " + str(total_owners) + " владельцев...</b>",
+                parse_mode="HTML", reply_markup=stop_kb()
+            )
+        except Exception:
+            pass
 
-    try:
-        await status_msg.edit_text("<b>Поиск запущен...</b>", reply_markup=stop_kb())
-        # Сначала собираем кто торгует (быстро, 4 сек)
-        await collect_market_sellers()
-
-        import random as _random
-        ids = list(gift_ids)
-        _random.shuffle(ids)
-        BATCH = 32
-        scanned_box = [0]
-        search_start = asyncio.get_event_loop().time()
-        SEARCH_TIMEOUT = 8.0
-        for i in range(0, len(ids), BATCH):
+        # Шаг 2: для каждого проверяем скрытые NFT
+        owner_list = list(owners_from_market.items())
+        _random.shuffle(owner_list)
+        check_start = asyncio.get_event_loop().time()
+        CHECK_TIMEOUT = 8.0
+        scanned = 0
+        for i in range(0, len(owner_list), 10):
             if not is_searching or found >= max_results:
                 break
-            if asyncio.get_event_loop().time() - search_start > SEARCH_TIMEOUT:
+            if asyncio.get_event_loop().time() - check_start > CHECK_TIMEOUT:
                 break
-            batch = ids[i:i+BATCH]
-            await asyncio.gather(*[scan_saved_gifts(gid) for gid in batch])
-            scanned_box[0] += len(batch)
+            batch = owner_list[i:i+10]
+            await asyncio.gather(*[check_owner_hidden(uid, info) for uid, info in batch])
+            scanned += len(batch)
             now = asyncio.get_event_loop().time()
             if now - last_upd > 1.5:
                 try:
                     lbl = "девушек" if girls_only else ("моделей" if model_only else "профилей")
                     await status_msg.edit_text(
-                        "<b>Сканирую: " + str(min(scanned_box[0], len(ids))) + "/" + str(len(ids)) + "\n"
+                        "<b>Проверено: " + str(scanned) + "/" + str(total_owners) + "\n"
                         "Найдено " + lbl + " (скрытые NFT): " + str(found) + "</b>",
                         parse_mode="HTML", reply_markup=stop_kb()
                     )
