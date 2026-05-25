@@ -97,53 +97,72 @@ def region_match(owner, username, name, region_key):
     """Проверяет соответствие владельца выбранному региону."""
     if region_key == "any" or not region_key:
         return True
-    reg = REGIONS.get(region_key, {})
-    kws = reg.get("kw", [])
-    # Собираем весь текст
+
+    # Собираем данные профиля
     bio   = ""
-    uname = (username or "").lower()
+    uname = (username or "").lower().strip()
     fname = ""
     lname = ""
+
     if owner:
-        bio   = (getattr(owner, "bio", "") or "").lower()
-        uname = uname or (getattr(owner, "username", "") or "").lower()
-        fname = (getattr(owner, "first_name", "") or "").lower()
-        lname = (getattr(owner, "last_name", "") or "").lower()
+        bio   = (getattr(owner, "bio",        "") or "").lower()
+        u2    = (getattr(owner, "username",   "") or "").lower().strip()
+        if u2:
+            uname = u2
+        fname = (getattr(owner, "first_name", "") or "").lower().strip()
+        lname = (getattr(owner, "last_name",  "") or "").lower().strip()
+
     if name and not fname:
         parts = name.lower().strip().split()
         fname = parts[0] if parts else ""
         lname = parts[1] if len(parts) > 1 else ""
-    name_text    = (fname + " " + lname).strip()
-    full         = (bio + " " + name_text + " " + uname).strip()
-    # Если вообще нет данных о пользователе — не отсеиваем
-    if not full.strip():
+
+    name_text = (fname + " " + lname).strip()
+    full      = (bio + " " + name_text + " " + uname).strip()
+
+    # Если вообще нет данных — не отсеиваем (профиль закрыт)
+    if not full:
         return True
+
+    reg = REGIONS.get(region_key, {})
+    kws = reg.get("kw", [])
+
     name_script  = detect_script(name_text)
     uname_script = detect_script(uname)
-    bio_script   = detect_script(bio)
-    has_cyrillic = (name_script == "cyrillic" or uname_script == "cyrillic" or
-                    any(c in RU_LETTERS for c in bio[:50]))
+    has_cyrillic = (name_script == "cyrillic" or uname_script == "cyrillic"
+                    or any(c in RU_LETTERS for c in bio[:100]))
+    has_latin    = (name_script == "latin" or uname_script == "latin"
+                    or any(c in EN_LETTERS for c in (name_text + uname)[:50]))
 
-    # Для CN — только китайские иероглифы, кириллица = стоп
-    if region_key == "cn":
+    # ---- Кириллические страны (RU / UA / BY / KZ / UZ) ----
+    if region_key in ("ru", "ua", "by", "kz", "uz"):
         if has_cyrillic:
-            return False
-        return any('一' <= c <= '鿿' for c in full)
-
-    # Для JP — японские символы (хирагана/катакана/кандзи), кириллица = стоп
-    if region_key == "jp":
-        if has_cyrillic:
-            return False
-        has_jp = (any('぀' <= c <= 'ヿ' for c in full) or
-                  any('一' <= c <= '鿿' for c in full))
-        if has_jp:
             return True
         for kw in kws:
             if kw in full:
                 return True
         return False
 
-    # Для TR — турецкие символы или ключевые слова, кириллица = стоп
+    # ---- CN — китайские иероглифы ----
+    if region_key == "cn":
+        if has_cyrillic:
+            return False
+        return any('一' <= c <= '鿿' for c in full)
+
+    # ---- JP — японские символы ----
+    if region_key == "jp":
+        if has_cyrillic:
+            return False
+        if any('぀' <= c <= 'ヿ' for c in full):
+            return True
+        if any('一' <= c <= '鿿' for c in full):
+            return True
+        for kw in kws:
+            if kw in full:
+                return True
+        return False
+
+    # ---- TR — турецкие буквы или ключевые слова ----
     if region_key == "tr":
         if has_cyrillic:
             return False
@@ -153,10 +172,9 @@ def region_match(owner, username, name, region_key):
         for kw in kws:
             if kw in full:
                 return True
-        # Только латиница без специфики — не считаем турком
         return False
 
-    # Для AE — арабский или ключевые слова, кириллица = стоп
+    # ---- AE — арабский или ключевые слова ----
     if region_key == "ae":
         if has_cyrillic:
             return False
@@ -167,51 +185,69 @@ def region_match(owner, username, name, region_key):
                 return True
         return False
 
-    # Для RU/UA - кириллица в имени ИЛИ нике = матч
-    if region_key in ("ru", "ua"):
-        if name_script == "cyrillic" or uname_script == "cyrillic":
-            return True
-        for kw in kws:
-            if kw in full:
-                return True
-        return False
-
-    # Для BY/KZ/UZ - кириллица или ключевые слова
-    if region_key in ("by", "kz", "uz"):
+    # ---- IN — индийские символы, ключевые слова или латиница ----
+    if region_key == "in":
         if has_cyrillic:
+            return False
+        if any('ऀ' <= c <= 'ॿ' for c in full):  # деванагари
             return True
         for kw in kws:
             if kw in full:
                 return True
         return False
 
-    # Для EN-стран (US/UK/CA/AU) - кириллица = СТОП, нужна латиница
+    # ---- BR — португальские буквы или ключевые слова ----
+    if region_key == "br":
+        if has_cyrillic:
+            return False
+        pt_chars = set("ãõâêôáéíóúàèìòùçÃÕÂÊÔÁÉÍÓÚÀÈÌÒÙÇ")
+        if any(c in pt_chars for c in full):
+            return True
+        for kw in kws:
+            if kw in full:
+                return True
+        return False
+
+    # ---- Латинские страны (US / UK / CA / AU / DE / FR / ES) ----
     if region_key in ("us", "uk", "ca", "au"):
         if has_cyrillic:
             return False
-        if name_script == "latin" or uname_script == "latin":
-            return True
-        for kw in kws:
-            if kw in full:
-                return True
+        if has_latin:
+            # Проверяем что это не явно другая страна
+            for kw in kws:
+                if kw in full:
+                    return True
+            # Латиница без специфики — принимаем
+            return has_latin
         return False
 
-    # Для DE/FR/ES/BR/IN - кириллица = стоп, проверяем ключевые слова
-    if region_key in ("de", "fr", "es", "br", "in"):
+    if region_key in ("de", "fr", "es"):
         if has_cyrillic:
             return False
         for kw in kws:
             if kw in full:
                 return True
-        if name_script == "latin" or uname_script == "latin":
-            return True
+        # Страноспецифичные буквы
+        if region_key == "de":
+            de_chars = set("äöüÄÖÜß")
+            if any(c in de_chars for c in full):
+                return True
+        if region_key == "fr":
+            fr_chars = set("àâæçéèêëîïôœùûüÿÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ")
+            if any(c in fr_chars for c in full):
+                return True
+        if region_key == "es":
+            es_chars = set("áéíóúüñÁÉÍÓÚÜÑ¿¡")
+            if any(c in es_chars for c in full):
+                return True
         return False
 
-    # Fallback
+    # Fallback — ключевые слова
     for kw in kws:
         if kw in full:
             return True
     return False
+
 
 # Флаги онбординга (первый запуск) - хранится в памяти, заполняется из users.json
 ONBOARDING_DONE = set()
@@ -323,6 +359,7 @@ class Onboarding(StatesGroup):
     min_gifts = State()
     max_gifts = State()
     boost     = State()
+    limit     = State()
 
 class SetGifts(StatesGroup):
     min_gifts = State()
@@ -1450,14 +1487,14 @@ async def do_profile_search(
             logger.warning("profile send: %s", e)
 
     try:
-        await status_msg.edit_text("<b>Сканирую маркет...</b>", reply_markup=stop_kb())
+        await status_msg.edit_text("<b>Поиск запущен...</b>", reply_markup=stop_kb())
 
         import random as _random
         ids = list(gift_ids)
         _random.shuffle(ids)
         BATCH = 64
         search_start = asyncio.get_event_loop().time()
-        COLLECT_TIMEOUT = 5.0  # 5 сек собираем владельцев с маркета
+        COLLECT_TIMEOUT = 5.0
 
         # Шаг 1: собираем всех владельцев с маркета
         for i in range(0, len(ids), BATCH):
@@ -1467,7 +1504,7 @@ async def do_profile_search(
             await asyncio.gather(*[collect_owners(gid) for gid in batch])
 
         total_owners = len(owners_from_market)
-        logger.info("Владельцев на маркете: %d", total_owners)
+        logger.info("Владельцев найдено: %d", total_owners)
 
         try:
             await status_msg.edit_text(
@@ -1643,9 +1680,9 @@ async def cmd_start(message: Message, state: FSMContext):
     if uid not in ONBOARDING_DONE:
         await message.answer(
             "<b>Добро пожаловать в Neptun Parser\n\n"
-            "Настроим поиск - 3 быстрых шага.\n\n"
-            "Шаг 1 из 3\n"
-            "Минимум гифтов у владельца\n"
+            "Настроим поиск — 4 быстрых шага.\n\n"
+            "Шаг 1 из 4\n"
+            "Минимум гифтов у владельца (рекомендуем 2)\n"
             "Введи число (например: 2):</b>",
             parse_mode="HTML"
         )
@@ -1679,7 +1716,7 @@ async def ob_min_text(message: Message, state: FSMContext):
     USER_MIN_GIFTS[message.from_user.id] = val
     await message.answer(
         "<b>Мин. гифтов: " + str(val) + "\n\n"
-        "Шаг 2 из 3. Максимум гифтов\n"
+        "Шаг 2 из 4. Максимум гифтов\n"
         "Введи число (0 = без лимита):</b>",
         parse_mode="HTML"
     )
@@ -1699,7 +1736,7 @@ async def ob_max_text(message: Message, state: FSMContext):
     label = "без лимита" if val == 0 else str(val)
     await message.answer(
         "<b>Макс. гифтов: " + label + "\n\n"
-        "Шаг 3 из 3. Буст цен\n"
+        "Шаг 3 из 4. Буст цен\n"
         "Введи число в % (например: 100)\n"
         "100 = цена до x2 от флора, 200 = до x3</b>",
         parse_mode="HTML"
@@ -1718,20 +1755,88 @@ async def ob_boost_text(message: Message, state: FSMContext):
         return
     uid = message.from_user.id
     USER_BOOST[uid] = val
+    await message.answer(
+        "<b>Буст: " + str(val) + "%\n\n"
+        "Шаг 4 из 4. Лимит выдачи результатов\n"
+        "Сколько результатов показывать за один поиск?\n"
+        "Введи число от 10 до 70:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="10", callback_data="ob_lim_10"),
+                InlineKeyboardButton(text="20", callback_data="ob_lim_20"),
+                InlineKeyboardButton(text="30", callback_data="ob_lim_30"),
+            ],
+            [
+                InlineKeyboardButton(text="50", callback_data="ob_lim_50"),
+                InlineKeyboardButton(text="70", callback_data="ob_lim_70"),
+            ],
+        ])
+    )
+    await state.set_state(Onboarding.limit)
+
+# Онбординг шаг 4 - лимит (кнопки)
+@dp.callback_query(F.data.startswith("ob_lim_"))
+async def ob_limit_btn(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    # Принимаем только если в состоянии онбординга
+    cur_state = await state.get_state()
+    if cur_state != Onboarding.limit.state:
+        await cb.answer()
+        return
+    val = int(cb.data[7:])
+    USER_LIMIT[uid] = val
     mn  = get_min_gifts(uid)
     mx  = get_max_gifts(uid)
+    bst = get_boost(uid)
     mx_str = str(mx) if mx > 0 else "без лимита"
     await state.clear()
+    ONBOARDING_DONE.add(uid)
+    save_onboarding(ONBOARDING_DONE)
+    await cb.message.edit_text(
+        "<b>Настройка завершена!\n\n"
+        "Мин. гифтов: " + str(mn) + "\n"
+        "Макс. гифтов: " + mx_str + "\n"
+        "Буст: " + str(bst) + "%\n"
+        "Лимит выдачи: " + str(val) + "\n\n"
+        "Можно изменить в Настройки</b>",
+        parse_mode="HTML"
+    )
+    await cb.message.answer(
+        "<b>Neptun Parser\n\nВыбери действие:</b>",
+        parse_mode="HTML",
+        reply_markup=main_menu_kb()
+    )
+    await cb.answer()
+
+# Онбординг шаг 4 - лимит (текстовый ввод)
+@dp.message(Onboarding.limit)
+async def ob_limit_text(message: Message, state: FSMContext):
+    try:
+        val = int(message.text.strip())
+        if val < 10 or val > 70:
+            raise ValueError
+    except ValueError:
+        await message.answer("<b>Введи число от 10 до 70:</b>", parse_mode="HTML")
+        return
+    uid = message.from_user.id
+    USER_LIMIT[uid] = val
+    mn  = get_min_gifts(uid)
+    mx  = get_max_gifts(uid)
+    bst = get_boost(uid)
+    mx_str = str(mx) if mx > 0 else "без лимита"
+    await state.clear()
+    ONBOARDING_DONE.add(uid)
+    save_onboarding(ONBOARDING_DONE)
     await message.answer(
         "<b>Настройка завершена!\n\n"
         "Мин. гифтов: " + str(mn) + "\n"
         "Макс. гифтов: " + mx_str + "\n"
-        "Буст: " + str(val) + "%\n\n"
+        "Буст: " + str(bst) + "%\n"
+        "Лимит выдачи: " + str(val) + "\n\n"
         "Можно изменить в Настройки</b>",
         parse_mode="HTML"
     )
-    ONBOARDING_DONE.add(uid)
-    save_onboarding(ONBOARDING_DONE)
     await message.answer(
         "<b>Neptun Parser\n\nВыбери действие:</b>",
         parse_mode="HTML",
@@ -1741,7 +1846,11 @@ async def ob_boost_text(message: Message, state: FSMContext):
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
+    uid = message.from_user.id
     await state.clear()
+    if uid not in ONBOARDING_DONE:
+        await message.answer("<b>Сначала пройди настройку. Напиши /start</b>", parse_mode="HTML")
+        return
     await message.answer("<b>Отменено.</b>", parse_mode="HTML", reply_markup=main_menu_kb())
 
 @dp.message(Command("myid"))
@@ -1749,12 +1858,18 @@ async def cmd_myid(message: Message):
     await message.answer("<b>Твой ID:</b> <code>" + str(message.from_user.id) + "</code>", parse_mode="HTML")
 
 @dp.message(Command("clear"))
-async def cmd_clear(message: Message):
+async def cmd_clear(message: Message, state: FSMContext):
     global is_searching
+    uid = message.from_user.id
+    # Если онбординг не пройден — не показываем меню
+    if uid not in ONBOARDING_DONE:
+        await message.answer("<b>Сначала пройди настройку. Напиши /start</b>", parse_mode="HTML")
+        return
     if not is_searching:
         await message.answer("<b>У вас не идёт поиск.</b>", parse_mode="HTML", reply_markup=menu_kb())
         return
     is_searching = False
+    await state.clear()
     await message.answer("<b>Поиск остановлен.</b>", parse_mode="HTML", reply_markup=menu_kb())
 
 @dp.message(Command("neptunteam"))
