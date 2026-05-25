@@ -45,6 +45,7 @@ NFT_CACHE = {}
 USER_BOOST = {}
 USER_MIN_GIFTS = {}
 USER_MAX_GIFTS = {}
+USER_SEEN_OWNERS = {}  # uid -> set of owner_ids которых уже показали
 DEFAULT_BOOST     = 100
 DEFAULT_MIN_GIFTS = 2
 DEFAULT_MAX_GIFTS = 0
@@ -112,46 +113,30 @@ def region_match(owner, username, name, region_key):
         parts = name.lower().strip().split()
         fname = parts[0] if parts else ""
         lname = parts[1] if len(parts) > 1 else ""
-    name_text = (fname + " " + lname + " " + uname).strip()
-    full      = (bio + " " + name_text).strip()
+    name_text    = (fname + " " + lname).strip()
+    full         = (bio + " " + name_text + " " + uname).strip()
+    name_script  = detect_script(name_text)
+    uname_script = detect_script(uname)
+    bio_script   = detect_script(bio)
+    has_cyrillic = (name_script == "cyrillic" or uname_script == "cyrillic" or
+                    any(c in RU_LETTERS for c in bio[:50]))
 
-    script = detect_script(name_text)
-
-    # Для RU/UA/BY/KZ/UZ — кириллица в имени = матч
-    if region_key in ("ru", "ua", "by", "kz", "uz"):
-        if script == "cyrillic":
-            return True
-        # Проверяем ключевые слова региона в bio
-        for kw in kws:
-            if kw in full:
-                return True
-        return False
-
-    # Для EN-стран — имя латиницей (кириллица = исключение)
-    if region_key in ("us", "uk", "ca", "au"):
-        if script == "cyrillic":
+    # Для CN — иероглифы обязательны, кириллица = стоп
+    if region_key == "cn":
+        if has_cyrillic:
             return False
-        if script == "latin":
-            return True
-        for kw in kws:
-            if kw in full:
-                return True
-        return False
+        return any('\u4e00' <= c <= '\u9fff' for c in full)
 
-    # Для DE/FR/ES/TR/BR/IN — проверяем ключевые слова, исключаем кириллицу
-    if region_key in ("de", "fr", "es", "tr", "br", "in"):
-        if script == "cyrillic":
+    # Для JP — японские символы обязательны, кириллица = стоп
+    if region_key == "jp":
+        if has_cyrillic:
             return False
-        for kw in kws:
-            if kw in full:
-                return True
-        # Если имя чисто латинское — считаем потенциальным матчем
-        if script == "latin":
-            return True
-        return False
+        return any('\u3040' <= c <= '\u30ff' for c in full)
 
-    # Для AE — арабский или ключевые слова
+    # Для AE — арабский или ключевые слова, кириллица = стоп
     if region_key == "ae":
+        if has_cyrillic:
+            return False
         if any('\u0600' <= c <= '\u06ff' for c in full):
             return True
         for kw in kws:
@@ -159,15 +144,47 @@ def region_match(owner, username, name, region_key):
                 return True
         return False
 
-    # Для CN — иероглифы
-    if region_key == "cn":
-        return any('\u4e00' <= c <= '\u9fff' for c in full)
+    # Для RU/UA — кириллица в имени ИЛИ нике = матч
+    if region_key in ("ru", "ua"):
+        if name_script == "cyrillic" or uname_script == "cyrillic":
+            return True
+        for kw in kws:
+            if kw in full:
+                return True
+        return False
 
-    # Для JP — японские символы
-    if region_key == "jp":
-        return any('\u3040' <= c <= '\u30ff' for c in full)
+    # Для BY/KZ/UZ — кириллица или ключевые слова
+    if region_key in ("by", "kz", "uz"):
+        if has_cyrillic:
+            return True
+        for kw in kws:
+            if kw in full:
+                return True
+        return False
 
-    # Для KZ/UZ — кириллица или ключевые слова
+    # Для EN-стран (US/UK/CA/AU) — кириллица = СТОП, нужна латиница
+    if region_key in ("us", "uk", "ca", "au"):
+        if has_cyrillic:
+            return False
+        if name_script == "latin" or uname_script == "latin":
+            return True
+        for kw in kws:
+            if kw in full:
+                return True
+        return False
+
+    # Для DE/FR/ES/TR/BR/IN — кириллица = стоп, проверяем ключевые слова
+    if region_key in ("de", "fr", "es", "tr", "br", "in"):
+        if has_cyrillic:
+            return False
+        for kw in kws:
+            if kw in full:
+                return True
+        if name_script == "latin" or uname_script == "latin":
+            return True
+        return False
+
+    # Fallback
     for kw in kws:
         if kw in full:
             return True
@@ -492,18 +509,30 @@ def price_ok_for_floor(price, floor, boost):
 async def load_collections():
     global ALL_GIFT_IDS, NFT_COLLECTIONS
     try:
-        result = await tg_client(GetStarGiftsRequest(hash=0))
         ALL_GIFT_IDS    = []
         NFT_COLLECTIONS = {}
-        for gift in result.gifts:
-            gid   = getattr(gift, "id",    None)
-            title = getattr(gift, "title", None)
-            if gid is None:
-                continue
-            label = title if title else ("Gift #" + str(gid))
-            ALL_GIFT_IDS.append((gid, label))
-            if title:
-                NFT_COLLECTIONS[title] = gid
+        seen_ids = set()
+        # Пробуем несколько hash-значений чтобы получить все коллекции
+        for h in [0, 1, 2, 3, 4, 5]:
+            try:
+                result = await tg_client(GetStarGiftsRequest(hash=h))
+                gifts = getattr(result, "gifts", None) or []
+                if not gifts:
+                    continue
+                for gift in gifts:
+                    gid   = getattr(gift, "id",    None)
+                    title = getattr(gift, "title", None)
+                    if gid is None or gid in seen_ids:
+                        continue
+                    seen_ids.add(gid)
+                    label = title if title else ("Gift #" + str(gid))
+                    ALL_GIFT_IDS.append((gid, label))
+                    if title:
+                        NFT_COLLECTIONS[title] = gid
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.debug("load_collections hash=%d: %s", h, e)
+                break
         logger.info("Коллекций загружено: %d", len(ALL_GIFT_IDS))
     except Exception as e:
         logger.error("load_collections: %s", e)
@@ -813,7 +842,7 @@ def col_kb(names, prefix, back):
 
 MODEL_COL_PAGE_SIZE = 20
 
-def model_col_kb(names, page=0):
+def model_col_kb(names, page=0, who="model"):
     """Клавиатура коллекций для поиска по модели с пагинацией."""
     start = page * MODEL_COL_PAGE_SIZE
     end   = min(start + MODEL_COL_PAGE_SIZE, len(names))
@@ -821,19 +850,19 @@ def model_col_kb(names, page=0):
     rows  = []
     for i in range(0, len(chunk), 2):
         idx1 = start + i
-        row  = [InlineKeyboardButton(text=chunk[i], callback_data="mdlcol_" + str(idx1))]
+        row  = [InlineKeyboardButton(text=chunk[i], callback_data="mdlcol_" + str(idx1) + "_" + who)]
         if i + 1 < len(chunk):
             idx2 = start + i + 1
-            row.append(InlineKeyboardButton(text=chunk[i+1], callback_data="mdlcol_" + str(idx2)))
+            row.append(InlineKeyboardButton(text=chunk[i+1], callback_data="mdlcol_" + str(idx2) + "_" + who))
         rows.append(row)
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="Назад", callback_data="mdlpage_" + str(page - 1)))
+        nav.append(InlineKeyboardButton(text="Назад", callback_data="mdlpage_" + str(page - 1) + "_" + who))
     if end < len(names):
-        nav.append(InlineKeyboardButton(text="Далее", callback_data="mdlpage_" + str(page + 1)))
+        nav.append(InlineKeyboardButton(text="Далее", callback_data="mdlpage_" + str(page + 1) + "_" + who))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton(text="Назад в меню", callback_data="search_mode_select")])
+    rows.append([InlineKeyboardButton(text="Назад в меню", callback_data="mode_model")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def owner_card_kb(username, profile_url, owner_uid):
@@ -910,21 +939,28 @@ async def do_market_search(
     max_gifts=0,
     profile_only=False,
     region="any",
+    user_seen_owners=None,
 ):
     global is_searching
     is_searching = True
     found        = 0
     seen_slugs   = set()
+    seen_owners  = set(user_seen_owners) if user_seen_owners is not None else set()
     owner_buckets = {}
     owner_seen    = {}
     last_upd      = 0.0
     START_TIME    = asyncio.get_event_loop().time()
-    DELAY         = 0.15  # задержка между запросами (сек, ускорено)
+    DELAY         = 0.08  # ускорено
 
     has_cat = cat is not None
 
     async def send_owner_card(uid, bucket):
         nonlocal found
+        if uid in seen_owners:
+            return
+        seen_owners.add(uid)
+        if user_seen_owners is not None:
+            user_seen_owners.add(uid)
         items       = bucket["items"]
         username    = bucket["username"]
         profile_url = bucket["profile_url"]
@@ -969,12 +1005,15 @@ async def do_market_search(
                 return
             if floor and not price_ok_for_floor(price, floor, boost):
                 return
+            if oid and oid in seen_owners:
+                return
             prof_url2 = item.get("profile_url") or ("https://t.me/" + username if username else "")
             prof_txt  = ("\n<b>👤 <a href=\"" + prof_url2 + "\">" + ("@"+username) + "</a></b>") if username else ""
             nft_txt   = ("\n<b>🔗 <a href=\"" + str(nft_url2) + "\">" + str(title) + " #" + str(num) + "</a></b>") if nft_url2 else ("<b>\n" + str(title) + " #" + str(num) + "</b>")
             txt = "<b>Цена: " + str(price) + " ⭐</b>" + nft_txt + prof_txt
             if oid:
                 cache_owner(oid, item["owner"], username, item.get("name",""), item.get("profile_url"), [item])
+                seen_owners.add(oid)
             kb = model_nft_kb(nft_url2, username, title, num)
             try:
                 await status_msg.bot.send_message(
@@ -994,6 +1033,8 @@ async def do_market_search(
             if floor and not price_ok_for_floor(price, floor, boost):
                 return
             if oid:
+                if oid in seen_owners:
+                    return
                 if owner_seen.get(oid, 0) >= 3:
                     return
                 owner_seen[oid] = owner_seen.get(oid, 0) + 1
@@ -1020,10 +1061,14 @@ async def do_market_search(
                 )
                 found += 1
                 stats["found"] += 1
+                if oid:
+                    seen_owners.add(oid)
             except Exception as e:
                 logger.warning("send: %s", e)
         else:
             if not oid:
+                return
+            if oid in seen_owners:
                 return
             if not region_match(item["owner"], username, item.get("name"), region):
                 return
@@ -1037,11 +1082,17 @@ async def do_market_search(
                     "items": [],
                 }
             owner_buckets[oid]["items"].append(item)
+            # Мгновенная выдача: если уже >= min_gifts — сразу отправляем
+            bucket = owner_buckets[oid]
+            if gifts_in_range(len(bucket["items"]), min_gifts, max_gifts) and oid not in seen_owners:
+                if is_searching and found < max_results:
+                    del owner_buckets[oid]
+                    await send_owner_card(oid, bucket)
 
     async def flush_ready_owners():
         nonlocal found
         ready = [(uid, bk) for uid, bk in list(owner_buckets.items())
-                 if gifts_in_range(len(bk["items"]), min_gifts, max_gifts)]
+                 if gifts_in_range(len(bk["items"]), min_gifts, max_gifts) and uid not in seen_owners]
         for uid, bk in ready:
             if not is_searching or found >= max_results:
                 break
@@ -1095,8 +1146,6 @@ async def do_market_search(
                 await process_item(item, floor)
 
             scanned += 1
-            if not has_cat:
-                await flush_ready_owners()
 
             now = asyncio.get_event_loop().time()
             if now - last_upd > 2.0:
@@ -1111,8 +1160,8 @@ async def do_market_search(
                     pass
                 last_upd = now
 
-        if not has_cat:
-            await flush_ready_owners()
+        # Финальный сброс оставшихся buckets
+        await flush_ready_owners()
 
     except Exception as e:
         logger.error("do_market_search: %s", e)
@@ -1132,11 +1181,12 @@ async def do_profile_search(
     min_gifts=2,
     max_gifts=0,
     region="any",
+    user_seen_owners=None,
 ):
     global is_searching
     is_searching = True
     found        = 0
-    seen_uids    = set()
+    seen_uids    = set(user_seen_owners) if user_seen_owners is not None else set()
     last_upd     = 0.0
     START_TIME   = asyncio.get_event_loop().time()
     HARD_LIMIT   = 180.0
@@ -1199,6 +1249,8 @@ async def do_profile_search(
         nonlocal found
         if found >= max_results:
             return
+        if uid in seen_uids:
+            return
         owner_obj   = info["owner"]
         username    = info["username"]
         name        = info["name"]
@@ -1248,6 +1300,9 @@ async def do_profile_search(
             )
             found += 1
             stats["found"] += 1
+            seen_uids.add(uid)
+            if user_seen_owners is not None:
+                user_seen_owners.add(uid)
         except Exception as e:
             logger.warning("profile send: %s", e)
 
@@ -1321,6 +1376,8 @@ async def run_market(cb, cat=None, girls=False, model=False, ids=None, col_name=
     lim    = limit if limit else get_limit(uid)
     mx_str = str(mx) if mx > 0 else "без лимита"
     reg_label = REGIONS.get(reg, {}).get("label", "Все")
+    # Уже виденные владельцы для этого юзера
+    user_seen = USER_SEEN_OWNERS.setdefault(uid, set())
     if col_name and model:
         label = "Модели. " + col_name
     elif girls:
@@ -1340,7 +1397,7 @@ async def run_market(cb, cat=None, girls=False, model=False, ids=None, col_name=
     status = await cb.message.answer(txt, parse_mode="HTML", reply_markup=stop_kb())
     found = await do_market_search(status, ids, cat=cat, girls_only=girls, model_only=model,
                                    boost=boost, min_gifts=mn, max_gifts=mx,
-                                   max_results=lim, region=reg)
+                                   max_results=lim, region=reg, user_seen_owners=user_seen)
     try:
         await status.edit_text(
             "<b>Готово! " + label + "\nНайдено: " + str(found) + "</b>",
@@ -1368,6 +1425,7 @@ async def run_profile(cb, girls=False, model=False, ids=None, limit=None):
     lim    = limit if limit else get_limit(uid)
     mx_str = str(mx) if mx > 0 else "без лимита"
     reg_label = REGIONS.get(reg, {}).get("label", "Все")
+    user_seen = USER_SEEN_OWNERS.setdefault(uid, set())
     if girls:
         label = "Девушки. Профиль"
     elif model:
@@ -1383,7 +1441,7 @@ async def run_profile(cb, girls=False, model=False, ids=None, limit=None):
     status = await cb.message.answer(txt, parse_mode="HTML", reply_markup=stop_kb())
     found = await do_profile_search(status, ids, girls_only=girls, model_only=model,
                                     min_gifts=mn, max_gifts=mx,
-                                    max_results=lim, region=reg)
+                                    max_results=lim, region=reg, user_seen_owners=user_seen)
     try:
         await status.edit_text(
             "<b>Готово! " + label + "\nНайдено скрытых NFT: " + str(found) + "</b>",
@@ -1880,9 +1938,25 @@ async def cb_mode_col(cb: CallbackQuery):
     await cb.message.answer("<b>По коллекции: выбери источник:</b>", parse_mode="HTML", reply_markup=col_source_kb())
     await cb.answer()
 
-# Поиск по модели — показываем список всех коллекций
+# Поиск по модели — сначала выбираем кого искать
 @dp.callback_query(F.data == "mode_model")
 async def cb_mode_model(cb: CallbackQuery):
+    await cb.message.answer(
+        "<b>Поиск по маркету.\nКого искать?</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Всех",      callback_data="mdlwho_all")],
+            [InlineKeyboardButton(text="Девушек",   callback_data="mdlwho_girls")],
+            [InlineKeyboardButton(text="По модели", callback_data="mdlwho_model")],
+            [InlineKeyboardButton(text="Назад",     callback_data="search_mode_select")],
+        ])
+    )
+    await cb.answer()
+
+# Выбор кого — переходим к выбору коллекции
+@dp.callback_query(F.data.startswith("mdlwho_"))
+async def cb_mdlwho(cb: CallbackQuery):
+    who = cb.data[7:]  # all, girls, model
     if not NFT_COLLECTIONS:
         await load_collections()
     if not NFT_COLLECTIONS:
@@ -1891,39 +1965,47 @@ async def cb_mode_model(cb: CallbackQuery):
         return
     names = list(NFT_COLLECTIONS.keys())
     total = len(names)
+    lbl = {"all": "Все", "girls": "Девушки", "model": "По модели"}.get(who, who)
     await cb.message.answer(
-        "<b>Поиск по модели. Выбери коллекцию NFT:\n"
+        "<b>Поиск: " + lbl + ". Выбери коллекцию NFT:\n"
         "Всего коллекций: " + str(total) + "</b>",
         parse_mode="HTML",
-        reply_markup=model_col_kb(names, page=0)
+        reply_markup=model_col_kb(names, page=0, who=who)
     )
     await cb.answer()
 
 # Пагинация списка коллекций для поиска по модели
 @dp.callback_query(F.data.startswith("mdlpage_"))
 async def cb_mdlpage(cb: CallbackQuery):
-    page  = int(cb.data[8:])
+    parts = cb.data[8:].split("_")
+    page  = int(parts[0])
+    who   = parts[1] if len(parts) > 1 else "model"
     names = list(NFT_COLLECTIONS.keys())
     total = len(names)
+    lbl = {"all": "Все", "girls": "Девушки", "model": "По модели"}.get(who, who)
     await cb.message.edit_text(
-        "<b>Поиск по модели. Выбери коллекцию NFT:\n"
+        "<b>Поиск: " + lbl + ". Выбери коллекцию NFT:\n"
         "Всего коллекций: " + str(total) + "</b>",
         parse_mode="HTML",
-        reply_markup=model_col_kb(names, page=page)
+        reply_markup=model_col_kb(names, page=page, who=who)
     )
     await cb.answer()
 
-# Выбор коллекции для поиска по модели — запускаем маркет с model_only=True
+# Выбор коллекции — запускаем маркет
 @dp.callback_query(F.data.startswith("mdlcol_"))
 async def cb_mdlcol(cb: CallbackQuery, state: FSMContext):
-    idx  = int(cb.data[7:])
-    lst  = list(NFT_COLLECTIONS.items())
+    parts    = cb.data[7:].split("_")
+    idx      = int(parts[0])
+    who      = parts[1] if len(parts) > 1 else "model"
+    lst      = list(NFT_COLLECTIONS.items())
     if idx >= len(lst):
         await cb.answer("Не найдено", show_alert=True)
         return
     col_name, col_id = lst[idx]
+    girls = (who == "girls")
+    model = (who == "model")
     await cb.answer()
-    await run_market(cb, ids=[col_id], model=True, col_name=col_name)
+    await run_market(cb, ids=[col_id], girls=girls, model=model, col_name=col_name)
 
 @dp.callback_query(F.data == "col_market")
 async def cb_col_market(cb: CallbackQuery):
