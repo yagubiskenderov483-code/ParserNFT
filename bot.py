@@ -1268,7 +1268,7 @@ async def do_profile_search(
                 items, _ = await fetch_market_page(gid, "", limit=100)
             except Exception:
                 return
-            new_uids = []
+            # Сначала собираем ВСЕ items для всех uid из этой страницы
             for item in items:
                 uid = item.get("owner_id")
                 if not uid:
@@ -1281,7 +1281,6 @@ async def do_profile_search(
                         "profile_url": item.get("profile_url"),
                         "items":       [],
                     }
-                    new_uids.append(uid)
                 nft_url = item.get("nft_url")
                 if nft_url:
                     uid_data[uid]["items"].append({
@@ -1290,12 +1289,14 @@ async def do_profile_search(
                         "nft_url": nft_url,
                         "price":   item.get("price"),
                     })
-            # Сразу показываем найденных юзеров
-            for uid in new_uids:
+            # Потом показываем — у всех уже полные items
+            uids_this_page = list({item.get("owner_id") for item in items if item.get("owner_id")})
+            for uid in uids_this_page:
                 if not is_searching or found >= max_results:
                     break
                 async with send_lock2:
-                    await process_uid(uid, uid_data[uid])
+                    if uid in uid_data:
+                        await process_uid(uid, uid_data[uid])
 
         for i in range(0, len(ids), BATCH):
             if not is_searching or found >= max_results:
@@ -1336,7 +1337,9 @@ async def do_profile_search(
             return
         if model_only and not is_model(owner_obj, username, name):
             return
-        if not gifts_in_range(len(items), min_gifts, max_gifts):
+        # Для girls/model режима достаточно 1 NFT, иначе используем настройку
+        eff_min = 1 if (girls_only or model_only) else min_gifts
+        if not gifts_in_range(len(items), eff_min, max_gifts):
             return
 
         owner_str = fmt_owner(owner_obj, username, name)
@@ -2065,7 +2068,7 @@ async def cb_mdlpage(cb: CallbackQuery):
 # Выбор коллекции - запускаем маркет или профиль
 @dp.callback_query(F.data.startswith("mdlci_"))
 async def cb_mdlcol(cb: CallbackQuery, state: FSMContext):
-    parts    = cb.data[5:].split("_")   # skip "mdlci_"
+    parts    = cb.data[6:].split("_")   # skip "mdlci_" (6 chars)
     idx      = int(parts[0])
     who_raw  = "_".join(parts[1:]) if len(parts) > 1 else "market_model"
     # who_raw: "market_all", "market_girls", "market_model", "profile_all" etc
