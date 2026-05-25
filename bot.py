@@ -1070,8 +1070,6 @@ def nft_list_kb(nft_items, username, profile_url):
         price = g.get("price")
         if url:
             label = str(title) + " #" + str(num)
-            if price:
-                label += " " + str(price) + " звезд"
             btns.append([InlineKeyboardButton(text=label, url=url)])
     if profile_url:
         label = "@" + username if username else "Профиль"
@@ -1331,15 +1329,14 @@ async def do_profile_search(
     uid_data     = {}
 
     async def collect_all():
+        nonlocal last_upd
         import random as _random
         ids = list(gift_ids)
         _random.shuffle(ids)
         BATCH = 64
-        scanned = 0
-        # send_lock2 removed — sequential sending
+        scanned_box = [0]
 
         async def fetch_and_process(gid):
-            nonlocal scanned
             try:
                 items, _ = await fetch_market_page(gid, "", limit=100)
             except Exception:
@@ -1378,14 +1375,13 @@ async def do_profile_search(
                 break
             batch = ids[i:i+BATCH]
             await asyncio.gather(*[fetch_and_process(gid) for gid in batch])
-            scanned += len(batch)
+            scanned_box[0] += len(batch)
             now = asyncio.get_event_loop().time()
-            nonlocal last_upd
             if now - last_upd > 1.5:
                 try:
                     lbl = "девушек" if girls_only else ("моделей" if model_only else "профилей")
                     await status_msg.edit_text(
-                        "<b>Сканирую: " + str(min(scanned, len(ids))) + "/" + str(len(ids)) + "\n"
+                        "<b>Сканирую: " + str(min(scanned_box[0], len(ids))) + "/" + str(len(ids)) + "\n"
                         "Найдено " + lbl + ": " + str(found) + "</b>",
                         parse_mode="HTML", reply_markup=stop_kb()
                     )
