@@ -112,28 +112,64 @@ def region_match(owner, username, name, region_key):
         parts = name.lower().strip().split()
         fname = parts[0] if parts else ""
         lname = parts[1] if len(parts) > 1 else ""
-    full = bio + " " + uname + " " + fname + " " + lname
-    # Проверяем ключевые слова региона
-    for kw in kws:
-        if kw in full:
-            return True
+    name_text = (fname + " " + lname + " " + uname).strip()
+    full      = (bio + " " + name_text).strip()
+
+    script = detect_script(name_text)
+
     # Для RU/UA/BY/KZ/UZ — кириллица в имени = матч
     if region_key in ("ru", "ua", "by", "kz", "uz"):
-        script = detect_script(fname + " " + lname + " " + uname)
         if script == "cyrillic":
             return True
-    # Для EN-стран — латиница и нет кириллицы
+        # Проверяем ключевые слова региона в bio
+        for kw in kws:
+            if kw in full:
+                return True
+        return False
+
+    # Для EN-стран — имя латиницей (кириллица = исключение)
     if region_key in ("us", "uk", "ca", "au"):
-        script = detect_script(fname + " " + lname + " " + uname)
+        if script == "cyrillic":
+            return False
         if script == "latin":
             return True
+        for kw in kws:
+            if kw in full:
+                return True
+        return False
+
+    # Для DE/FR/ES/TR/BR/IN — проверяем ключевые слова, исключаем кириллицу
+    if region_key in ("de", "fr", "es", "tr", "br", "in"):
+        if script == "cyrillic":
+            return False
+        for kw in kws:
+            if kw in full:
+                return True
+        # Если имя чисто латинское — считаем потенциальным матчем
+        if script == "latin":
+            return True
+        return False
+
+    # Для AE — арабский или ключевые слова
+    if region_key == "ae":
+        if any('\u0600' <= c <= '\u06ff' for c in full):
+            return True
+        for kw in kws:
+            if kw in full:
+                return True
+        return False
+
     # Для CN — иероглифы
     if region_key == "cn":
-        if any('\u4e00' <= c <= '\u9fff' for c in full):
-            return True
+        return any('\u4e00' <= c <= '\u9fff' for c in full)
+
     # Для JP — японские символы
     if region_key == "jp":
-        if any('\u3040' <= c <= '\u30ff' for c in full):
+        return any('\u3040' <= c <= '\u30ff' for c in full)
+
+    # Для KZ/UZ — кириллица или ключевые слова
+    for kw in kws:
+        if kw in full:
             return True
     return False
 
@@ -820,8 +856,9 @@ def model_nft_kb(nft_url, username, title, num):
     import urllib.parse as _up
     btns = []
     if nft_url:
-        btns.append([InlineKeyboardButton(text="🔍 Смотреть NFT", url=nft_url)])
+        btns.append([InlineKeyboardButton(text="🔗 Смотреть NFT", url=nft_url)])
     if username:
+        btns.append([InlineKeyboardButton(text="👤 @" + username, url="https://t.me/" + username)])
         nft_link = nft_url or ""
         msg = _up.quote(
             "Привет! Хочу купить твой " + str(title) + " #" + str(num) +
@@ -900,8 +937,8 @@ async def do_market_search(
                 chat_id=status_msg.chat.id, text=txt,
                 parse_mode="HTML", reply_markup=kb,
             )
-            found += len(items)
-            stats["found"] += len(items)
+            found += 1
+            stats["found"] += 1
         except Exception as e:
             logger.warning("flush: %s", e)
 
@@ -932,10 +969,10 @@ async def do_market_search(
                 return
             if floor and not price_ok_for_floor(price, floor, boost):
                 return
-            txt = (
-                "<b>" + str(title) + " #" + str(num) + "\n"
-                "Цена: " + str(price) + " ⭐</b>"
-            )
+            prof_url2 = item.get("profile_url") or ("https://t.me/" + username if username else "")
+            prof_txt  = ("\n<b>👤 <a href=\"" + prof_url2 + "\">" + ("@"+username) + "</a></b>") if username else ""
+            nft_txt   = ("\n<b>🔗 <a href=\"" + str(nft_url2) + "\">" + str(title) + " #" + str(num) + "</a></b>") if nft_url2 else ("<b>\n" + str(title) + " #" + str(num) + "</b>")
+            txt = "<b>Цена: " + str(price) + " ⭐</b>" + nft_txt + prof_txt
             if oid:
                 cache_owner(oid, item["owner"], username, item.get("name",""), item.get("profile_url"), [item])
             kb = model_nft_kb(nft_url2, username, title, num)
@@ -1002,16 +1039,17 @@ async def do_market_search(
             owner_buckets[oid]["items"].append(item)
 
     async def flush_ready_owners():
+        nonlocal found
         ready = [(uid, bk) for uid, bk in list(owner_buckets.items())
                  if gifts_in_range(len(bk["items"]), min_gifts, max_gifts)]
         for uid, bk in ready:
-            if not is_searching:
+            if not is_searching or found >= max_results:
                 break
             del owner_buckets[uid]
             await send_owner_card(uid, bk)
 
     try:
-        await status_msg.edit_text("<b>Сканирую коллекции...</b>", reply_markup=stop_kb())
+        await status_msg.edit_text("<b>🔍 Поиск запущен...</b>", reply_markup=stop_kb())
 
         import random as _random
         total_ids = list(gift_ids)
@@ -1084,7 +1122,7 @@ async def do_market_search(
 
 
 
-# ===================== CORE: ПРОФИЛИ (гифты в профиле, НЕ на маркете) =====================
+# ===================== CORE: ПРОФИЛИ (быстрый поиск по юзам с маркета) =====================
 async def do_profile_search(
     status_msg,
     gift_ids,
@@ -1098,16 +1136,20 @@ async def do_profile_search(
     global is_searching
     is_searching = True
     found        = 0
-    seen_owners  = {}           # uid -> (owner_obj, username, name)
+    seen_uids    = set()
     last_upd     = 0.0
     START_TIME   = asyncio.get_event_loop().time()
-    HARD_LIMIT   = 120.0
+    HARD_LIMIT   = 180.0
 
-    # Шаг 1: собираем всех владельцев с маркета (чтобы знать у кого сколько лотов)
-    async def build_market_index():
+    # uid -> {"owner", "username", "name", "profile_url", "items": [...]}
+    uid_data     = {}
+
+    # Шаг 1: собираем ВСЕХ юзеров со всех коллекций
+    async def collect_all():
         import random as _random
         ids = list(gift_ids)
         _random.shuffle(ids)
+        scanned = 0
         for gid in ids:
             if not is_searching:
                 break
@@ -1115,56 +1157,53 @@ async def do_profile_search(
                 items, _ = await fetch_market_page(gid, "", limit=100)
             except Exception as e:
                 logger.debug("fetch_market_page %s: %s", gid, e)
+                await asyncio.sleep(0.3)
                 continue
             await asyncio.sleep(0.1)
             for item in items:
                 uid = item.get("owner_id")
                 if not uid:
                     continue
-                if uid not in seen_owners:
-                    seen_owners[uid] = {
-                        "owner": item["owner"],
-                        "username": item["username"],
-                        "name": item.get("name", ""),
-                        "market_cnt": 0,
+                if uid not in uid_data:
+                    uid_data[uid] = {
+                        "owner":       item["owner"],
+                        "username":    item.get("username"),
+                        "name":        item.get("name", ""),
+                        "profile_url": item.get("profile_url"),
+                        "items":       [],
                     }
-                seen_owners[uid]["market_cnt"] = seen_owners[uid]["market_cnt"] + 1
+                nft_url = item.get("nft_url")
+                if nft_url:
+                    uid_data[uid]["items"].append({
+                        "title":   item.get("title","?"),
+                        "num":     item.get("num","?"),
+                        "nft_url": nft_url,
+                        "price":   item.get("price"),
+                    })
+            scanned += 1
+            now = asyncio.get_event_loop().time()
+            nonlocal last_upd
+            if now - last_upd > 2.0:
+                try:
+                    await status_msg.edit_text(
+                        "<b>🔍 Сканирую коллекции: " + str(scanned) + "/" + str(len(ids)) + "\n"
+                        "Юзеров собрано: " + str(len(uid_data)) + "</b>",
+                        parse_mode="HTML", reply_markup=stop_kb()
+                    )
+                except Exception:
+                    pass
+                last_upd = now
 
-    # Шаг 2: загружаем гифты из профиля (только NFT, у которых есть slug)
-    async def fast_saved_gifts(user_id):
-        try:
-            peer   = await tg_client.get_input_entity(user_id)
-            result = await tg_client(GetSavedStarGiftsRequest(
-                peer=peer, offset="", limit=100,
-            ))
-            items = []
-            for gift in (getattr(result, "gifts", None) or []):
-                nft_url = make_nft_url(gift)
-                if not nft_url:
-                    inner = getattr(gift, "gift", None)
-                    if inner:
-                        nft_url = make_nft_url(inner)
-                if not nft_url:
-                    continue
-                inner = getattr(gift, "gift", None) or gift
-                title = getattr(inner, "title", None) or getattr(gift, "title", "?")
-                num   = getattr(gift, "num", "?")
-                items.append({"title": title, "num": num, "nft_url": nft_url})
-            return items
-        except FloodWaitError as e:
-            logger.warning("FloodWait %ds in fast_saved_gifts", e.seconds)
-            await asyncio.sleep(min(e.seconds, 10))
-            return []
-        except Exception as e:
-            logger.debug("fast_saved_gifts uid=%s: %s", user_id, e)
-            return []
-
-    async def check_one(uid, info):
+    # Шаг 2: фильтруем и показываем
+    async def process_uid(uid, info):
         nonlocal found
-        owner_obj  = info["owner"]
-        username   = info["username"]
-        name       = info["name"]
-        market_cnt = info["market_cnt"]
+        if found >= max_results:
+            return
+        owner_obj   = info["owner"]
+        username    = info["username"]
+        name        = info["name"]
+        profile_url = info["profile_url"] or (("https://t.me/" + username) if username else ("tg://user?id=" + str(uid)))
+        items       = info["items"]
 
         if not region_match(owner_obj, username, name, region):
             return
@@ -1172,94 +1211,82 @@ async def do_profile_search(
             return
         if model_only and not is_model(owner_obj, username, name):
             return
-
-        # Загружаем гифты из профиля
-        profile_gifts = await fast_saved_gifts(uid)
-        profile_cnt   = len(profile_gifts)
-
-        # Считаем все гифты в профиле (market_cnt используем как справку)
-        hidden_cnt = profile_cnt
-        if hidden_cnt <= 0:
-            return
-        if not gifts_in_range(hidden_cnt, min_gifts, max_gifts):
+        if not gifts_in_range(len(items), min_gifts, max_gifts):
             return
 
-        profile_url = ("https://t.me/" + username) if username else ("tg://user?id=" + str(uid))
-        owner_str   = fmt_owner(owner_obj, username, name)
-        cache_owner(uid, owner_obj, username, name, profile_url, profile_gifts)
-        kb  = owner_card_kb(username, profile_url, uid)
-        # Список NFT со ссылками
+        owner_str = fmt_owner(owner_obj, username, name)
+        cache_owner(uid, owner_obj, username, name, profile_url, items)
+
+        # NFT список со ссылками (до 5)
         nft_lines = ""
-        for g in profile_gifts[:5]:
-            nft_url_g = g.get("nft_url")
-            t = g.get("title","?")
-            n = g.get("num","?")
-            if nft_url_g:
-                nft_lines += "\n<b>• <a href=\"" + nft_url_g + "\">" + str(t) + " #" + str(n) + "</a></b>"
+        for g in items[:5]:
+            nu = g.get("nft_url")
+            t  = g.get("title","?")
+            n  = g.get("num","?")
+            p  = g.get("price")
+            p_str = (" — " + str(p) + " ⭐") if p else ""
+            if nu:
+                nft_lines += "\n<b>• <a href=\"" + nu + "\">" + str(t) + " #" + str(n) + "</a>" + p_str + "</b>"
             else:
-                nft_lines += "\n<b>• " + str(t) + " #" + str(n) + "</b>"
-        if len(profile_gifts) > 5:
-            nft_lines += "\n<b>  ... ещё " + str(len(profile_gifts)-5) + "</b>"
+                nft_lines += "\n<b>• " + str(t) + " #" + str(n) + p_str + "</b>"
+        if len(items) > 5:
+            nft_lines += "\n<b>  ... ещё " + str(len(items)-5) + "</b>"
+
         prof_link = "<b><a href=\"" + profile_url + "\">" + ("@"+username if username else "Профиль") + "</a></b>"
         txt = (
             "<b>Владелец: " + owner_str + "</b>\n"
             + prof_link + "\n"
-            "<b>NFT в профиле: " + str(profile_cnt) + "</b>"
+            "<b>NFT: " + str(len(items)) + " шт.</b>"
             + nft_lines
         )
+        kb = owner_card_kb(username, profile_url, uid)
         try:
             await status_msg.bot.send_message(
                 chat_id=status_msg.chat.id, text=txt,
                 parse_mode="HTML", reply_markup=kb,
+                disable_web_page_preview=True,
             )
-            found += hidden_cnt
-            stats["found"] += hidden_cnt
+            found += 1
+            stats["found"] += 1
         except Exception as e:
-            logger.warning("profile block: %s", e)
+            logger.warning("profile send: %s", e)
 
     try:
-        await status_msg.edit_text("<b>Сканирую коллекции...</b>", reply_markup=stop_kb())
-        await build_market_index()
+        await status_msg.edit_text("<b>🔍 Поиск запущен...</b>", reply_markup=stop_kb())
+        await collect_all()
 
         if not is_searching:
             is_searching = False
             return 0
 
-        all_owners = list(seen_owners.items())
-        total      = len(all_owners)
+        all_uids = list(uid_data.items())
+        total    = len(all_uids)
 
         if total == 0:
             return 0
 
         await status_msg.edit_text(
-            "<b>Найдено владельцев: " + str(total) + "\nПроверяю профили...</b>",
+            "<b>Собрано юзеров: " + str(total) + "\nФильтрую и показываю...</b>",
             reply_markup=stop_kb()
         )
 
-        PBATCH  = 10
-        checked = 0
-        for i in range(0, len(all_owners), PBATCH):
+        for uid, info in all_uids:
             if not is_searching or found >= max_results:
                 break
             if asyncio.get_event_loop().time() - START_TIME > HARD_LIMIT:
                 break
-            batch = all_owners[i:i+PBATCH]
-            tasks = [check_one(uid, info) for uid, info in batch]
-            await asyncio.gather(*tasks, return_exceptions=True)
-            checked += len(batch)
+            await process_uid(uid, info)
             now = asyncio.get_event_loop().time()
             if now - last_upd > 1.5:
                 try:
                     lbl = "девушек" if girls_only else ("моделей" if model_only else "профилей")
                     await status_msg.edit_text(
-                        "<b>Проверено: " + str(checked) + "/" + str(total) + "\n"
-                        "Найдено " + lbl + ": " + str(found) + "</b>",
+                        "<b>Найдено " + lbl + ": " + str(found) + "/" + str(max_results) + "</b>",
                         parse_mode="HTML", reply_markup=stop_kb()
                     )
                 except Exception:
                     pass
                 last_upd = now
-            await asyncio.sleep(0.02)
 
     except Exception as e:
         logger.error("do_profile_search: %s", e)
