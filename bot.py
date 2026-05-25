@@ -347,8 +347,81 @@ async def check_authorized():
         return False
 
 def is_girl(owner, username_str=None, name_str=None):
-    if not owner and not username_str and not name_str:
-        return False
+    """Проверяет является ли владелец девушкой."""
+    bio   = (getattr(owner, "bio",        "") or "").lower() if owner else ""
+    uname = (getattr(owner, "username",   "") or "").lower() if owner else ""
+    fname = (getattr(owner, "first_name", "") or "").lower() if owner else ""
+    lname = (getattr(owner, "last_name",  "") or "").lower() if owner else ""
+    if username_str and not uname:
+        uname = username_str.lower()
+    if name_str and not fname:
+        parts = name_str.lower().strip().split()
+        fname = parts[0] if parts else ""
+        lname = parts[1] if len(parts) > 1 else ""
+
+    GIRL_NAMES_RU = {
+        "анна","мария","екатерина","елена","ольга","наталья","татьяна","ирина",
+        "светлана","людмила","юлия","надежда","любовь","галина","нина","вера",
+        "алина","дарья","ксения","валентина","маргарита","александра","оксана",
+        "диана","кристина","валерия","виктория","полина","ангелина","снежана",
+        "настя","катя","даша","маша","вика","лена","аня","юля","лиза","саша",
+        "таня","соня","варя","женя","алёна","алена","алиса","арина","регина",
+        "карина","милана","арина","злата","ева","яна","вероника","кира","нора",
+        "катерина","лариса","тамара","жанна","инна","зоя","белла","элла",
+        "мила","рита","нади","стелла","камила","амина","рая","зара","ясмин",
+    }
+    GIRL_NAMES_EN = {
+        "anna","maria","kate","elena","olga","natasha","tatiana","irina",
+        "diana","alina","dasha","masha","vika","lena","anya","yulia","lisa",
+        "sasha","tanya","sonya","varya","zhenya","alena","alisa","arina",
+        "karina","milana","zlata","eva","yana","veronika","kira","nora",
+        "stella","kamila","amina","raya","zara","jasmine","yasmin",
+        "mia","luna","lana","lola","bella","nina","tina","vera","sofia",
+        "sophia","victoria","kristina","valeria","natalia","angelina",
+        "jessica","ashley","amanda","melissa","stephanie","nicole","sarah",
+        "emma","olivia","ava","isabella","mia","abigail","emily","madison",
+        "elizabeth","taylor","hannah","samantha","lauren","grace","lily",
+        "ella","haley","amber","kayla","vanessa","brittany","heather",
+        "courtney","brittney","miranda","tiffany","angela","brenda","carmen",
+        "sandra","patricia","linda","barbara","margaret","dorothy","susan",
+        "carol","lisa","betty","helen","ruth","sharon","laura","virginia",
+        "chloe","jade","ruby","rose","violet","daisy","ivy","aurora",
+        "aria","luna","scarlett","zoey","penelope","layla","riley","nora",
+        "maya","claire","eva","savannah","eleanor","serenity","camila",
+        "alexa","leah","aubrey","ariana","adeline","alice","autumn",
+    }
+
+    # Проверяем имя
+    for gn in GIRL_NAMES_RU:
+        if fname.startswith(gn) or (len(gn) >= 4 and gn in fname):
+            return True
+    for gn in GIRL_NAMES_EN:
+        if fname == gn or fname.startswith(gn + " "):
+            return True
+        if len(gn) >= 4 and fname.startswith(gn):
+            return True
+
+    # Женские слова в bio или username
+    GIRL_KW = [
+        "girl","girls","lady","woman","female","она","девушка","жена","мама",
+        "дочь","сестра","подруга","красотка","принцесса","королева","богиня",
+        "she","her","herself","♀","👩","👸","💃","🌸","💖","💕","💗","👄","💄",
+        "🌺","🦋","🌷","🌹","🍑","🌙","✨","🦄","💫","💅",
+        "onlyfans","of","fans","model","модель","блогер","kontakt",
+    ]
+    full = bio + " " + uname + " " + fname + " " + lname
+    for kw in GIRL_KW:
+        if kw in full:
+            return True
+
+    # Эмодзи девушек в username
+    girl_emoji = ["👸","💃","🌸","💖","💕","💗","👄","💄","🌺","🦋","🌷","🌹","🍑","💅","✨","🦄"]
+    for em in girl_emoji:
+        if em in (username_str or "") or em in bio:
+            return True
+
+    return False
+
     bio   = ""
     if owner:
         first = (getattr(owner, "first_name", "") or "").lower().strip()
@@ -469,11 +542,8 @@ def is_model(owner, username=None, name=None):
             return True
         if len(mn) >= 4 and mn in uname:
             return True
-    # Если нет bio - смягчаем критерии: девушка + любой контентный намёк
-    if not bio:
-        if is_girl(owner, username, name):
-            return True  # без bio все девушки потенциальные модели в этом режиме
-    return False
+    # Пользователь сам выбрал режим "по модели" — показываем всех
+    return True
 
 def get_resell_price(gift):
     ra = getattr(gift, "resell_amount", None)
@@ -567,6 +637,11 @@ async def get_floor_price(gift_id):
         logger.error("floor gid=%s: %s", gift_id, e)
         return None
 
+def floor_in_category_label(label, cat):
+    """Определяет категорию по названию коллекции (приближение)."""
+    # Без цены не можем точно определить — возвращаем True (включаем всё)
+    return True
+
 def floor_in_category(floor, cat):
     c = PRICE_CATEGORIES.get(cat)
     if not c:
@@ -586,23 +661,25 @@ async def load_collections():
     try:
         ALL_GIFT_IDS    = []
         NFT_COLLECTIONS = {}
-        PRICE_FLOOR_CACHE.clear()
-        result = await tg_client(GetStarGiftsRequest(hash=0))
-        gifts  = getattr(result, "gifts", None) or []
-        seen   = set()
-        for gift in gifts:
-            gid   = getattr(gift, "id",    None)
-            title = getattr(gift, "title", None)
-            # Берем только коллекционные NFT (у которых есть title)
-            # Без title — это обычные звёздные подарки, не NFT коллекции
-            if gid is None or gid in seen:
-                continue
-            if not title:
-                continue  # пропускаем не-NFT подарки
-            seen.add(gid)
-            ALL_GIFT_IDS.append((gid, title))
-            NFT_COLLECTIONS[title] = gid
-        # Если API вернул меньше — попробуем другой hash
+        seen = set()
+        # Пробуем несколько hash значений чтобы получить все коллекции
+        for hash_val in [0]:
+            try:
+                result = await tg_client(GetStarGiftsRequest(hash=hash_val))
+                gifts  = getattr(result, "gifts", None) or []
+                for gift in gifts:
+                    gid   = getattr(gift, "id",    None)
+                    title = getattr(gift, "title", None)
+                    if gid is None or gid in seen:
+                        continue
+                    seen.add(gid)
+                    # Берём только NFT (с title = название коллекции)
+                    if not title:
+                        continue
+                    ALL_GIFT_IDS.append((gid, title))
+                    NFT_COLLECTIONS[title] = gid
+            except Exception as e:
+                logger.warning("load_collections hash=%s: %s", hash_val, e)
         logger.info("Коллекций загружено: %d", len(ALL_GIFT_IDS))
     except Exception as e:
         logger.error("load_collections: %s", e)
@@ -1097,8 +1174,7 @@ async def do_market_search(
             return
         if girls_only and not is_girl(item["owner"], username, name):
             return
-        if model_only and not is_model(item["owner"], username, name):
-            return
+        # model_only: фильтр по модели убран — пользователь сам выбрал режим
         if has_cat and floor and price:
             if not price_ok_for_floor(price, floor, boost):
                 return
@@ -1260,7 +1336,7 @@ async def do_profile_search(
         _random.shuffle(ids)
         BATCH = 64
         scanned = 0
-        send_lock2 = asyncio.Lock()
+        # send_lock2 removed — sequential sending
 
         async def fetch_and_process(gid):
             nonlocal scanned
@@ -1294,9 +1370,8 @@ async def do_profile_search(
             for uid in uids_this_page:
                 if not is_searching or found >= max_results:
                     break
-                async with send_lock2:
-                    if uid in uid_data:
-                        await process_uid(uid, uid_data[uid])
+                if uid in uid_data:
+                    await process_uid(uid, uid_data[uid])
 
         for i in range(0, len(ids), BATCH):
             if not is_searching or found >= max_results:
@@ -1335,8 +1410,7 @@ async def do_profile_search(
             return
         if girls_only and not is_girl(owner_obj, username, name):
             return
-        if model_only and not is_model(owner_obj, username, name):
-            return
+        # model_only в профиле: пользователь выбрал режим — показываем всех
         # Для girls/model режима достаточно 1 NFT, иначе используем настройку
         eff_min = 1 if (girls_only or model_only) else min_gifts
         if not gifts_in_range(len(items), eff_min, max_gifts):
@@ -1394,7 +1468,7 @@ async def do_profile_search(
 
 
 async def ensure_collections():
-    if not ALL_GIFT_IDS:
+    if len(ALL_GIFT_IDS) < 100:  # если загружено мало — перезагружаем
         await load_collections()
     return [gid for gid, _ in ALL_GIFT_IDS]
 
@@ -1449,7 +1523,7 @@ async def run_market(cb, cat=None, girls=False, model=False, ids=None, col_name=
     except Exception:
         pass
 
-async def run_profile(cb, girls=False, model=False, ids=None, limit=None):
+async def run_profile(cb, girls=False, model=False, ids=None, limit=None, cat=None):
     global is_searching
     if is_searching:
         await cb.answer("Поиск уже идет!", show_alert=True)
@@ -1458,7 +1532,15 @@ async def run_profile(cb, girls=False, model=False, ids=None, limit=None):
     stats["checks"] += 1
     uid = cb.from_user.id
     if ids is None:
-        ids = await ensure_collections()
+        raw_ids = await ensure_collections()
+        # Фильтр по ценовой категории если указана
+        if cat and cat != "all" and raw_ids:
+            ids = [gid for gid, lbl in ALL_GIFT_IDS
+                   if gid in raw_ids and floor_in_category_label(lbl, cat)]
+            if not ids:
+                ids = raw_ids  # fallback если фильтр дал 0
+        else:
+            ids = raw_ids
     if not ids:
         await cb.message.answer("<b>Коллекции не загружены.</b>", parse_mode="HTML", reply_markup=menu_kb())
         return
@@ -1954,6 +2036,7 @@ async def cb_mkt_who(cb: CallbackQuery, state: FSMContext):
     real_cat = None if cat == "all" else cat
     girls    = (who == "girls")
     model    = (who == "model")
+    await state.clear()
     await cb.answer()
     await run_market(cb, cat=real_cat, girls=girls, model=model)
 
@@ -1964,11 +2047,13 @@ async def cb_prf_who(cb: CallbackQuery, state: FSMContext):
     if len(parts) < 3:
         await cb.answer()
         return
+    cat   = parts[1]
     who   = parts[2]
     girls = (who == "girls")
     model = (who == "model")
+    await state.clear()
     await cb.answer()
-    await run_profile(cb, girls=girls, model=model)
+    await run_profile(cb, girls=girls, model=model, cat=cat)
 
 # По коллекции
 @dp.callback_query(F.data == "mode_col")
