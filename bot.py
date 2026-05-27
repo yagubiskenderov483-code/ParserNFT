@@ -210,6 +210,44 @@ BOY_SIGNALS = [
     "мужчина","чел","братан","он ","сын ","брат ","папа","отец","муж ","дядя",
 ]
 
+MODEL_KW = [
+    "onlyfans","of","only fans","content creator","nsfw","18+","exclusive",
+    "model","модель","blogger","bloger","блогер","influencer","influensher",
+    "fans","adult","vip","premium","creator","link in bio","linktr",
+    "babe","sexy","goddess","spicy","OF",
+    "фото","фотомодель","контент","эксклюзив","взрослый","18",
+]
+MODEL_NAMES = {
+    "mia","luna","lana","lola","kira","nina","tina","diana","alisa","bella",
+    "stella","victoria","angelina","kristina","valeria","natasha","vera",
+    "lili","lilly","candy","honey","bunny","cherry",
+    "катя","настя","лена","маша","вика","даша","юля","лиза","милана","арина",
+}
+
+def is_model(owner, username=None, name=None):
+    bio   = (getattr(owner, "bio",        "") or "").lower() if owner else ""
+    uname = (getattr(owner, "username",   "") or "").lower() if owner else (username or "").lower()
+    fname = (getattr(owner, "first_name", "") or "").lower() if owner else ""
+    lname = (getattr(owner, "last_name",  "") or "").lower() if owner else ""
+    if not fname and name:
+        parts = name.lower().split()
+        fname = parts[0] if parts else ""
+        lname = parts[1] if len(parts) > 1 else ""
+    full = (bio + " " + uname + " " + fname + " " + lname).strip()
+    for kw in MODEL_KW:
+        if kw in full:
+            return True
+    # Имена типичных моделей
+    for mn in MODEL_NAMES:
+        if fname.startswith(mn) or (len(mn) >= 4 and mn in uname):
+            return True
+    # Эмодзи моделей в username/bio
+    model_emoji = ["💋","🔥","👄","💦","🍑","💎","🌟","⭐","✨","💫","👑"]
+    for em in model_emoji:
+        if em in (username or "") or em in bio:
+            return True
+    return False
+
 def is_girl(owner, username=None, name=None):
     bio   = (getattr(owner, "bio",        "") or "").lower() if owner else ""
     uname = (getattr(owner, "username",   "") or "").lower() if owner else (username or "").lower()
@@ -443,11 +481,18 @@ def search_mode_select_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="По маркету",  callback_data="mode_market")],
         [InlineKeyboardButton(text="По профилю",  callback_data="mode_profile")],
+        [InlineKeyboardButton(text="По модели",   callback_data="mode_model")],
         [InlineKeyboardButton(text="Назад",       callback_data="menu")],
     ])
 
 def cat_kb(mode):
-    p = "mc_" if mode == "market" else "pc_"
+    if mode == "market":
+        p = "mc_"
+    elif mode == "profile":
+        p = "pc_"
+    else:
+        p = "mm_"
+    back = "search_mode_select" if mode not in ("market","profile") else "search_mode_select"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Все",                 callback_data=p+"all")],
         [InlineKeyboardButton(text="Дешевые до 2000",     callback_data=p+"cheap")],
@@ -464,6 +509,13 @@ def who_kb(mode, cat):
         [InlineKeyboardButton(text="Всех",    callback_data="run_" + mode + "_" + cat + "_all")],
         [InlineKeyboardButton(text="Девушек", callback_data="run_" + mode + "_" + cat + "_girls")],
         [InlineKeyboardButton(text="Назад",   callback_data=("mode_market" if mode=="market" else "mode_profile"))],
+    ])
+
+def who_model_kb(cat):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Всех",    callback_data="run_model_" + cat + "_all")],
+        [InlineKeyboardButton(text="Девушек", callback_data="run_model_" + cat + "_girls")],
+        [InlineKeyboardButton(text="Назад",   callback_data="mode_model")],
     ])
 
 def settings_menu_kb(uid):
@@ -594,11 +646,9 @@ async def load_collections():
         seen = set()
         for gift in (getattr(result, "gifts", None) or []):
             gid   = getattr(gift, "id", None)
-            title = getattr(gift, "title", None)
             if gid is None or gid in seen:
                 continue
-            if not title:
-                continue  # берём только именованные NFT коллекции
+            title = getattr(gift, "title", None) or ("Gift #" + str(gid))
             seen.add(gid)
             ALL_GIFT_IDS.append((gid, title))
             NFT_COLLECTIONS[title] = gid
@@ -698,141 +748,146 @@ async def fetch_saved_gifts(uid, max_pages=10):
 async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                            boost=100, min_gifts=2, max_gifts=0,
                            max_results=30, region="any"):
+    """
+    Сканирует маркет по всем коллекциям.
+    Собирает NFT каждого владельца, когда набрано >= min_gifts - отправляет карточку.
+    Параллельно грузит 3 коллекции одновременно (лимит 3 как просили).
+    """
     global is_searching
     is_searching = True
-    found        = 0       # кол-во отправленных карточек владельцев
-    total_nft    = 0       # кол-во NFT
-    seen_slugs   = set()
-    # uid -> {owner, username, name, profile_url, items:[]}
-    owner_map    = {}
-    sent_owners  = set()
+    found       = 0
+    seen_slugs  = set()
+    owner_map   = {}   # uid -> {owner,username,name,profile_url,items:[]}
+    sent_owners = set()
 
-    async def flush_owners(force=False):
+    async def send_owner_card(uid, bucket):
         nonlocal found
+        if uid in sent_owners or found >= max_results:
+            return
+        sent_owners.add(uid)
+        cnt     = len(bucket["items"])
+        kb      = owner_card_kb(bucket["username"], bucket["profile_url"], uid)
+        owner_s = fmt_owner(bucket["owner"], bucket["username"], bucket["name"])
+        cache_owner(uid, bucket["owner"], bucket["username"],
+                    bucket["name"], bucket["profile_url"], bucket["items"])
+        nft_lines = ""
+        for it in bucket["items"][:5]:
+            nu = it.get("nft_url")
+            t  = esc(str(it.get("title","?")))
+            n  = esc(str(it.get("num","?")))
+            p  = it.get("price")
+            ps = " " + str(p) + " zv" if p else ""
+            if nu:
+                nft_lines += '\n<a href="' + nu + '"><b>' + t + " #" + n + ps + "</b></a>"
+            else:
+                nft_lines += "\n<b>" + t + " #" + n + ps + "</b>"
+        if cnt > 5:
+            nft_lines += "\n<b>ещё " + str(cnt - 5) + " NFT</b>"
+        txt = "<b>" + owner_s + "\nNFT на маркете: " + str(cnt) + "</b>" + nft_lines
+        try:
+            await status_msg.bot.send_message(
+                chat_id=status_msg.chat.id, text=txt,
+                parse_mode="HTML", reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            found += 1
+            stats["found"] += 1
+        except Exception as e:
+            logger.warning("send_owner_card: %s", e)
+
+    async def flush_ready():
         for uid in list(owner_map.keys()):
-            if uid in sent_owners:
+            if uid in sent_owners or found >= max_results:
                 continue
             bucket = owner_map[uid]
-            cnt    = len(bucket["items"])
-            if force or gifts_in_range(cnt, min_gifts, max_gifts):
-                sent_owners.add(uid)
+            if gifts_in_range(len(bucket["items"]), min_gifts, max_gifts):
                 owner_map.pop(uid, None)
-                cache_owner(uid, bucket["owner"], bucket["username"],
-                            bucket["name"], bucket["profile_url"], bucket["items"])
-                kb       = owner_card_kb(bucket["username"], bucket["profile_url"], uid)
-                owner_s  = fmt_owner(bucket["owner"], bucket["username"], bucket["name"])
-                # список NFT
-                nft_lines = ""
-                for it in bucket["items"][:5]:
-                    nu = it.get("nft_url")
-                    t  = esc(str(it.get("title","?")))
-                    n  = esc(str(it.get("num","?")))
-                    p  = it.get("price")
-                    price_s = " " + str(p) + " zv" if p else ""
-                    if nu:
-                        nft_lines += '\n<a href="' + nu + '"><b>' + t + " #" + n + price_s + "</b></a>"
-                    else:
-                        nft_lines += "\n<b>" + t + " #" + n + price_s + "</b>"
-                if len(bucket["items"]) > 5:
-                    nft_lines += "\n<b>... ещё " + str(len(bucket["items"]) - 5) + "</b>"
-                txt = "<b>" + owner_s + "\nNFT на маркете: " + str(cnt) + "</b>" + nft_lines
-                try:
-                    await status_msg.bot.send_message(
-                        chat_id=status_msg.chat.id, text=txt,
-                        parse_mode="HTML", reply_markup=kb,
-                        disable_web_page_preview=True,
-                    )
-                    found += 1
-                    stats["found"] += 1
-                except Exception as e:
-                    logger.warning("flush owner: %s", e)
-                if found >= max_results:
-                    break
+                await send_owner_card(uid, bucket)
+
+    async def scan_one_collection(gid, fl):
+        """Полностью сканирует одну коллекцию со всей пагинацией."""
+        offset = ""
+        while is_searching and found < max_results:
+            items, nxt = await fetch_market_page(gid, offset, limit=100)
+            for item in items:
+                nft_url = item.get("nft_url") or ""
+                slug    = nft_url.split("/")[-1] if nft_url else ""
+                if slug:
+                    if slug in seen_slugs:
+                        continue
+                    seen_slugs.add(slug)
+                oid   = item["owner_id"]
+                price = item.get("price")
+                if not oid:
+                    continue
+                if oid in sent_owners:
+                    continue
+                if cat and cat != "all" and fl and price:
+                    if not price_ok(price, fl, boost):
+                        continue
+                if not region_match(item["owner"], item["username"], item["name"], region):
+                    continue
+                if girls_only and not is_girl(item["owner"], item["username"], item["name"]):
+                    continue
+                if oid not in owner_map:
+                    owner_map[oid] = {
+                        "owner": item["owner"], "username": item["username"],
+                        "name": item["name"], "profile_url": item["profile_url"],
+                        "items": [],
+                    }
+                owner_map[oid]["items"].append(item)
+                # Сразу отправляем если набрали нужное кол-во
+                if gifts_in_range(len(owner_map[oid]["items"]), min_gifts, max_gifts):
+                    bucket = owner_map.pop(oid)
+                    await send_owner_card(oid, bucket)
+            if not nxt:
+                break
+            offset = nxt
 
     try:
-        await status_msg.edit_text("<b>Загружаю данные коллекций...</b>", reply_markup=stop_kb())
+        await status_msg.edit_text("<b>Загружаю коллекции...</b>", reply_markup=stop_kb())
 
-        # Фильтруем коллекции по категории (загружаем флоры параллельно)
-        if cat and cat != "all":
-            floors = await asyncio.gather(*[get_floor(gid) for gid in gift_ids])
-            valid_ids = [gid for gid, fl in zip(gift_ids, floors)
-                         if fl is not None and floor_in_cat(fl, cat)]
-        else:
-            valid_ids = list(gift_ids)
-            floors    = [None] * len(valid_ids)
-
+        # Фильтрация по категории - грузим флоры параллельно батчами по 16
         floor_map = {}
         if cat and cat != "all":
-            floor_map = {gid: fl for gid, fl in zip(gift_ids, floors) if fl is not None}
+            for i in range(0, len(gift_ids), 16):
+                batch  = gift_ids[i:i+16]
+                floors = await asyncio.gather(*[get_floor(gid) for gid in batch])
+                for gid, fl in zip(batch, floors):
+                    if fl is not None and floor_in_cat(fl, cat):
+                        floor_map[gid] = fl
+            valid_ids = list(floor_map.keys())
+        else:
+            valid_ids = list(gift_ids)
 
         if not valid_ids:
             is_searching = False
             return 0
 
         random.shuffle(valid_ids)
-        last_upd = 0.0
+        last_upd  = 0.0
+        scanned   = 0
+        # Параллельно сканируем 3 коллекции одновременно (как просили)
+        PARALLEL  = 3
 
-        # Параллельный скан коллекций батчами по 8
-        BATCH = 8
-        for i in range(0, len(valid_ids), BATCH):
+        for i in range(0, len(valid_ids), PARALLEL):
             if not is_searching or found >= max_results:
                 break
-            batch = valid_ids[i:i+BATCH]
-            pages = await asyncio.gather(*[fetch_market_page(gid, "", limit=100) for gid in batch])
-
-            for gid, (items, _) in zip(batch, pages):
-                if not is_searching:
-                    break
-                fl = floor_map.get(gid)
-                for item in items:
-                    nft_url = item.get("nft_url") or ""
-                    slug    = nft_url.split("/")[-1] if nft_url else ""
-                    if slug and slug in seen_slugs:
-                        continue
-                    if slug:
-                        seen_slugs.add(slug)
-
-                    price = item.get("price")
-                    oid   = item["owner_id"]
-                    if not oid:
-                        continue
-
-                    # Фильтр по цене (только если категория задана)
-                    if cat and cat != "all" and fl and price:
-                        if not price_ok(price, fl, boost):
-                            continue
-
-                    # Фильтр по региону
-                    if not region_match(item["owner"], item["username"], item["name"], region):
-                        continue
-
-                    # Фильтр по полу
-                    if girls_only and not is_girl(item["owner"], item["username"], item["name"]):
-                        continue
-
-                    if oid in sent_owners:
-                        continue
-
-                    if oid not in owner_map:
-                        owner_map[oid] = {
-                            "owner": item["owner"], "username": item["username"],
-                            "name": item["name"], "profile_url": item["profile_url"],
-                            "items": [],
-                        }
-                    owner_map[oid]["items"].append(item)
-
-            # Отправляем готовых
-            await flush_owners(force=False)
-            if found >= max_results:
-                break
+            batch = valid_ids[i:i+PARALLEL]
+            await asyncio.gather(*[
+                scan_one_collection(gid, floor_map.get(gid))
+                for gid in batch
+            ])
+            scanned += len(batch)
+            # Flush оставшихся у кого набралось нужное кол-во
+            await flush_ready()
 
             now = asyncio.get_event_loop().time()
-            if now - last_upd > 2:
+            if now - last_upd > 1.5:
                 try:
                     lbl = "девушек" if girls_only else "владельцев"
                     await status_msg.edit_text(
-                        "<b>Проверено коллекций: " + str(min(i + BATCH, len(valid_ids))) +
-                        " из " + str(len(valid_ids)) +
+                        "<b>Коллекций: " + str(scanned) + " из " + str(len(valid_ids)) +
                         "\nНайдено " + lbl + ": " + str(found) + " из " + str(max_results) + "</b>",
                         parse_mode="HTML", reply_markup=stop_kb()
                     )
@@ -840,8 +895,8 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 except Exception:
                     pass
 
-        # Финальный flush с force=True для тех у кого меньше min_gifts но хоть что-то есть
-        await flush_owners(force=False)
+        # Финальный flush - отправляем всех у кого хоть что-то есть
+        await flush_ready()
 
     except Exception as e:
         logger.error("do_market_search: %s", e)
@@ -898,76 +953,73 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         owner_list = list(owners_index.items())
         random.shuffle(owner_list)
         checked = 0
+        # Параллельно проверяем 3 профиля одновременно
+        PARALLEL = 3
 
-        for i in range(0, len(owner_list), 5):
+        async def check_one(uid, info):
+            nonlocal found
+            if not is_searching or found >= max_results:
+                return
+            if uid in seen_sent:
+                return
+            owner_obj   = info["owner"]
+            username    = info["username"]
+            name        = info["name"]
+            profile_url = info["profile_url"] or (("https://t.me/" + username) if username else ("tg://user?id=" + str(uid)))
+
+            if not region_match(owner_obj, username, name, region):
+                return
+            if girls_only and not is_girl(owner_obj, username, name):
+                return
+
+            saved  = await fetch_saved_gifts(uid, max_pages=5)
+            hidden = [g for g in saved if g.get("nft_url") and not g.get("on_market")]
+
+            if not gifts_in_range(len(hidden), min_gifts, max_gifts):
+                return
+            if uid in seen_sent:
+                return
+            seen_sent.add(uid)
+            cache_owner(uid, owner_obj, username, name, profile_url, hidden)
+            kb = owner_card_kb(username, profile_url, uid)
+
+            owner_s   = fmt_owner(owner_obj, username, name)
+            nft_lines = ""
+            for g in hidden[:5]:
+                nu = g.get("nft_url")
+                t  = esc(str(g.get("title","?")))
+                n  = esc(str(g.get("num","?")))
+                if nu:
+                    nft_lines += '\n<a href="' + nu + '"><b>' + t + " #" + n + "</b></a>"
+                else:
+                    nft_lines += "\n<b>" + t + " #" + n + "</b>"
+            if len(hidden) > 5:
+                nft_lines += "\n<b>ещё " + str(len(hidden) - 5) + " NFT</b>"
+            txt = (
+                "<b>" + owner_s + "</b>\n"
+                "<b>Скрытых: " + str(len(hidden)) + "  На маркете: " + str(owner_on_mkt.get(uid,0)) + "</b>"
+                + nft_lines
+            )
+            try:
+                await status_msg.bot.send_message(
+                    chat_id=status_msg.chat.id, text=txt,
+                    parse_mode="HTML", reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
+                found += 1
+                stats["found"] += 1
+            except Exception as e:
+                logger.warning("profile send: %s", e)
+
+        for i in range(0, len(owner_list), PARALLEL):
             if not is_searching or found >= max_results:
                 break
-            batch = owner_list[i:i+5]
-
-            async def check_one(uid, info):
-                nonlocal found
-                if not is_searching or found >= max_results:
-                    return
-                if uid in seen_sent:
-                    return
-
-                owner_obj   = info["owner"]
-                username    = info["username"]
-                name        = info["name"]
-                profile_url = info["profile_url"] or (("https://t.me/" + username) if username else ("tg://user?id=" + str(uid)))
-
-                if not region_match(owner_obj, username, name, region):
-                    return
-                if girls_only and not is_girl(owner_obj, username, name):
-                    return
-
-                saved = await fetch_saved_gifts(uid, max_pages=5)
-                # Берём только NFT которые НЕ на маркете
-                hidden = [g for g in saved if g.get("nft_url") and not g.get("on_market")]
-
-                if not gifts_in_range(len(hidden), min_gifts, max_gifts):
-                    return
-                if uid in seen_sent:
-                    return
-
-                seen_sent.add(uid)
-                cache_owner(uid, owner_obj, username, name, profile_url, hidden)
-                kb  = owner_card_kb(username, profile_url, uid)
-
-                owner_s   = fmt_owner(owner_obj, username, name)
-                nft_lines = ""
-                for g in hidden[:5]:
-                    nu = g.get("nft_url")
-                    t  = esc(str(g.get("title","?")))
-                    n  = esc(str(g.get("num","?")))
-                    if nu:
-                        nft_lines += '\n<a href="' + nu + '"><b>' + t + " #" + n + "</b></a>"
-                    else:
-                        nft_lines += "\n<b>" + t + " #" + n + "</b>"
-                if len(hidden) > 5:
-                    nft_lines += "\n<b>... ещё " + str(len(hidden) - 5) + "</b>"
-
-                txt = (
-                    "<b>" + owner_s + "</b>\n"
-                    "<b>Скрытых NFT: " + str(len(hidden)) + "  На маркете: " + str(owner_on_mkt.get(uid,0)) + "</b>"
-                    + nft_lines
-                )
-                try:
-                    await status_msg.bot.send_message(
-                        chat_id=status_msg.chat.id, text=txt,
-                        parse_mode="HTML", reply_markup=kb,
-                        disable_web_page_preview=True,
-                    )
-                    found += 1
-                    stats["found"] += 1
-                except Exception as e:
-                    logger.warning("profile send: %s", e)
-
+            batch = owner_list[i:i+PARALLEL]
             await asyncio.gather(*[check_one(uid, info) for uid, info in batch])
             checked += len(batch)
 
             now = asyncio.get_event_loop().time()
-            if now - last_upd > 2:
+            if now - last_upd > 1.5:
                 try:
                     lbl = "девушек" if girls_only else "профилей"
                     await status_msg.edit_text(
@@ -987,6 +1039,114 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
 
 
 # ===================== RUN HELPERS =====================
+async def do_model_search(status_msg, gift_ids, cat=None, girls_only=False,
+                         boost=100, min_gifts=1, max_gifts=0,
+                         max_results=30, region="any"):
+    """Поиск по модели — каждый NFT выводится отдельной карточкой."""
+    global is_searching
+    is_searching = True
+    found      = 0
+    seen_slugs = set()
+
+    try:
+        await status_msg.edit_text("<b>Загружаю коллекции...</b>", reply_markup=stop_kb())
+
+        if cat and cat != "all":
+            floors = await asyncio.gather(*[get_floor(gid) for gid in gift_ids])
+            valid_ids = [gid for gid, fl in zip(gift_ids, floors)
+                         if fl is not None and floor_in_cat(fl, cat)]
+            floor_map = {gid: fl for gid, fl in zip(gift_ids, floors) if fl is not None}
+        else:
+            valid_ids = list(gift_ids)
+            floor_map = {}
+
+        if not valid_ids:
+            is_searching = False
+            return 0
+
+        random.shuffle(valid_ids)
+        last_upd = 0.0
+        BATCH = 8
+
+        for i in range(0, len(valid_ids), BATCH):
+            if not is_searching or found >= max_results:
+                break
+            batch = valid_ids[i:i+BATCH]
+            pages = await asyncio.gather(*[fetch_market_page(gid, "", limit=100) for gid in batch])
+
+            for gid, (items, _) in zip(batch, pages):
+                if not is_searching:
+                    break
+                fl = floor_map.get(gid)
+                for item in items:
+                    if found >= max_results:
+                        break
+                    nft_url = item.get("nft_url") or ""
+                    slug    = nft_url.split("/")[-1] if nft_url else ""
+                    if slug and slug in seen_slugs:
+                        continue
+                    if slug:
+                        seen_slugs.add(slug)
+
+                    price = item.get("price")
+                    if cat and cat != "all" and fl and price:
+                        if not price_ok(price, fl, boost):
+                            continue
+                    if not region_match(item["owner"], item["username"], item["name"], region):
+                        continue
+                    if girls_only and not is_girl(item["owner"], item["username"], item["name"]):
+                        continue
+                    if not is_model(item["owner"], item["username"], item["name"]):
+                        continue
+
+                    oid      = item["owner_id"] or 0
+                    username = item["username"]
+                    name     = item["name"]
+                    title    = esc(str(item.get("title","?")))
+                    num      = esc(str(item.get("num","?")))
+                    p_url    = item.get("profile_url")
+                    price_s  = str(price) + " zv" if price else "?"
+                    owner_s  = fmt_owner(item["owner"], username, name)
+
+                    if nft_url:
+                        nft_line = '\n<a href="' + nft_url + '"><b>' + title + " #" + num + "</b></a>"
+                    else:
+                        nft_line = "\n<b>" + title + " #" + num + "</b>"
+                    txt = "<b>" + owner_s + "</b>" + nft_line + "\n<b>" + price_s + "</b>"
+
+                    cache_owner(oid, item["owner"], username, name, p_url, [item])
+                    kb = owner_card_kb(username, p_url, oid)
+                    try:
+                        await status_msg.bot.send_message(
+                            chat_id=status_msg.chat.id, text=txt,
+                            parse_mode="HTML", reply_markup=kb,
+                            disable_web_page_preview=True,
+                        )
+                        found += 1
+                        stats["found"] += 1
+                    except Exception as e:
+                        logger.warning("model send: %s", e)
+                    await asyncio.sleep(0.03)
+
+            now = asyncio.get_event_loop().time()
+            if now - last_upd > 2:
+                try:
+                    await status_msg.edit_text(
+                        "<b>Проверено: " + str(min(i+BATCH, len(valid_ids))) +
+                        " из " + str(len(valid_ids)) +
+                        "\nНайдено моделей: " + str(found) + " из " + str(max_results) + "</b>",
+                        parse_mode="HTML", reply_markup=stop_kb()
+                    )
+                    last_upd = now
+                except Exception:
+                    pass
+
+    except Exception as e:
+        logger.error("do_model_search: %s", e)
+    finally:
+        is_searching = False
+    return found
+
 async def run_market(cb, cat=None, girls=False, ids=None):
     global is_searching
     if is_searching:
@@ -1067,6 +1227,46 @@ async def run_profile(cb, cat=None, girls=False, ids=None):
     except Exception:
         pass
 
+
+async def run_model(cb, cat=None, girls=False, ids=None):
+    """Поиск по модели — ищет на маркете NFT у владельцев похожих на моделей."""
+    global is_searching
+    if is_searching:
+        await cb.answer("Поиск уже идёт!", show_alert=True)
+        return
+    await cb.answer("Запускаю...")
+    stats["checks"] += 1
+    uid = cb.from_user.id
+    if ids is None:
+        ids = await ensure_collections()
+    if not ids:
+        await cb.message.answer("<b>Коллекции не загружены.</b>", parse_mode="HTML", reply_markup=menu_kb())
+        return
+    boost  = get_boost(uid)
+    mn     = get_min_gifts(uid)
+    mx     = get_max_gifts(uid)
+    lim    = get_limit(uid)
+    reg    = get_region(uid)
+    mx_str = str(mx) if mx > 0 else "без лимита"
+    cat_l  = CAT_LABELS.get(cat or "all", "Все")
+    who_l  = "Девушки-модели" if girls else "По модели"
+    reg_l  = REGIONS.get(reg, {}).get("label", "Все страны")
+    txt = (
+        "<b>По модели / " + cat_l + " / " + who_l + "\n"
+        "Регион: " + reg_l + "\n"
+        "Лимит: " + str(lim) + "</b>"
+    )
+    status = await cb.message.answer(txt, parse_mode="HTML", reply_markup=stop_kb())
+    found = await do_model_search(status, ids, cat=cat, girls_only=girls,
+                                  boost=boost, min_gifts=1, max_gifts=mx,
+                                  max_results=lim, region=reg)
+    try:
+        await status.edit_text(
+            "<b>Готово. По модели / " + cat_l + "\nНайдено: " + str(found) + "</b>",
+            parse_mode="HTML", reply_markup=menu_kb()
+        )
+    except Exception:
+        pass
 
 # ===================== ONBOARDING =====================
 WELCOME_TXT = "<b>Neptun Parser\n\nВыбери действие:</b>"
@@ -1435,6 +1635,44 @@ async def cb_show_nft(cb: CallbackQuery):
     txt = "<b>NFT " + owner_s + "\nВсего: " + str(len(items)) + "</b>"
     await cb.message.answer(txt, parse_mode="HTML", reply_markup=kb)
 
+
+
+# ===================== CALLBACKS: MODEL SEARCH =====================
+@dp.callback_query(F.data == "mode_model")
+async def cb_mode_model(cb: CallbackQuery):
+    await cb.message.answer(
+        "<b>Поиск по модели — выбери категорию:</b>",
+        parse_mode="HTML",
+        reply_markup=cat_kb("model")
+    )
+    await cb.answer()
+
+# mm_<cat> — модель выбрал категорию
+@dp.callback_query(F.data.startswith("mm_"))
+async def cb_mm(cb: CallbackQuery):
+    cat = cb.data[3:]
+    lbl = CAT_LABELS.get(cat, cat)
+    await cb.message.answer(
+        "<b>По модели / " + lbl + "\nКого искать?</b>",
+        parse_mode="HTML",
+        reply_markup=who_model_kb(cat)
+    )
+    await cb.answer()
+
+# run_model_<cat>_<who>
+@dp.callback_query(F.data.startswith("run_model_"))
+async def cb_run_model(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    parts = cb.data.split("_")  # ["run","model",cat,who]
+    if len(parts) < 4:
+        await cb.answer()
+        return
+    cat      = parts[2]
+    who      = parts[3]
+    real_cat = None if cat == "all" else cat
+    girls    = (who == "girls")
+    await cb.answer()
+    await run_model(cb, cat=real_cat, girls=girls)
 
 # ===================== CALLBACKS: SETTINGS =====================
 @dp.callback_query(F.data == "settings_menu")
