@@ -478,7 +478,8 @@ def floor_in_cat(floor, cat):
     return True
 
 def price_ok(price, floor, boost):
-    return floor * 0.7 <= price <= floor * (1.0 + boost / 100.0)
+    # Ищем от флора вверх до буста, не ниже флора
+    return floor <= price <= floor * (1.0 + boost / 100.0)
 
 def cache_owner(uid, owner, username, name, profile_url, items):
     NFT_CACHE[uid] = {"owner": owner, "username": username,
@@ -772,13 +773,13 @@ def _make_nft_lines(items):
         t  = esc(str(it.get("title","?")))
         n  = esc(str(it.get("num","?")))
         p  = it.get("price")
-        ps = " " + str(p) + " zv" if p else ""
+        ps = " — " + str(p) + " ⭐" if p else ""
         if nu:
-            lines += '\n<a href="' + nu + '"><b>' + t + " #" + n + ps + "</b></a>"
+            lines += '\n<a href="' + nu + '">' + t + " #" + n + ps + "</a>"
         else:
-            lines += "\n<b>" + t + " #" + n + ps + "</b>"
+            lines += "\n" + t + " #" + n + ps
     if len(items) > 5:
-        lines += "\n<b>ещё " + str(len(items) - 5) + " NFT</b>"
+        lines += "\n+ ещё " + str(len(items) - 5) + " NFT"
     return lines
 
 
@@ -884,7 +885,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         random.shuffle(valid_ids)
         last_upd = 0.0
         scanned  = 0
-        PARALLEL = 3  # 3 коллекции одновременно
+        PARALLEL = 5  # 5 коллекций одновременно
 
         for i in range(0, len(valid_ids), PARALLEL):
             if not is_searching or found >= max_results:
@@ -921,17 +922,16 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
     global is_searching
     is_searching = True
     found        = 0
-    owners_index = {}
-    owner_on_mkt = {}
     seen_sent    = set()
     last_upd     = 0.0
 
     try:
-        await status_msg.edit_text("<b>Сканирую маркет...</b>", reply_markup=stop_kb())
+        await status_msg.edit_text("<b>Собираю владельцев NFT...</b>", parse_mode="HTML", reply_markup=stop_kb())
         random.shuffle(gift_ids)
 
-        # Собираем всех владельцев с маркета (3 коллекции параллельно)
-        PARALLEL = 3
+        # Быстро собираем владельцев — только первая страница каждой коллекции, параллельно
+        PARALLEL = 5
+        owners_index = {}
         for i in range(0, len(gift_ids), PARALLEL):
             if not is_searching:
                 break
@@ -940,14 +940,15 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             for gid, (items, _) in zip(batch, pages):
                 for item in items:
                     oid = item["owner_id"]
-                    if not oid:
+                    if not oid or oid in owners_index:
                         continue
-                    owner_on_mkt[oid] = owner_on_mkt.get(oid, 0) + 1
-                    if oid not in owners_index:
-                        owners_index[oid] = {
-                            "owner": item["owner"], "username": item["username"],
-                            "name": item["name"], "profile_url": item["profile_url"],
-                        }
+                    owners_index[oid] = {
+                        "owner": item["owner"], "username": item["username"],
+                        "name": item["name"], "profile_url": item["profile_url"],
+                    }
+            # Если уже собрали достаточно — хватит
+            if len(owners_index) >= max_results * 10:
+                break
 
         total = len(owners_index)
         await status_msg.edit_text(
@@ -983,8 +984,8 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
 
             owner_s = fmt_owner(owner_obj, username, name)
             txt = (
-                "<b>" + owner_s + "</b>\n"
-                "<b>Скрытых: " + str(len(hidden)) + "  На маркете: " + str(owner_on_mkt.get(uid,0)) + "</b>"
+                "<b>" + owner_s + "\n"
+                "Скрытых NFT: " + str(len(hidden)) + "</b>"
                 + _make_nft_lines(hidden)
             )
             kb = owner_card_kb(username, profile_url, uid)
@@ -999,10 +1000,11 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             except Exception as e:
                 logger.warning("profile send: %s", e)
 
-        for i in range(0, len(owner_list), PARALLEL):
+        PARALLEL_CHECK = 5
+        for i in range(0, len(owner_list), PARALLEL_CHECK):
             if not is_searching or found >= max_results:
                 break
-            batch = owner_list[i:i+PARALLEL]
+            batch = owner_list[i:i+PARALLEL_CHECK]
             await asyncio.gather(*[check_one(uid, info) for uid, info in batch])
             checked += len(batch)
 
@@ -1068,7 +1070,7 @@ async def do_model_search(status_msg, gift_ids, cat=None, girls_only=False,
                     nft_line = '\n<a href="' + nft_url + '"><b>' + title + " #" + num + "</b></a>"
                 else:
                     nft_line = "\n<b>" + title + " #" + num + "</b>"
-                txt = "<b>" + owner_s + "</b>" + nft_line + "\n<b>" + price_s + "</b>"
+                txt = "<b>" + owner_s + "</b>" + nft_line + "\n" + price_s
                 cache_owner(oid, item["owner"], username, name, p_url, [item])
                 kb = owner_card_kb(username, p_url, oid)
                 try:
@@ -1106,7 +1108,7 @@ async def do_model_search(status_msg, gift_ids, cat=None, girls_only=False,
         random.shuffle(valid_ids)
         last_upd = 0.0
         scanned  = 0
-        PARALLEL = 3
+        PARALLEL = 5
 
         for i in range(0, len(valid_ids), PARALLEL):
             if not is_searching or found >= max_results:
