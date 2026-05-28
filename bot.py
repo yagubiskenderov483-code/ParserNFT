@@ -83,7 +83,7 @@ def _lat_count(text):
     return sum(1 for c in text.lower() if 'a' <= c <= 'z')
 
 def region_match(owner, username, name, region_key):
-    """97%+ точность   строгая проверка по совокупности признаков."""
+    """Жёсткая проверка региона — требуем минимум 2 явных признака."""
     if not region_key or region_key == "any":
         return True
 
@@ -99,109 +99,151 @@ def region_match(owner, username, name, region_key):
     full_raw = (bio + " " + uname + " " + fname + " " + lname).strip()
     full     = full_raw.lower()
 
-    if not full:
-        return False   # нет данных = не определяем = не показываем
+    if not full or len(full) < 3:
+        return False
 
     cyr = _cyr_count(full)
     lat = _lat_count(full)
-    has_cyr = cyr >= 3
-    has_lat = lat >= 3
+    has_cyr = cyr >= 4
+    has_lat = lat >= 4
 
-    # ── Кириллические страны ───────────────────────────────────────────────
-    if region_key in ("ru", "ua", "by"):
-        if not has_cyr:
-            return False
-        # Украина: специфичные буквы або
-        if region_key == "ua":
-            ua_specific = any(c in UK_UA_ONLY for c in full)
-            ua_kw = any(k in full for k in ["ukraine","ukrainian","київ","kyiv","харків","одеса","львів","ua ","з україни","слава україні"])
-            # Если нет специфичных букв и нет ключевых слов   считаем Россией, не Украиной
-            return ua_specific or ua_kw
-        if region_key == "by":
-            by_kw = any(k in full for k in ["беларус","минск","by ","беларь","белорус"])
-            return by_kw or has_cyr  # кириллица + нет явных других признаков
-        # ru: кириллица без явных UA/BY признаков
-        ua_signs = any(c in UK_UA_ONLY for c in full) or any(k in full for k in ["ukraine","київ","kyiv","слава україні"])
-        by_signs = any(k in full for k in ["беларус","минск"])
-        return has_cyr and not ua_signs and not by_signs
+    def score_ru():
+        s = 0
+        if has_cyr: s += 1
+        ua_signs = any(c in UK_UA_ONLY for c in full) or any(k in full for k in ["ukraine","київ","kyiv","слава україні","ukraine"])
+        by_signs = any(k in full for k in ["беларус","минск","белорус"])
+        if ua_signs or by_signs: return -1
+        kw = ["россия","россиянин","москва","питер","санкт","рф","russia","moscow","spb","ru ","краснодар","новосибирск","екатеринбург","уфа","казань","нижний","ростов"]
+        for k in kw:
+            if k in full: s += 1
+        return s
 
-    # ── Латинские страны ──────────────────────────────────────────────────
-    if region_key in ("us", "uk"):
-        if has_cyr:
-            return False
-        if not has_lat:
-            return False
-        # США vs UK   сложно без геолокации, принимаем всю латиницу без спецсимволов других стран
+    def score_ua():
+        s = 0
+        if has_cyr: s += 1
+        ua_specific = sum(1 for c in full if c in UK_UA_ONLY)
+        s += min(ua_specific, 2)
+        kw = ["ukraine","ukrainian","київ","kyiv","харків","одеса","львів","ua ","з україни","слава україні","дніпро"]
+        for k in kw:
+            if k in full: s += 1
+        return s
+
+    def score_by():
+        s = 0
+        if has_cyr: s += 1
+        kw = ["беларус","минск","белорус","by ","беларь"]
+        for k in kw:
+            if k in full: s += 1
+        return s
+
+    def score_us():
+        if has_cyr: return -1
+        s = 0
+        if has_lat: s += 1
+        kw = ["usa","us ","america","american","new york","los angeles","chicago","houston","miami","california","texas","new york","nyc","la ","english","english speaking"]
+        for k in kw:
+            if k in full: s += 1
+        de_chars = set("äöüÄÖÜß"); fr_chars = set("àâæçéèêëîïôœùûüÿ"); es_chars = set("áéíóúüñ"); tr_chars = set("ğüşıöçĞÜŞİÖÇ")
+        if any(c in de_chars | fr_chars | es_chars | tr_chars for c in full_raw): s -= 1
+        return s
+
+    def score_uk():
+        if has_cyr: return -1
+        s = 0
+        if has_lat: s += 1
+        kw = ["uk ","united kingdom","britain","british","england","london","manchester","birmingham","glasgow","scotland","wales","liverpool","english","pounds","sterling"]
+        for k in kw:
+            if k in full: s += 1
+        return s
+
+    def score_de():
+        if has_cyr: return -1
+        s = 0
         de_chars = set("äöüÄÖÜß")
-        fr_chars = set("àâæçéèêëîïôœùûüÿ")
-        es_chars = set("áéíóúüñ")
-        tr_chars = set("ğüşıöçĞÜŞİÖÇ")
-        if any(c in de_chars | fr_chars | es_chars | tr_chars for c in full_raw):
-            return False
-        return True
+        found_chars = sum(1 for c in full_raw if c in de_chars)
+        s += min(found_chars, 2)
+        kw = ["german","deutsch","berlin","münchen","hamburg","frankfurt","köln","deutschland","de ","austria","schweiz"]
+        for k in kw:
+            if k in full: s += 1
+        return s
 
-    if region_key == "de":
-        if has_cyr:
-            return False
-        de_chars = set("äöüÄÖÜß")
-        de_kw    = ["german","deutsch","berlin","münchen","hamburg","frankfurt","köln","deutschland","de "]
-        if any(c in de_chars for c in full_raw):
-            return True
-        return any(k in full for k in de_kw)
-
-    if region_key == "fr":
-        if has_cyr:
-            return False
+    def score_fr():
+        if has_cyr: return -1
+        s = 0
         fr_chars = set("àâæçéèêëîïôœùûüÿÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ")
-        fr_kw    = ["french","france","paris","française","fr ","lyon","marseille","bordeaux"]
-        if any(c in fr_chars for c in full_raw):
-            return True
-        return any(k in full for k in fr_kw)
+        found_chars = sum(1 for c in full_raw if c in fr_chars)
+        s += min(found_chars, 2)
+        kw = ["french","france","paris","française","fr ","lyon","marseille","bordeaux","belgique","suisse"]
+        for k in kw:
+            if k in full: s += 1
+        return s
 
-    if region_key == "es":
-        if has_cyr:
-            return False
+    def score_es():
+        if has_cyr: return -1
+        s = 0
         es_chars = set("áéíóúüñÁÉÍÓÚÜÑ")
-        es_kw    = ["spain","español","madrid","barcelona","españa","es ","valencia","sevilla","mexico","argentina","colombia"]
-        if any(c in es_chars for c in full_raw):
-            return True
-        return any(k in full for k in es_kw)
+        found_chars = sum(1 for c in full_raw if c in es_chars)
+        s += min(found_chars, 2)
+        kw = ["spain","español","madrid","barcelona","españa","es ","valencia","sevilla","mexico","argentina","colombia","chile","peru","cubano","venezolano"]
+        for k in kw:
+            if k in full: s += 1
+        return s
 
-    if region_key == "tr":
-        if has_cyr:
-            return False
+    def score_tr():
+        if has_cyr: return -1
+        s = 0
         tr_chars = set("ğüşıöçĞÜŞİÖÇ")
-        tr_kw    = ["turkey","türk","türkiye","istanbul","ankara","izmir","tr "]
-        if any(c in tr_chars for c in full_raw):
-            return True
-        return any(k in full for k in tr_kw)
+        found_chars = sum(1 for c in full_raw if c in tr_chars)
+        s += min(found_chars, 2)
+        kw = ["turkey","türk","türkiye","istanbul","ankara","izmir","tr ","antalya"]
+        for k in kw:
+            if k in full: s += 1
+        return s
 
-    if region_key == "ae":
-        if has_cyr:
-            return False
-        ar_char = any('\u0600' <= c <= '\u06ff' for c in full_raw)
-        ae_kw   = ["dubai","uae","emirates","sharjah","abudhabi","abu dhabi","دبي","الإمارات","emirat"]
-        return ar_char or any(k in full for k in ae_kw)
+    def score_ae():
+        if has_cyr: return -1
+        s = 0
+        ar_chars = sum(1 for c in full_raw if '\u0600' <= c <= '\u06ff')
+        s += min(ar_chars, 2)
+        kw = ["dubai","uae","emirates","sharjah","abu dhabi","دبي","الإمارات","emirat","abudhabi"]
+        for k in kw:
+            if k in full: s += 1
+        return s
 
-    if region_key == "cn":
-        return any('\u4e00' <= c <= '\u9fff' for c in full_raw)
+    def score_cn():
+        cn_chars = sum(1 for c in full_raw if '\u4e00' <= c <= '\u9fff')
+        return min(cn_chars, 3)
 
-    if region_key == "jp":
-        jp_hiragana = any('\u3040' <= c <= '\u309f' for c in full_raw)
-        jp_katakana = any('\u30a0' <= c <= '\u30ff' for c in full_raw)
-        if jp_hiragana or jp_katakana:
-            return True
-        jp_kw = ["japan","tokyo","osaka","japanese","jp ","kyoto","yokohama","kawai","kawaii"]
-        return any(k in full for k in jp_kw)
+    def score_jp():
+        s = 0
+        hi = sum(1 for c in full_raw if '\u3040' <= c <= '\u309f')
+        ka = sum(1 for c in full_raw if '\u30a0' <= c <= '\u30ff')
+        s += min(hi + ka, 2)
+        kw = ["japan","tokyo","osaka","japanese","jp ","kyoto","yokohama"]
+        for k in kw:
+            if k in full: s += 1
+        return s
 
-    if region_key == "in":
-        devanagari = any('\u0900' <= c <= '\u097f' for c in full_raw)
-        if devanagari:
-            return True
-        in_kw = ["india","indian","delhi","mumbai","bangalore","hindi","pakistan","bangladesh","rupee","₹"]
-        return any(k in full for k in in_kw)
+    def score_in():
+        s = 0
+        dev = sum(1 for c in full_raw if '\u0900' <= c <= '\u097f')
+        s += min(dev, 2)
+        kw = ["india","indian","delhi","mumbai","bangalore","hindi","₹","rupee","pakistan","bangladesh"]
+        for k in kw:
+            if k in full: s += 1
+        return s
 
-    return False
+    scorers = {
+        "ru": score_ru, "ua": score_ua, "by": score_by,
+        "us": score_us, "uk": score_uk, "de": score_de,
+        "fr": score_fr, "es": score_es, "tr": score_tr,
+        "ae": score_ae, "cn": score_cn, "jp": score_jp, "in": score_in,
+    }
+    fn = scorers.get(region_key)
+    if not fn:
+        return False
+    # Требуем минимум 2 очка — жёсткая проверка
+    return fn() >= 2
 
 
 # ── GIRL DETECTION ────────────────────────────────────────────────────────────
@@ -260,6 +302,9 @@ def is_girl(owner, username=None, name=None):
         lname = parts[1] if len(parts) > 1 else ""
     full = (bio + " " + uname + " " + fname + " " + lname).strip()
 
+    score = 0
+
+    # Явные мужские сигналы → сразу False
     for bn in BOY_NAMES_SET:
         if fname == bn or fname.startswith(bn + " "):
             return False
@@ -267,15 +312,19 @@ def is_girl(owner, username=None, name=None):
         if sig in full:
             return False
 
+    # Женское имя — сильный признак
     for gn in GIRL_NAMES_SET:
         if fname == gn or (len(gn) >= 4 and fname.startswith(gn)):
-            return True
+            score += 2
+            break
 
+    # Женские сигналы в тексте
     for sig in GIRL_SIGNALS:
         if sig in full:
-            return True
+            score += 1
 
-    return False
+    # Требуем минимум 2 очка
+    return score >= 2
 
 
 # ── MODEL DETECTION ───────────────────────────────────────────────────────────
@@ -478,8 +527,8 @@ def floor_in_cat(floor, cat):
     return True
 
 def price_ok(price, floor, boost):
-    # Ищем от флора вверх до буста, не ниже флора
-    return floor <= price <= floor * (1.0 + boost / 100.0)
+    # Ищем в диапазоне: от 70% флора до флора * (1 + boost/100)
+    return floor * 0.7 <= price <= floor * (1.0 + boost / 100.0)
 
 def cache_owner(uid, owner, username, name, profile_url, items):
     NFT_CACHE[uid] = {"owner": owner, "username": username,
@@ -536,17 +585,16 @@ def who_kb(mode, cat):
         [InlineKeyboardButton(text="Назад",   callback_data=back)],
     ])
 
-def who_model_kb(cat):
+def who_model_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Всех",    callback_data="gomdl_" + cat + "_all")],
-        [InlineKeyboardButton(text="Девушек", callback_data="gomdl_" + cat + "_girls")],
-        [InlineKeyboardButton(text="Назад",   callback_data="mode_model")],
+        [InlineKeyboardButton(text="Всех моделей",    callback_data="gomdl_all")],
+        [InlineKeyboardButton(text="Только девушек", callback_data="gomdl_girls")],
+        [InlineKeyboardButton(text="Назад",           callback_data="search_mode_select")],
     ])
 
 def settings_menu_kb(uid):
     mn  = get_min_gifts(uid)
     mx  = get_max_gifts(uid)
-    bst = get_boost(uid)
     lim = get_limit(uid)
     reg = get_region(uid)
     mx_s    = str(mx) if mx > 0 else "без лимита"
@@ -554,7 +602,6 @@ def settings_menu_kb(uid):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Мин. гифтов: " + str(mn),   callback_data="set_min")],
         [InlineKeyboardButton(text="Макс. гифтов: " + mx_s,     callback_data="set_max")],
-        [InlineKeyboardButton(text="Буст: " + str(bst) + "%",   callback_data="set_boost")],
         [InlineKeyboardButton(text="Лимит выдачи: " + str(lim), callback_data="set_limit")],
         [InlineKeyboardButton(text="Регион: " + reg_lbl,        callback_data="set_region")],
         [InlineKeyboardButton(text="Назад",                      callback_data="menu")],
@@ -918,7 +965,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
 
 async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                             min_gifts=2, max_gifts=0,
-                            max_results=30, region="any", boost=100):
+                            max_results=30, region="any"):
     global is_searching
     is_searching = True
     found        = 0
@@ -1027,14 +1074,15 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
     return found
 
 
-async def do_model_search(status_msg, gift_ids, cat=None, girls_only=False,
-                          boost=100, max_results=30, region="any"):
+async def do_model_search(status_msg, gift_ids, girls_only=False,
+                          max_results=30, region="any"):
     global is_searching
     is_searching = True
     found      = 0
     seen_slugs = set()
+    seen_owners = set()
 
-    async def scan_col(gid, fl):
+    async def scan_col(gid):
         nonlocal found
         offset = ""
         while is_searching and found < max_results:
@@ -1042,15 +1090,15 @@ async def do_model_search(status_msg, gift_ids, cat=None, girls_only=False,
             for item in items:
                 if not is_searching or found >= max_results:
                     return
+                oid = item["owner_id"]
+                if not oid or oid in seen_owners:
+                    continue
                 nft_url = item.get("nft_url") or ""
                 slug    = nft_url.split("/")[-1] if nft_url else ""
                 if slug:
                     if slug in seen_slugs:
                         continue
                     seen_slugs.add(slug)
-                price = item.get("price")
-                if cat and fl and price and not price_ok(price, fl, boost):
-                    continue
                 if not region_match(item["owner"], item["username"], item["name"], region):
                     continue
                 if girls_only and not is_girl(item["owner"], item["username"], item["name"]):
@@ -1058,18 +1106,19 @@ async def do_model_search(status_msg, gift_ids, cat=None, girls_only=False,
                 if not is_model(item["owner"], item["username"], item["name"]):
                     continue
 
-                oid     = item["owner_id"] or 0
+                seen_owners.add(oid)
                 username= item["username"]
                 name    = item["name"]
                 p_url   = item["profile_url"]
+                price   = item.get("price")
                 title   = esc(str(item.get("title","?")))
                 num     = esc(str(item.get("num","?")))
-                price_s = str(price) + " zv" if price else "?"
+                price_s = str(price) + " ⭐" if price else "нет цены"
                 owner_s = fmt_owner(item["owner"], username, name)
                 if nft_url:
-                    nft_line = '\n<a href="' + nft_url + '"><b>' + title + " #" + num + "</b></a>"
+                    nft_line = '\n<a href="' + nft_url + '">' + title + " #" + num + "</a>"
                 else:
-                    nft_line = "\n<b>" + title + " #" + num + "</b>"
+                    nft_line = "\n" + title + " #" + num
                 txt = "<b>" + owner_s + "</b>" + nft_line + "\n" + price_s
                 cache_owner(oid, item["owner"], username, name, p_url, [item])
                 kb = owner_card_kb(username, p_url, oid)
@@ -1088,23 +1137,8 @@ async def do_model_search(status_msg, gift_ids, cat=None, girls_only=False,
             offset = nxt
 
     try:
-        await status_msg.edit_text("<b>Загружаю коллекции...</b>", reply_markup=stop_kb())
-        floor_map = {}
-        if cat:
-            for i in range(0, len(gift_ids), 20):
-                batch  = gift_ids[i:i+20]
-                floors = await asyncio.gather(*[get_floor(gid) for gid in batch])
-                for gid, fl in zip(batch, floors):
-                    if fl is not None and floor_in_cat(fl, cat):
-                        floor_map[gid] = fl
-            valid_ids = list(floor_map.keys())
-        else:
-            valid_ids = list(gift_ids)
-
-        if not valid_ids:
-            is_searching = False
-            return 0
-
+        await status_msg.edit_text("<b>Ищу модели...</b>", parse_mode="HTML", reply_markup=stop_kb())
+        valid_ids = list(gift_ids)
         random.shuffle(valid_ids)
         last_upd = 0.0
         scanned  = 0
@@ -1114,7 +1148,7 @@ async def do_model_search(status_msg, gift_ids, cat=None, girls_only=False,
             if not is_searching or found >= max_results:
                 break
             batch = valid_ids[i:i+PARALLEL]
-            await asyncio.gather(*[scan_col(gid, floor_map.get(gid)) for gid in batch])
+            await asyncio.gather(*[scan_col(gid) for gid in batch])
             scanned += len(batch)
 
             now = asyncio.get_event_loop().time()
@@ -1122,7 +1156,7 @@ async def do_model_search(status_msg, gift_ids, cat=None, girls_only=False,
                 try:
                     await status_msg.edit_text(
                         "<b>Коллекций: " + str(scanned) + " из " + str(len(valid_ids)) +
-                        "\nНайдено моделей: " + str(found) + " из " + str(max_results) + "</b>",
+                        "\nНайдено: " + str(found) + " из " + str(max_results) + "</b>",
                         parse_mode="HTML", reply_markup=stop_kb()
                     )
                     last_upd = now
@@ -1160,13 +1194,20 @@ async def _start_market(cb, cat, girls):
     txt = (
         "<b>Маркет / " + cat_l + " / " + who_l + "\n"
         "Регион: " + reg_l + "\n"
-        "Гифтов: от " + str(mn) + " до " + mx_s + "  Буст: " + str(boost) + "%\n"
+        "Гифтов: от " + str(mn) + " до " + mx_s + "\n"
         "Лимит: " + str(lim) + "</b>"
     )
     status = await cb.message.answer(txt, parse_mode="HTML", reply_markup=stop_kb())
-    found = await do_market_search(status, ids, cat=cat, girls_only=girls,
-                                   boost=boost, min_gifts=mn, max_gifts=mx,
-                                   max_results=lim, region=reg)
+    try:
+        found = await asyncio.wait_for(
+            do_market_search(status, ids, cat=cat, girls_only=girls,
+                             boost=boost, min_gifts=mn, max_gifts=mx,
+                             max_results=lim, region=reg),
+            timeout=300
+        )
+    except asyncio.TimeoutError:
+        is_searching = False
+        found = 0
     try:
         await status.edit_text(
             "<b>Готово. Маркет / " + cat_l + " / " + who_l + "\nНайдено: " + str(found) + "</b>",
@@ -1187,7 +1228,6 @@ async def _start_profile(cb, cat, girls):
     if not ids:
         await cb.message.answer("<b>Коллекции не загружены.</b>", parse_mode="HTML", reply_markup=menu_kb())
         return
-    boost  = get_boost(uid)
     mn     = get_min_gifts(uid)
     mx     = get_max_gifts(uid)
     lim    = get_limit(uid)
@@ -1205,7 +1245,7 @@ async def _start_profile(cb, cat, girls):
     status = await cb.message.answer(txt, parse_mode="HTML", reply_markup=stop_kb())
     found = await do_profile_search(status, ids, cat=cat, girls_only=girls,
                                     min_gifts=mn, max_gifts=mx,
-                                    max_results=lim, region=reg, boost=boost)
+                                    max_results=lim, region=reg)
     try:
         await status.edit_text(
             "<b>Готово. Профиль / " + cat_l + " / " + who_l + "\nНайдено: " + str(found) + "</b>",
@@ -1214,7 +1254,7 @@ async def _start_profile(cb, cat, girls):
     except Exception:
         pass
 
-async def _start_model(cb, cat, girls):
+async def _start_model(cb, girls=False):
     global is_searching
     if is_searching:
         await cb.answer("Поиск уже идёт!", show_alert=True)
@@ -1226,23 +1266,21 @@ async def _start_model(cb, cat, girls):
     if not ids:
         await cb.message.answer("<b>Коллекции не загружены.</b>", parse_mode="HTML", reply_markup=menu_kb())
         return
-    boost  = get_boost(uid)
     lim    = get_limit(uid)
     reg    = get_region(uid)
-    cat_l  = CAT_LABELS.get(cat, "Все")
     who_l  = "Девушки-модели" if girls else "Все модели"
     reg_l  = REGIONS.get(reg, {}).get("label", "Все страны")
     txt = (
-        "<b>По модели / " + cat_l + " / " + who_l + "\n"
+        "<b>По модели / " + who_l + "\n"
         "Регион: " + reg_l + "\n"
         "Лимит: " + str(lim) + "</b>"
     )
     status = await cb.message.answer(txt, parse_mode="HTML", reply_markup=stop_kb())
-    found = await do_model_search(status, ids, cat=cat, girls_only=girls,
-                                  boost=boost, max_results=lim, region=reg)
+    found = await do_model_search(status, ids, girls_only=girls,
+                                  max_results=lim, region=reg)
     try:
         await status.edit_text(
-            "<b>Готово. По модели / " + cat_l + " / " + who_l + "\nНайдено: " + str(found) + "</b>",
+            "<b>Готово. По модели / " + who_l + "\nНайдено: " + str(found) + "</b>",
             parse_mode="HTML", reply_markup=menu_kb()
         )
     except Exception:
@@ -1278,13 +1316,11 @@ async def cmd_start(message: Message, state: FSMContext):
 
     mn  = get_min_gifts(uid)
     mx  = get_max_gifts(uid)
-    bst = get_boost(uid)
     mx_s = str(mx) if mx > 0 else "без лимита"
     await message.answer(
         "<b>Neptun Parser\n\n"
         "Мин. гифтов: " + str(mn) + "\n"
-        "Макс. гифтов: " + mx_s + "\n"
-        "Буст: " + str(bst) + "%\n\n"
+        "Макс. гифтов: " + mx_s + "\n\n"
         "Выбери действие:</b>",
         parse_mode="HTML",
         reply_markup=main_menu_kb()
@@ -1316,23 +1352,7 @@ async def ob_max(message: Message, state: FSMContext):
     lbl = "без лимита" if val == 0 else str(val)
     await message.answer(
         "<b>Макс. гифтов: " + lbl + "\n\n"
-        "Шаг 3 из 4\n"
-        "Буст цен для маркета.\n"
-        "100 = цена до x2 флора. Введи число %:</b>",
-        parse_mode="HTML"
-    )
-    await state.set_state(Onboarding.boost)
-
-@dp.message(Onboarding.boost)
-async def ob_boost(message: Message, state: FSMContext):
-    if not message.text or not message.text.strip().isdigit():
-        await message.answer("<b>Введи число от 1:</b>", parse_mode="HTML")
-        return
-    val = max(1, int(message.text.strip()))
-    USER_BOOST[message.from_user.id] = val
-    await message.answer(
-        "<b>Буст: " + str(val) + "%\n\n"
-        "Шаг 4 из 4\n"
+        "Шаг 3 из 3\n"
         "Лимит выдачи результатов за один поиск.\n"
         "Введи число от 5 до 100:</b>",
         parse_mode="HTML",
@@ -1345,6 +1365,15 @@ async def ob_boost(message: Message, state: FSMContext):
         ])
     )
     await state.set_state(Onboarding.limit)
+
+@dp.message(Onboarding.boost)
+async def ob_boost(message: Message, state: FSMContext):
+    # Буст убран из онбординга — пропускаем
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("<b>Введи число от 5 до 100:</b>", parse_mode="HTML")
+        return
+    val = max(5, min(100, int(message.text.strip())))
+    await _finish_onboarding(message.from_user.id, val, state, message)
 
 @dp.callback_query(F.data.startswith("oblim_"))
 async def ob_lim_btn(cb: CallbackQuery, state: FSMContext):
@@ -1370,13 +1399,11 @@ async def _finish_onboarding(uid, limit_val, state, msg_or_cb_msg):
     await state.clear()
     mn  = get_min_gifts(uid)
     mx  = get_max_gifts(uid)
-    bst = get_boost(uid)
     mx_s = str(mx) if mx > 0 else "без лимита"
     await msg_or_cb_msg.answer(
         "<b>Настройка завершена\n\n"
         "Мин. гифтов: " + str(mn) + "\n"
         "Макс. гифтов: " + mx_s + "\n"
-        "Буст: " + str(bst) + "%\n"
         "Лимит: " + str(limit_val) + "\n\n"
         "Менять можно в Настройках</b>",
         parse_mode="HTML"
@@ -1409,38 +1436,33 @@ async def cmd_neptunteam(message: Message):
     uid  = message.from_user.id
     mn   = get_min_gifts(uid)
     mx   = get_max_gifts(uid)
-    bst  = get_boost(uid)
     lim  = get_limit(uid)
     reg  = get_region(uid)
     mx_s = str(mx) if mx > 0 else "без лимита"
     reg_l= REGIONS.get(reg, {}).get("label", "Все страны")
     txt = (
-        "<b>Neptun Parser   справка\n\n"
+        "<b>Neptun Parser — справка\n\n"
         "РЕЖИМЫ ПОИСКА\n\n"
         "По маркету\n"
         "Ищет NFT выставленные на продажу.\n"
-        "Фильтрует по цене относительно флора коллекции.\n"
-        "Флор = минимальная цена (нижние 25%).\n\n"
+        "Фильтрует по цене относительно флора коллекции.\n\n"
         "По профилю\n"
         "Ищет владельцев у которых NFT есть в профиле но не выставлены на маркет.\n\n"
         "По модели\n"
-        "Показывает каждый NFT отдельно у владельцев похожих на моделей и блогеров.\n\n"
+        "Показывает NFT у владельцев-моделей и блогеров.\n\n"
         "НАСТРОЙКИ\n\n"
         "Мин. гифтов: " + str(mn) + "\n"
         "Минимум NFT у владельца чтобы попасть в результаты.\n\n"
         "Макс. гифтов: " + mx_s + "\n"
         "Максимум NFT. 0 = без лимита.\n\n"
-        "Буст цен: " + str(bst) + "%\n"
-        "Только для маркета. 100% = до x2 флора.\n"
-        "30% = до x1.3  100% = до x2  200% = до x3\n\n"
         "Лимит выдачи: " + str(lim) + "\n"
         "Сколько результатов показывает один поиск.\n\n"
         "Регион: " + reg_l + "\n"
-        "Фильтрует по языку и признакам страны в профиле.\n\n"
+        "Жёсткий фильтр по языку и признакам страны в профиле.\n\n"
         "КОМАНДЫ\n"
-        "/start   главное меню\n"
-        "/clear   остановить поиск\n"
-        "/neptunteam   эта справка</b>"
+        "/start — главное меню\n"
+        "/clear — остановить поиск\n"
+        "/neptunteam — эта справка</b>"
     )
     await message.answer(txt, parse_mode="HTML", reply_markup=main_menu_kb())
 
@@ -1469,13 +1491,11 @@ async def cb_menu(cb: CallbackQuery, state: FSMContext):
     uid  = cb.from_user.id
     mn   = get_min_gifts(uid)
     mx   = get_max_gifts(uid)
-    bst  = get_boost(uid)
     mx_s = str(mx) if mx > 0 else "без лимита"
     await cb.message.answer(
         "<b>Neptun Parser\n\n"
         "Мин. гифтов: " + str(mn) + "\n"
-        "Макс. гифтов: " + mx_s + "\n"
-        "Буст: " + str(bst) + "%\n\n"
+        "Макс. гифтов: " + mx_s + "\n\n"
         "Выбери действие:</b>",
         parse_mode="HTML", reply_markup=main_menu_kb()
     )
@@ -1501,8 +1521,8 @@ async def cb_mode_profile(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "mode_model")
 async def cb_mode_model(cb: CallbackQuery):
-    await cb.message.answer("<b>По модели   выбери ценовую категорию:</b>",
-                            parse_mode="HTML", reply_markup=cat_kb("model"))
+    await cb.message.answer("<b>По модели — кого искать?</b>",
+                            parse_mode="HTML", reply_markup=who_model_kb())
     await cb.answer()
 
 # mc_<cat>   маркет категория -> кого искать
@@ -1521,15 +1541,6 @@ async def cb_pc(cb: CallbackQuery):
     lbl = CAT_LABELS.get(cat, cat)
     await cb.message.answer("<b>Профиль / " + lbl + "\nКого искать?</b>",
                             parse_mode="HTML", reply_markup=who_kb("profile", cat))
-    await cb.answer()
-
-# mm_<cat>   модель категория -> кого искать
-@dp.callback_query(F.data.startswith("mm_"))
-async def cb_mm(cb: CallbackQuery):
-    cat = cb.data[3:]
-    lbl = CAT_LABELS.get(cat, cat)
-    await cb.message.answer("<b>По модели / " + lbl + "\nКого искать?</b>",
-                            parse_mode="HTML", reply_markup=who_model_kb(cat))
     await cb.answer()
 
 # go_market_<cat>_<who>   запуск маркета
@@ -1552,15 +1563,12 @@ async def cb_go_profile(cb: CallbackQuery, state: FSMContext):
     who   = parts[1] if len(parts) == 2 else "all"
     await _start_profile(cb, cat=cat, girls=(who == "girls"))
 
-# gomdl_<cat>_<who>   запуск поиска по модели
+# gomdl_<who>   запуск поиска по модели
 @dp.callback_query(F.data.startswith("gomdl_"))
 async def cb_go_model(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    rest  = cb.data[len("gomdl_"):]
-    parts = rest.rsplit("_", 1)
-    cat   = parts[0] if len(parts) == 2 else rest
-    who   = parts[1] if len(parts) == 2 else "all"
-    await _start_model(cb, cat=cat, girls=(who == "girls"))
+    who = cb.data[len("gomdl_"):]
+    await _start_model(cb, girls=(who == "girls"))
 
 @dp.callback_query(F.data == "stop_search")
 async def cb_stop(cb: CallbackQuery):
@@ -1577,7 +1585,6 @@ async def cb_stats(cb: CallbackQuery):
     uid  = cb.from_user.id
     mn   = get_min_gifts(uid)
     mx   = get_max_gifts(uid)
-    bst  = get_boost(uid)
     lim  = get_limit(uid)
     mx_s = str(mx) if mx > 0 else "без лимита"
     reg  = REGIONS.get(get_region(uid), {}).get("label", "Все страны")
@@ -1588,7 +1595,7 @@ async def cb_stats(cb: CallbackQuery):
         "Пользователей: " + str(get_user_count()) + "\n\n"
         "Настройки:\n"
         "Мин: " + str(mn) + "  Макс: " + mx_s + "\n"
-        "Буст: " + str(bst) + "%  Лимит: " + str(lim) + "\n"
+        "Лимит: " + str(lim) + "\n"
         "Регион: " + reg + "</b>",
         parse_mode="HTML"
     )
@@ -1629,13 +1636,11 @@ async def cb_settings(cb: CallbackQuery, state: FSMContext):
     uid  = cb.from_user.id
     mn   = get_min_gifts(uid)
     mx   = get_max_gifts(uid)
-    bst  = get_boost(uid)
     mx_s = str(mx) if mx > 0 else "без лимита"
     await cb.message.answer(
         "<b>Настройки поиска\n\n"
         "Мин. гифтов: " + str(mn) + "\n"
-        "Макс. гифтов: " + mx_s + "\n"
-        "Буст: " + str(bst) + "%</b>",
+        "Макс. гифтов: " + mx_s + "</b>",
         parse_mode="HTML", reply_markup=settings_menu_kb(uid)
     )
     await cb.answer()
