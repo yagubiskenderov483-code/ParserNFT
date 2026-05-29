@@ -83,11 +83,9 @@ def _lat_count(text):
     return sum(1 for c in text.lower() if 'a' <= c <= 'z')
 
 def region_match(owner, username, name, region_key, bio_override=None):
-    """Жёсткая проверка региона — требуем минимум 2 явных признака."""
     if not region_key or region_key == "any":
         return True
 
-    bio   = bio_override if bio_override is not None else ((getattr(owner, "bio", "") or "") if owner else "")
     uname = (getattr(owner, "username",   "") or "") if owner else (username or "")
     fname = (getattr(owner, "first_name", "") or "") if owner else ""
     lname = (getattr(owner, "last_name",  "") or "") if owner else ""
@@ -96,164 +94,81 @@ def region_match(owner, username, name, region_key, bio_override=None):
         fname = parts[0] if parts else ""
         lname = parts[1] if len(parts) > 1 else ""
 
-    full_raw = (bio + " " + uname + " " + fname + " " + lname).strip()
+    full_raw = (uname + " " + fname + " " + lname).strip()
     full     = full_raw.lower()
 
-    if not full or len(full) < 3:
-        return False
+    if not full or len(full) < 2:
+        return False  # нет данных — не показываем
 
-    cyr = _cyr_count(full)
-    lat = _lat_count(full)
-    has_cyr = cyr >= 4
-    has_lat = lat >= 4
+    cyr = sum(1 for c in full if c in RU_LETTERS)
+    lat = sum(1 for c in full if 'a' <= c <= 'z')
+    has_cyr = cyr >= 2
+    has_lat = lat >= 2
 
-    def score_ru():
-        s = 0
-        if has_cyr: s += 1
-        ua_signs = any(c in UK_UA_ONLY for c in full) or any(k in full for k in ["ukraine","київ","kyiv","слава україні","ukraine"])
-        by_signs = any(k in full for k in ["беларус","минск","белорус"])
-        if ua_signs or by_signs: return -1
-        kw = ["россия","россиянин","москва","питер","санкт","рф","russia","moscow","spb","ru ","краснодар","новосибирск","екатеринбург","уфа","казань","нижний","ростов"]
-        for k in kw:
-            if k in full: s += 1
-        return s
+    # ── Кириллические страны ──────────────────────────────────────────────
+    if region_key in ("ru", "ua", "by"):
+        if not has_cyr:
+            return False  # нет кириллицы — точно не эти страны
+        ua_chars = sum(1 for c in full if c in UK_UA_ONLY)
+        ua_words = any(k in full for k in ["ukraine","kyiv","київ","харків","одеса","львів","укр","ua"])
+        by_words = any(k in full for k in ["беларус","минск","белорус","bel"])
+        ru_words = any(k in full for k in ["россия","москва","питер","санкт","рф","russia","moscow","краснодар","новосибирск","екатеринбург","казань","ростов","уфа","spb"])
+        if region_key == "ua":
+            return ua_chars >= 1 or ua_words
+        if region_key == "by":
+            return by_words
+        # ru: кириллица + нет явных UA/BY признаков
+        return not (ua_chars >= 2 or ua_words or by_words)
 
-    def score_ua():
-        s = 0
-        if has_cyr: s += 1
-        ua_specific = sum(1 for c in full if c in UK_UA_ONLY)
-        s += min(ua_specific, 2)
-        kw = ["ukraine","ukrainian","київ","kyiv","харків","одеса","львів","ua ","з україни","слава україні","дніпро"]
-        for k in kw:
-            if k in full: s += 1
-        return s
+    # ── Латинские страны ─────────────────────────────────────────────────
+    if not has_lat or has_cyr:
+        return False  # латинские страны требуют латиницу и не кириллицу
 
-    def score_by():
-        s = 0
-        if has_cyr: s += 1
-        kw = ["беларус","минск","белорус","by ","беларь"]
-        for k in kw:
-            if k in full: s += 1
-        return s
+    de_c = set("äöüÄÖÜß")
+    fr_c = set("àâæçéèêëîïôœùûüÿÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ")
+    es_c = set("áéíóúüñÁÉÍÓÚÜÑ")
+    tr_c = set("ğüşıöçĞÜŞİÖÇ")
+    has_de = any(c in de_c for c in full_raw)
+    has_fr = any(c in fr_c for c in full_raw)
+    has_es = any(c in es_c for c in full_raw)
+    has_tr = any(c in tr_c for c in full_raw)
 
-    def score_us():
-        if has_cyr: return -1
-        s = 0
-        if has_lat: s += 1
-        kw = ["usa","us ","america","american","new york","los angeles","chicago","houston","miami","california","texas","new york","nyc","la ","english","english speaking"]
-        for k in kw:
-            if k in full: s += 1
-        de_chars = set("äöüÄÖÜß"); fr_chars = set("àâæçéèêëîïôœùûüÿ"); es_chars = set("áéíóúüñ"); tr_chars = set("ğüşıöçĞÜŞİÖÇ")
-        if any(c in de_chars | fr_chars | es_chars | tr_chars for c in full_raw): s -= 1
-        return s
-
-    def score_uk():
-        if has_cyr: return -1
-        s = 0
-        if has_lat: s += 1
-        kw = ["uk ","united kingdom","britain","british","england","london","manchester","birmingham","glasgow","scotland","wales","liverpool","english","pounds","sterling"]
-        for k in kw:
-            if k in full: s += 1
-        return s
-
-    def score_de():
-        if has_cyr: return -1
-        s = 0
-        de_chars = set("äöüÄÖÜß")
-        found_chars = sum(1 for c in full_raw if c in de_chars)
-        s += min(found_chars, 2)
-        kw = ["german","deutsch","berlin","münchen","hamburg","frankfurt","köln","deutschland","de ","austria","schweiz"]
-        for k in kw:
-            if k in full: s += 1
-        return s
-
-    def score_fr():
-        if has_cyr: return -1
-        s = 0
-        fr_chars = set("àâæçéèêëîïôœùûüÿÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ")
-        found_chars = sum(1 for c in full_raw if c in fr_chars)
-        s += min(found_chars, 2)
-        kw = ["french","france","paris","française","fr ","lyon","marseille","bordeaux","belgique","suisse"]
-        for k in kw:
-            if k in full: s += 1
-        return s
-
-    def score_es():
-        if has_cyr: return -1
-        s = 0
-        es_chars = set("áéíóúüñÁÉÍÓÚÜÑ")
-        found_chars = sum(1 for c in full_raw if c in es_chars)
-        s += min(found_chars, 2)
-        kw = ["spain","español","madrid","barcelona","españa","es ","valencia","sevilla","mexico","argentina","colombia","chile","peru","cubano","venezolano"]
-        for k in kw:
-            if k in full: s += 1
-        return s
-
-    def score_tr():
-        if has_cyr: return -1
-        s = 0
-        tr_chars = set("ğüşıöçĞÜŞİÖÇ")
-        found_chars = sum(1 for c in full_raw if c in tr_chars)
-        s += min(found_chars, 2)
-        kw = ["turkey","türk","türkiye","istanbul","ankara","izmir","tr ","antalya"]
-        for k in kw:
-            if k in full: s += 1
-        return s
-
-    def score_ae():
-        if has_cyr: return -1
-        s = 0
-        ar_chars = sum(1 for c in full_raw if '\u0600' <= c <= '\u06ff')
-        s += min(ar_chars, 2)
-        kw = ["dubai","uae","emirates","sharjah","abu dhabi","دبي","الإمارات","emirat","abudhabi"]
-        for k in kw:
-            if k in full: s += 1
-        return s
-
-    def score_cn():
-        cn_chars = sum(1 for c in full_raw if '\u4e00' <= c <= '\u9fff')
-        return min(cn_chars, 3)
-
-    def score_jp():
-        s = 0
+    if region_key == "de":
+        return has_de or any(k in full for k in ["berlin","munich","hamburg","frankfurt","deutsch","german","münchen","köln","deutschland"])
+    if region_key == "fr":
+        return has_fr or any(k in full for k in ["paris","france","french","lyon","marseille","française","bordeaux"])
+    if region_key == "es":
+        return has_es or any(k in full for k in ["spain","madrid","barcelona","español","españa","mexico","argentina","colombia"])
+    if region_key == "tr":
+        return has_tr or any(k in full for k in ["turkey","istanbul","ankara","türk","türkiye","izmir","antalya"])
+    if region_key == "ae":
+        ar = sum(1 for c in full_raw if '\u0600' <= c <= '\u06ff')
+        return ar >= 1 or any(k in full for k in ["dubai","uae","emirates","sharjah","abu dhabi","abudhabi"])
+    if region_key == "cn":
+        return sum(1 for c in full_raw if '\u4e00' <= c <= '\u9fff') >= 1
+    if region_key == "jp":
         hi = sum(1 for c in full_raw if '\u3040' <= c <= '\u309f')
         ka = sum(1 for c in full_raw if '\u30a0' <= c <= '\u30ff')
-        s += min(hi + ka, 2)
-        kw = ["japan","tokyo","osaka","japanese","jp ","kyoto","yokohama"]
-        for k in kw:
-            if k in full: s += 1
-        return s
-
-    def score_in():
-        s = 0
+        return (hi + ka) >= 1 or any(k in full for k in ["japan","tokyo","osaka","japanese","kyoto"])
+    if region_key == "in":
         dev = sum(1 for c in full_raw if '\u0900' <= c <= '\u097f')
-        s += min(dev, 2)
-        kw = ["india","indian","delhi","mumbai","bangalore","hindi","₹","rupee","pakistan","bangladesh"]
-        for k in kw:
-            if k in full: s += 1
-        return s
-
-    scorers = {
-        "ru": score_ru, "ua": score_ua, "by": score_by,
-        "us": score_us, "uk": score_uk, "de": score_de,
-        "fr": score_fr, "es": score_es, "tr": score_tr,
-        "ae": score_ae, "cn": score_cn, "jp": score_jp, "in": score_in,
-    }
-    fn = scorers.get(region_key)
-    if not fn:
-        return False
-    # Требуем минимум 2 очка — жёсткая проверка
-    return fn() >= 2
+        return dev >= 1 or any(k in full for k in ["india","indian","delhi","mumbai","bangalore","pakistan","bangladesh"])
+    if region_key == "uk":
+        if has_de or has_fr or has_es or has_tr:
+            return False
+        return any(k in full for k in ["uk","london","britain","british","england","scotland","wales","manchester","liverpool","glasgow","birmingham"])
+    if region_key == "us":
+        if has_de or has_fr or has_es or has_tr:
+            return False
+        return any(k in full for k in ["usa","america","american","newyork","nyc","california","texas","miami","chicago","houston","losangeles","new york","los angeles"])
+    return False
 
 
 async def region_match_async(owner, username, name, region_key, uid=None):
-    """Async версия с получением bio."""
-    if not region_key or region_key == "any":
-        return True
-    bio = ""
-    if uid:
-        bio = await get_user_bio(uid)
-    return region_match(owner, username, name, region_key, bio_override=bio)
+    return region_match(owner, username, name, region_key)
+
+async def is_girl_async(owner, username=None, name=None, uid=None):
+    return is_girl(owner, username, name)
 
 
 # ── GIRL DETECTION ────────────────────────────────────────────────────────────
@@ -337,37 +252,7 @@ def is_girl(owner, username=None, name=None):
     return score >= 2
 
 
-async def is_girl_async(owner, username=None, name=None, uid=None):
-    bio_extra = ""
-    if uid:
-        bio_extra = await get_user_bio(uid)
-    # Подмешиваем bio в owner временно через monkey-patch замену
-    # Лучше передадим bio_extra как часть full текста
-    bio   = bio_extra or ((getattr(owner, "bio", "") or "").lower() if owner else "")
-    uname = (getattr(owner, "username",   "") or "").lower() if owner else (username or "").lower()
-    fname = (getattr(owner, "first_name", "") or "").lower() if owner else ""
-    lname = (getattr(owner, "last_name",  "") or "").lower() if owner else ""
-    if not fname and name:
-        parts = name.lower().split()
-        fname = parts[0] if parts else ""
-        lname = parts[1] if len(parts) > 1 else ""
-    full = (bio + " " + uname + " " + fname + " " + lname).strip()
 
-    score = 0
-    for bn in BOY_NAMES_SET:
-        if fname == bn or fname.startswith(bn + " "):
-            return False
-    for sig in BOY_SIGNALS:
-        if sig in full:
-            return False
-    for gn in GIRL_NAMES_SET:
-        if fname == gn or (len(gn) >= 4 and fname.startswith(gn)):
-            score += 2
-            break
-    for sig in GIRL_SIGNALS:
-        if sig in full:
-            score += 1
-    return score >= 2
 
 
 # ── MODEL DETECTION ───────────────────────────────────────────────────────────
@@ -854,22 +739,9 @@ async def fetch_market_page(gid, offset, limit=100):
             return [], ""
     return [], ""
 
-USER_BIO_CACHE = {}  # uid -> bio string
+USER_BIO_CACHE = {}  # оставлен для совместимости, не используется
 
-async def get_user_bio(uid):
-    """Получает bio пользователя через GetFullUser, с кэшем."""
-    if uid in USER_BIO_CACHE:
-        return USER_BIO_CACHE[uid]
-    try:
-        full = await tg_client(
-            __import__("telethon.tl.functions.users", fromlist=["GetFullUserRequest"]).GetFullUserRequest(uid)
-        )
-        bio = getattr(getattr(full, "full_user", None), "about", None) or ""
-        USER_BIO_CACHE[uid] = bio
-        return bio
-    except Exception:
-        USER_BIO_CACHE[uid] = ""
-        return ""
+async def fetch_saved_gifts(uid, max_pages=3):
     all_items = []
     offset    = ""
     for _ in range(max_pages):
@@ -883,15 +755,18 @@ async def get_user_bio(uid):
                 inner     = getattr(gift, "gift", None)
                 if not nft_url and inner:
                     nft_url = make_nft_url(inner)
-                title     = (getattr(inner, "title", None) or getattr(gift, "title", "?"))
+                title     = (getattr(inner, "title", None) or getattr(gift, "title", None) or "NFT")
                 num       = getattr(gift, "num", "?")
                 on_market = bool(getattr(gift, "resell_amount", None))
-                all_items.append({"title": title, "num": num, "nft_url": nft_url, "on_market": on_market})
+                all_items.append({"title": str(title), "num": num, "nft_url": nft_url, "on_market": on_market})
             offset = getattr(result, "next_offset", "") or ""
             if not offset:
                 break
+        except FloodWaitError as e:
+            await asyncio.sleep(min(e.seconds, 5))
+            break
         except Exception as e:
-            logger.error("saved_gifts uid=%s: %s", uid, e)
+            logger.debug("saved_gifts uid=%s: %s", uid, e)
             break
     return all_items
 
@@ -920,18 +795,27 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
     global is_searching
     is_searching = True
 
-    # Общее состояние — защищаем lock-ом только критические мутации
     lock        = asyncio.Lock()
-    found       = [0]          # список чтобы nonlocal не нужен был
+    found       = [0]
     seen_slugs  = set()
     owner_map   = {}
     sent_owners = set()
+    recent_titles = []   # последние 3 отправленных названия коллекций — не дублируем подряд
 
     async def send_owner(uid, bucket):
+        nonlocal recent_titles
         async with lock:
             if uid in sent_owners or found[0] >= max_results:
                 return
+            # Не отправляем ту же коллекцию если она была в последних 3
+            first_title = bucket["items"][0].get("title","") if bucket["items"] else ""
+            if first_title and recent_titles.count(first_title) >= 2:
+                return  # уже отправляли эту коллекцию недавно
             sent_owners.add(uid)
+            if first_title:
+                recent_titles.append(first_title)
+                if len(recent_titles) > 6:
+                    recent_titles = recent_titles[-6:]
         cnt     = len(bucket["items"])
         kb      = owner_card_kb(bucket["username"], bucket["profile_url"], uid)
         owner_s = fmt_owner(bucket["owner"], bucket["username"], bucket["name"])
@@ -1503,8 +1387,11 @@ async def cmd_cancel(message: Message, state: FSMContext):
 @dp.message(Command("clear"))
 async def cmd_clear(message: Message):
     global is_searching
-    is_searching = False
-    await message.answer("<b>Поиск остановлен.</b>", parse_mode="HTML", reply_markup=menu_kb())
+    if is_searching:
+        is_searching = False
+        await message.answer("<b>Поиск остановлен.</b>", parse_mode="HTML", reply_markup=menu_kb())
+    else:
+        await message.answer("<b>Поиск не идёт.</b>", parse_mode="HTML", reply_markup=menu_kb())
 
 @dp.message(Command("myid"))
 async def cmd_myid(message: Message):
