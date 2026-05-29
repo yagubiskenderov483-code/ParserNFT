@@ -50,8 +50,8 @@ USER_REGION       = {}
 ONBOARDING_DONE   = set()
 
 DEFAULT_BOOST     = 100
-DEFAULT_MIN_GIFTS = 2
-DEFAULT_MAX_GIFTS = 0
+DEFAULT_MIN_GIFTS = 1
+DEFAULT_MAX_GIFTS = 5
 DEFAULT_LIMIT     = 30
 DEFAULT_REGION    = "any"
 
@@ -82,12 +82,12 @@ def _cyr_count(text):
 def _lat_count(text):
     return sum(1 for c in text.lower() if 'a' <= c <= 'z')
 
-def region_match(owner, username, name, region_key):
+def region_match(owner, username, name, region_key, bio_override=None):
     """Жёсткая проверка региона — требуем минимум 2 явных признака."""
     if not region_key or region_key == "any":
         return True
 
-    bio   = (getattr(owner, "bio",        "") or "") if owner else ""
+    bio   = bio_override if bio_override is not None else ((getattr(owner, "bio", "") or "") if owner else "")
     uname = (getattr(owner, "username",   "") or "") if owner else (username or "")
     fname = (getattr(owner, "first_name", "") or "") if owner else ""
     lname = (getattr(owner, "last_name",  "") or "") if owner else ""
@@ -246,6 +246,16 @@ def region_match(owner, username, name, region_key):
     return fn() >= 2
 
 
+async def region_match_async(owner, username, name, region_key, uid=None):
+    """Async версия с получением bio."""
+    if not region_key or region_key == "any":
+        return True
+    bio = ""
+    if uid:
+        bio = await get_user_bio(uid)
+    return region_match(owner, username, name, region_key, bio_override=bio)
+
+
 # ── GIRL DETECTION ────────────────────────────────────────────────────────────
 GIRL_NAMES_SET = {
     "анна","мария","екатерина","елена","ольга","наталья","татьяна","ирина",
@@ -324,6 +334,39 @@ def is_girl(owner, username=None, name=None):
             score += 1
 
     # Требуем минимум 2 очка
+    return score >= 2
+
+
+async def is_girl_async(owner, username=None, name=None, uid=None):
+    bio_extra = ""
+    if uid:
+        bio_extra = await get_user_bio(uid)
+    # Подмешиваем bio в owner временно через monkey-patch замену
+    # Лучше передадим bio_extra как часть full текста
+    bio   = bio_extra or ((getattr(owner, "bio", "") or "").lower() if owner else "")
+    uname = (getattr(owner, "username",   "") or "").lower() if owner else (username or "").lower()
+    fname = (getattr(owner, "first_name", "") or "").lower() if owner else ""
+    lname = (getattr(owner, "last_name",  "") or "").lower() if owner else ""
+    if not fname and name:
+        parts = name.lower().split()
+        fname = parts[0] if parts else ""
+        lname = parts[1] if len(parts) > 1 else ""
+    full = (bio + " " + uname + " " + fname + " " + lname).strip()
+
+    score = 0
+    for bn in BOY_NAMES_SET:
+        if fname == bn or fname.startswith(bn + " "):
+            return False
+    for sig in BOY_SIGNALS:
+        if sig in full:
+            return False
+    for gn in GIRL_NAMES_SET:
+        if fname == gn or (len(gn) >= 4 and fname.startswith(gn)):
+            score += 2
+            break
+    for sig in GIRL_SIGNALS:
+        if sig in full:
+            score += 1
     return score >= 2
 
 
@@ -779,6 +822,8 @@ async def fetch_market_page(gid, offset, limit=100):
         try:
             result    = await tg_client(GetResaleStarGiftsRequest(gift_id=gid, offset=offset, limit=limit))
             users_map = {int(u.id): u for u in (getattr(result, "users", None) or [])}
+            # Название коллекции из кэша
+            col_title = next((t for t, i in NFT_COLLECTIONS.items() if i == gid), None)
             items     = []
             for gift in (getattr(result, "gifts", None) or []):
                 owner, oid = get_owner(gift, users_map)
@@ -788,11 +833,15 @@ async def fetch_market_page(gid, offset, limit=100):
                 name = (fn + " " + ln).strip()
                 nft_url = make_nft_url(gift)
                 profile_url = ("https://t.me/" + username) if username else (("tg://user?id=" + str(oid)) if oid else None)
+                # title: сначала из gift.title, потом из коллекции
+                raw_title = getattr(gift, "title", None)
+                if not raw_title or str(raw_title).strip() in ("", "?", "None"):
+                    raw_title = col_title or "NFT"
                 items.append({
                     "owner": owner, "owner_id": oid,
                     "username": username, "name": name,
-                    "title": getattr(gift, "title", "?"),
-                    "num":   getattr(gift, "num",   "?"),
+                    "title": str(raw_title),
+                    "num":   getattr(gift, "num", "?"),
                     "price": get_resell_price(gift),
                     "nft_url": nft_url,
                     "profile_url": profile_url,
@@ -805,7 +854,22 @@ async def fetch_market_page(gid, offset, limit=100):
             return [], ""
     return [], ""
 
-async def fetch_saved_gifts(uid, max_pages=5):
+USER_BIO_CACHE = {}  # uid -> bio string
+
+async def get_user_bio(uid):
+    """Получает bio пользователя через GetFullUser, с кэшем."""
+    if uid in USER_BIO_CACHE:
+        return USER_BIO_CACHE[uid]
+    try:
+        full = await tg_client(
+            __import__("telethon.tl.functions.users", fromlist=["GetFullUserRequest"]).GetFullUserRequest(uid)
+        )
+        bio = getattr(getattr(full, "full_user", None), "about", None) or ""
+        USER_BIO_CACHE[uid] = bio
+        return bio
+    except Exception:
+        USER_BIO_CACHE[uid] = ""
+        return ""
     all_items = []
     offset    = ""
     for _ in range(max_pages):
@@ -927,9 +991,9 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 price = item.get("price")
                 if cat and fl and price and not price_ok(price, fl, boost):
                     continue
-                if not region_match(item["owner"], item["username"], item["name"], region):
+                if not await region_match_async(item["owner"], item["username"], item["name"], region, uid=oid):
                     continue
-                if girls_only and not is_girl(item["owner"], item["username"], item["name"]):
+                if girls_only and not await is_girl_async(item["owner"], item["username"], item["name"], uid=oid):
                     continue
 
                 async with lock:
@@ -958,11 +1022,10 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             offset = nxt
 
     try:
-        await status_msg.edit_text("<b>Ищу...</b>", parse_mode="HTML", reply_markup=stop_kb())
+        await status_msg.edit_text("<b>Идёт парсинг подарка, ожидай</b>", parse_mode="HTML", reply_markup=stop_kb())
 
         valid_ids = list(gift_ids)
         random.shuffle(valid_ids)
-        last_upd = 0.0
         scanned  = 0
         PARALLEL = 10
 
@@ -973,19 +1036,6 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             await asyncio.gather(*[scan_col(gid) for gid in batch])
             await flush_ready()
             scanned += len(batch)
-
-            now = asyncio.get_event_loop().time()
-            if now - last_upd > 1.5:
-                try:
-                    lbl = "девушек" if girls_only else "владельцев"
-                    await status_msg.edit_text(
-                        "<b>Коллекций: " + str(scanned) + " из " + str(len(valid_ids)) +
-                        "\nНайдено " + lbl + ": " + str(found[0]) + " из " + str(max_results) + "</b>",
-                        parse_mode="HTML", reply_markup=stop_kb()
-                    )
-                    last_upd = now
-                except Exception:
-                    pass
 
         await flush_ready()
     except Exception as e:
@@ -1003,7 +1053,6 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
     lock      = asyncio.Lock()
     found     = [0]
     seen_sent = set()
-    last_upd  = 0.0
 
     try:
         await status_msg.edit_text("<b>Собираю владельцев NFT...</b>", parse_mode="HTML", reply_markup=stop_kb())
@@ -1032,10 +1081,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                 break
 
         total = len(owners_index)
-        await status_msg.edit_text(
-            "<b>Найдено владельцев: " + str(total) + "\nПроверяю профили...</b>",
-            parse_mode="HTML", reply_markup=stop_kb()
-        )
+        await status_msg.edit_text("<b>Идёт парсинг подарка, ожидай</b>", parse_mode="HTML", reply_markup=stop_kb())
 
         owner_list = list(owners_index.items())
         random.shuffle(owner_list)
@@ -1055,9 +1101,9 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             profile_url = (info["profile_url"]
                            or ("https://t.me/" + username if username else "tg://user?id=" + str(uid)))
 
-            if not region_match(owner_obj, username, name, region):
+            if not await region_match_async(owner_obj, username, name, region, uid=uid):
                 return
-            if girls_only and not is_girl(owner_obj, username, name):
+            if girls_only and not await is_girl_async(owner_obj, username, name, uid=uid):
                 return
 
             saved  = await fetch_saved_gifts(uid, max_pages=5)
@@ -1096,19 +1142,6 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             batch = owner_list[i:i+PARALLEL_CHECK]
             await asyncio.gather(*[check_one(uid, info) for uid, info in batch])
             checked[0] += len(batch)
-
-            now = asyncio.get_event_loop().time()
-            if now - last_upd > 1.5:
-                try:
-                    lbl = "девушек" if girls_only else "профилей"
-                    await status_msg.edit_text(
-                        "<b>Проверено: " + str(checked[0]) + " из " + str(total) +
-                        "\nНайдено " + lbl + ": " + str(found[0]) + " из " + str(max_results) + "</b>",
-                        parse_mode="HTML", reply_markup=stop_kb()
-                    )
-                    last_upd = now
-                except Exception:
-                    pass
     except Exception as e:
         logger.error("do_profile_search: %s", e)
     finally:
@@ -1146,9 +1179,9 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                     if slug:
                         seen_slugs.add(slug)
 
-                if not region_match(item["owner"], item["username"], item["name"], region):
+                if not await region_match_async(item["owner"], item["username"], item["name"], region, uid=oid):
                     continue
-                if girls_only and not is_girl(item["owner"], item["username"], item["name"]):
+                if girls_only and not await is_girl_async(item["owner"], item["username"], item["name"], uid=oid):
                     continue
                 if not is_model(item["owner"], item["username"], item["name"]):
                     continue
@@ -1187,10 +1220,9 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             offset = nxt
 
     try:
-        await status_msg.edit_text("<b>Ищу модели...</b>", parse_mode="HTML", reply_markup=stop_kb())
+        await status_msg.edit_text("<b>Идёт парсинг подарка, ожидай</b>", parse_mode="HTML", reply_markup=stop_kb())
         valid_ids = list(gift_ids)
         random.shuffle(valid_ids)
-        last_upd = 0.0
         scanned  = 0
         PARALLEL = 10
 
@@ -1200,19 +1232,6 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             batch = valid_ids[i:i+PARALLEL]
             await asyncio.gather(*[scan_col(gid) for gid in batch])
             scanned += len(batch)
-
-            now = asyncio.get_event_loop().time()
-            if now - last_upd > 1.5:
-                try:
-                    lbl = "девушек" if girls_only else "моделей"
-                    await status_msg.edit_text(
-                        "<b>Коллекций: " + str(scanned) + " из " + str(len(valid_ids)) +
-                        "\nНайдено " + lbl + ": " + str(found[0]) + " из " + str(max_results) + "</b>",
-                        parse_mode="HTML", reply_markup=stop_kb()
-                    )
-                    last_upd = now
-                except Exception:
-                    pass
     except Exception as e:
         logger.error("do_model_search: %s", e)
     finally:
