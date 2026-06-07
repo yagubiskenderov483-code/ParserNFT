@@ -11,7 +11,9 @@ from telethon import TelegramClient
 from telethon.tl.functions.payments import (
     GetResaleStarGiftsRequest, GetStarGiftsRequest
 )
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telethon.tl.functions.messages import GetHistoryRequest
+from telethon.tl.types import InputPeerChannel, InputPeerUser, UserGift
+from telethon.errors import FloodWaitError, SessionPasswordNeededError, ChatAdminRequiredError
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -40,10 +42,10 @@ tg_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 # ── STATE ─────────────────────────────────────────────────────────────────────
 stats           = {"checks": 0, "found": 0}
 is_searching    = False
-ALL_GIFT_IDS    = []        # [(gid, title), ...]
-NFT_COLLECTIONS = {}        # title -> gid
+ALL_GIFT_IDS    = []
+NFT_COLLECTIONS = {}
 PRICE_FLOOR_CACHE = {}
-NFT_CACHE       = {}        # uid -> {...}
+NFT_CACHE       = {}
 
 USER_BOOST      = {}
 USER_MIN_GIFTS  = {}
@@ -62,6 +64,170 @@ CAT_LABELS = {
     "ultra":   "Хард 20000-100000",
     "extreme": "Экстрим от 100000",
 }
+
+# ── COUNTRY CONFIG ────────────────────────────────────────────────────────────
+COUNTRY_CONFIG = {
+    "ru": {
+        "name": "🇷🇺 Россия",
+        "languages": ["ru"],
+        "channels": ["@nft_russia", "@gifts_ru", "@crypto_russia"],
+        "name_hints": ["иван","александр","дмитрий","сергей","андрей","михаил","алексей","николай","владимир","павел"],
+        "gift_lang": "ru",
+    },
+    "es": {
+        "name": "🇪🇸 Испания",
+        "languages": ["es"],
+        "channels": ["@nft_espana", "@telegram_es", "@crypto_esp"],
+        "name_hints": ["pablo","carlos","miguel","antonio","manuel","jose","francisco","juan","pedro","luis"],
+        "gift_lang": "es",
+    },
+    "de": {
+        "name": "🇩🇪 Германия",
+        "languages": ["de"],
+        "channels": ["@nft_germany", "@telegram_de", "@crypto_de"],
+        "name_hints": ["hans","peter","thomas","michael","andreas","stefan","christian","daniel","markus","martin"],
+        "gift_lang": "de",
+    },
+    "us": {
+        "name": "🇺🇸 США",
+        "languages": ["en"],
+        "channels": ["@nft_usa", "@crypto_us", "@telegram_us"],
+        "name_hints": ["james","john","robert","michael","william","david","richard","joseph","thomas","charles"],
+        "gift_lang": "en",
+    },
+    "tr": {
+        "name": "🇹🇷 Турция",
+        "languages": ["tr"],
+        "channels": ["@nft_turkey", "@telegram_tr", "@crypto_tr"],
+        "name_hints": ["mehmet","mustafa","ahmet","ali","ibrahim","hasan","hüseyin","ismail","ömer","yusuf"],
+        "gift_lang": "tr",
+    },
+    "ua": {
+        "name": "🇺🇦 Украина",
+        "languages": ["uk","ru"],
+        "channels": ["@nft_ukraine", "@crypto_ua", "@telegram_ua"],
+        "name_hints": ["олександр","дмитро","сергій","андрій","михайло","іван","василь","юрій","олег","максим"],
+        "gift_lang": "uk",
+    },
+    "br": {
+        "name": "🇧🇷 Бразилия",
+        "languages": ["pt"],
+        "channels": ["@nft_brasil", "@telegram_br", "@crypto_br"],
+        "name_hints": ["lucas","gabriel","matheus","pedro","rafael","gustavo","rodrigo","bruno","thiago","felipe"],
+        "gift_lang": "pt",
+    },
+    "in": {
+        "name": "🇮🇳 Индия",
+        "languages": ["hi","en"],
+        "channels": ["@nft_india", "@telegram_in", "@crypto_india"],
+        "name_hints": ["rahul","amit","raj","arun","suresh","ravi","vijay","ajay","sanjay","deepak"],
+        "gift_lang": "hi",
+    },
+    "cn": {
+        "name": "🇨🇳 Китай",
+        "languages": ["zh"],
+        "channels": ["@nft_china", "@telegram_cn", "@crypto_china"],
+        "name_hints": ["wei","fang","li","wang","zhang","liu","chen","yang","huang","zhao"],
+        "gift_lang": "zh",
+    },
+    "jp": {
+        "name": "🇯🇵 Япония",
+        "languages": ["ja"],
+        "channels": ["@nft_japan", "@telegram_jp", "@crypto_jp"],
+        "name_hints": ["yuki","kenji","takeshi","hiroshi","satoshi","naoki","daisuke","kenta","shota","ryota"],
+        "gift_lang": "ja",
+    },
+    "kr": {
+        "name": "🇰🇷 Корея",
+        "languages": ["ko"],
+        "channels": ["@nft_korea", "@telegram_kr", "@crypto_kr"],
+        "name_hints": ["minjun","jihoon","jiyeon","minji","sooyeon","jinho","seungho","hyunwoo","jongwon","sangwon"],
+        "gift_lang": "ko",
+    },
+    "fr": {
+        "name": "🇫🇷 Франция",
+        "languages": ["fr"],
+        "channels": ["@nft_france", "@telegram_fr", "@crypto_fr"],
+        "name_hints": ["pierre","jean","paul","jacques","louis","michel","andre","philippe","claude","nicolas"],
+        "gift_lang": "fr",
+    },
+    "it": {
+        "name": "🇮🇹 Италия",
+        "languages": ["it"],
+        "channels": ["@nft_italia", "@telegram_it", "@crypto_it"],
+        "name_hints": ["marco","luca","matteo","giovanni","andrea","giuseppe","antonio","roberto","stefano","paolo"],
+        "gift_lang": "it",
+    },
+}
+
+LANG_CHAR_RANGES = {
+    "ru": (0x0400, 0x04FF),
+    "uk": (0x0400, 0x04FF),
+    "zh": (0x4E00, 0x9FFF),
+    "ja": (0x3040, 0x30FF),
+    "ko": (0xAC00, 0xD7AF),
+    "ar": (0x0600, 0x06FF),
+    "hi": (0x0900, 0x097F),
+}
+
+def detect_text_language(text):
+    if not text:
+        return "en"
+    text = text.lower()
+    for lang, (start, end) in LANG_CHAR_RANGES.items():
+        count = sum(1 for c in text if start <= ord(c) <= end)
+        if count > len(text) * 0.3:
+            return lang
+    latin_es = sum(1 for c in text if c in "áéíóúüñ¿¡")
+    latin_de = sum(1 for c in text if c in "äöüß")
+    latin_fr = sum(1 for c in text if c in "àâæçéèêëîïôùûüÿœ")
+    latin_pt = sum(1 for c in text if c in "ãõâêôáéíóúç")
+    latin_tr = sum(1 for c in text if c in "ğışöüç")
+    scores = {"es": latin_es, "de": latin_de, "fr": latin_fr, "pt": latin_pt, "tr": latin_tr}
+    best = max(scores, key=scores.get)
+    if scores[best] > 0:
+        return best
+    return "en"
+
+def check_country_strict(user, country_code):
+    """Строгая проверка принадлежности пользователя к стране."""
+    if not user or country_code not in COUNTRY_CONFIG:
+        return False
+    cfg = COUNTRY_CONFIG[country_code]
+    score = 0
+
+    first = (getattr(user, "first_name", "") or "").lower()
+    last  = (getattr(user, "last_name",  "") or "").lower()
+    bio   = (getattr(user, "about",      "") or "").lower()
+    uname = (getattr(user, "username",   "") or "").lower()
+    phone = (getattr(user, "phone",      "") or "")
+
+    # Телефонный код страны
+    phone_codes = {
+        "ru": "+7", "es": "+34", "de": "+49", "us": "+1",
+        "tr": "+90", "ua": "+380", "br": "+55", "in": "+91",
+        "cn": "+86", "jp": "+81", "kr": "+82", "fr": "+33", "it": "+39",
+    }
+    if phone and phone_codes.get(country_code) and phone.startswith(phone_codes[country_code].replace("+","")):
+        score += 3
+
+    # Язык bio
+    bio_lang = detect_text_language(bio)
+    if bio_lang in cfg["languages"]:
+        score += 2
+
+    # Имя из списка страны
+    for hint in cfg["name_hints"]:
+        if hint in first or hint in last:
+            score += 2
+            break
+
+    # Язык имени
+    name_lang = detect_text_language(first + " " + last)
+    if name_lang in cfg["languages"]:
+        score += 1
+
+    return score >= 2
 
 # ── GIRL DETECTION ────────────────────────────────────────────────────────────
 GIRL_NAMES_SET = {
@@ -301,6 +467,9 @@ def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Поиск по маркету",     callback_data="mode_market")],
         [InlineKeyboardButton(text="👧 Поиск девушек",         callback_data="mode_girls")],
+        [InlineKeyboardButton(text="🌍 Поиск по странам",      callback_data="mode_country")],
+        [InlineKeyboardButton(text="🎁 Поиск по моделям",      callback_data="mode_models")],
+        [InlineKeyboardButton(text="👤 Поиск по профилям",     callback_data="mode_profiles")],
         [InlineKeyboardButton(text="⚙️ Настройки",            callback_data="settings_menu"),
          InlineKeyboardButton(text="📊 Статистика",           callback_data="stats")],
     ])
@@ -315,6 +484,47 @@ def cat_kb(mode):
         [InlineKeyboardButton(text="Экстрим от 100000",  callback_data=p + "extreme")],
         [InlineKeyboardButton(text="Все коллекции",      callback_data=p + "all")],
         [InlineKeyboardButton(text="◀️ Назад",           callback_data="menu")],
+    ])
+
+def country_kb():
+    rows = []
+    items = list(COUNTRY_CONFIG.items())
+    for i in range(0, len(items), 2):
+        row = []
+        for code, cfg in items[i:i+2]:
+            row.append(InlineKeyboardButton(text=cfg["name"], callback_data="country_" + code))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def models_kb():
+    """Инлайн кнопки с названиями коллекций."""
+    if not ALL_GIFT_IDS:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Коллекции не загружены", callback_data="noop")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="menu")],
+        ])
+    rows = []
+    batch = []
+    for gid, title in ALL_GIFT_IDS[:30]:  # max 30 моделей
+        batch.append(InlineKeyboardButton(text=str(title), callback_data="model_" + str(gid)))
+        if len(batch) == 2:
+            rows.append(batch)
+            batch = []
+    if batch:
+        rows.append(batch)
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def model_cat_kb(gid):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Дешевые до 2000",    callback_data="mcat_" + str(gid) + "_cheap")],
+        [InlineKeyboardButton(text="Средние 2000-5000",  callback_data="mcat_" + str(gid) + "_mid")],
+        [InlineKeyboardButton(text="Сложные 5000-20000", callback_data="mcat_" + str(gid) + "_hard")],
+        [InlineKeyboardButton(text="Хард 20000-100000",  callback_data="mcat_" + str(gid) + "_ultra")],
+        [InlineKeyboardButton(text="Экстрим от 100000",  callback_data="mcat_" + str(gid) + "_extreme")],
+        [InlineKeyboardButton(text="Все цены",           callback_data="mcat_" + str(gid) + "_all")],
+        [InlineKeyboardButton(text="◀️ Назад",           callback_data="mode_models")],
     ])
 
 def settings_menu_kb(uid):
@@ -371,18 +581,21 @@ def menu_kb():
         [InlineKeyboardButton(text="🏠 Меню",    callback_data="menu")],
     ])
 
-def owner_card_kb(username, profile_url, owner_uid):
+def owner_card_kb(username, profile_url, owner_uid, nft_url=None, is_model=False):
     btns = []
     if username:
         btns.append([InlineKeyboardButton(text="@" + username, url="https://t.me/" + username)])
-        msg = urllib.parse.quote("Привет хочу купить твои NFT")
+        if is_model and nft_url:
+            msg = urllib.parse.quote("Привет хочу купить твой NFT " + nft_url)
+        else:
+            msg = urllib.parse.quote("Привет хочу купить твои NFT")
         btns.append([InlineKeyboardButton(text="✉️ Написать", url="https://t.me/" + username + "?text=" + msg)])
     elif profile_url:
         btns.append([InlineKeyboardButton(text="Профиль", url=profile_url)])
     btns.append([InlineKeyboardButton(text="📦 Все NFT", callback_data="shownft_" + str(owner_uid))])
     return InlineKeyboardMarkup(inline_keyboard=btns)
 
-def nft_list_kb(items, username, profile_url):
+def nft_list_kb(items, username, profile_url, is_model=False):
     btns = []
     for g in items:
         url = g.get("nft_url")
@@ -391,7 +604,12 @@ def nft_list_kb(items, username, profile_url):
             btns.append([InlineKeyboardButton(text=lbl, url=url)])
     if username:
         btns.append([InlineKeyboardButton(text="@" + username, url="https://t.me/" + username)])
-        msg = urllib.parse.quote("Привет хочу купить твои NFT")
+        # Для модели берём ссылку первого NFT
+        first_nft_url = items[0].get("nft_url") if items else None
+        if is_model and first_nft_url:
+            msg = urllib.parse.quote("Привет хочу купить твой NFT " + first_nft_url)
+        else:
+            msg = urllib.parse.quote("Привет хочу купить твои NFT")
         btns.append([InlineKeyboardButton(text="✉️ Написать", url="https://t.me/" + username + "?text=" + msg)])
     elif profile_url:
         btns.append([InlineKeyboardButton(text="Профиль", url=profile_url)])
@@ -504,7 +722,7 @@ async def fetch_market_page(gid, offset, limit=100):
             return [], ""
     return [], ""
 
-def _make_nft_lines(items):
+def _make_nft_lines(items, is_model=False):
     lines = ""
     for it in items[:5]:
         nu = it.get("nft_url")
@@ -512,34 +730,101 @@ def _make_nft_lines(items):
         n  = esc(str(it.get("num", "?")))
         p  = it.get("price")
         ps = " — " + str(p) + " ⭐" if p else ""
-        if nu:
-            lines += '\n<a href="' + nu + '">' + t + " #" + n + ps + "</a>"
+        if is_model:
+            label = "#" + n + ps   # только номер, без названия
         else:
-            lines += "\n" + t + " #" + n + ps
+            label = t + " #" + n + ps
+        if nu:
+            lines += '\n<a href="' + nu + '">' + label + "</a>"
+        else:
+            lines += "\n" + label
     if len(items) > 5:
         lines += "\n+ ещё " + str(len(items) - 5) + " NFT"
     return lines
 
-# ── SEARCH CORE ───────────────────────────────────────────────────────────────
+# ── PROFILE SEARCH (по участникам чатов/каналов) ──────────────────────────────
+async def get_all_dialogs_users(limit_dialogs=50):
+    """Собираем пользователей из всех доступных диалогов (чаты, каналы)."""
+    users = {}
+    try:
+        dialogs = await tg_client.get_dialogs(limit=limit_dialogs)
+        for dialog in dialogs:
+            if not is_searching:
+                break
+            try:
+                entity = dialog.entity
+                # Только группы и каналы
+                if not hasattr(entity, "megagroup") and not hasattr(entity, "broadcast"):
+                    continue
+                participants = await tg_client.get_participants(entity, limit=200)
+                for p in participants:
+                    uid = int(p.id)
+                    if uid not in users:
+                        users[uid] = p
+                await asyncio.sleep(0.3)
+            except (ChatAdminRequiredError, Exception):
+                continue
+    except Exception as e:
+        logger.error("get_all_dialogs_users: %s", e)
+    return users
+
+async def get_user_nfts(user_id):
+    """Получаем NFT пользователя через профиль."""
+    gifts = []
+    seen_slugs = set()
+    try:
+        full_user = await tg_client.get_entity(user_id)
+        # Пробуем через GetStarGifts для конкретного пользователя
+        from telethon.tl.functions.payments import GetUserStarGiftsRequest
+        offset = ""
+        for _ in range(5):
+            result = await tg_client(GetUserStarGiftsRequest(
+                user_id=full_user,
+                offset=offset,
+                limit=50,
+            ))
+            for gift in (getattr(result, "gifts", None) or []):
+                nft_url = make_nft_url(gift)
+                slug = nft_url.split("/")[-1] if nft_url else str(getattr(gift, "num", ""))
+                if slug and slug in seen_slugs:
+                    continue
+                if slug:
+                    seen_slugs.add(slug)
+                raw_title = getattr(gift, "title", None)
+                col_title = next((t for t, i in NFT_COLLECTIONS.items() if i == getattr(gift, "gift_id", None)), None)
+                if not raw_title or str(raw_title).strip() in ("", "?", "None"):
+                    raw_title = col_title or "NFT"
+                price = get_resell_price(gift)
+                gifts.append({
+                    "title":   str(raw_title),
+                    "num":     getattr(gift, "num", "?"),
+                    "nft_url": nft_url,
+                    "price":   price,
+                })
+            nxt = getattr(result, "next_offset", "") or ""
+            if not nxt:
+                break
+            offset = nxt
+    except Exception as e:
+        logger.debug("get_user_nfts %s: %s", user_id, e)
+    return gifts
+
+# ── SEARCH CORE (маркет) ──────────────────────────────────────────────────────
 async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
-                           boost=100, min_gifts=1, max_gifts=5, max_results=30):
-    """
-    Поиск по маркету с жёсткой дедупликацией:
-      - seen_nft_slugs: каждый NFT (slug) считается только 1 раз
-      - seen_owners: каждый владелец отправляется только 1 раз
-      - owner_map: накапливаем NFT по владельцу, отправляем когда min_gifts достигнут
-    """
+                           boost=100, min_gifts=1, max_gifts=5, max_results=30,
+                           model_gid=None, country_code=None):
     global is_searching
     is_searching = True
 
-    lock        = asyncio.Lock()
-    found       = [0]
-    seen_nft_slugs = set()   # дедупликация отдельных NFT
-    seen_owners    = set()   # дедупликация владельцев (отправленных)
-    owner_map      = {}      # uid -> {owner, username, name, profile_url, items:[]}
+    is_model = model_gid is not None
+
+    lock           = asyncio.Lock()
+    found          = [0]
+    seen_nft_slugs = set()
+    seen_owners    = set()
+    owner_map      = {}
 
     async def try_send_owner(uid):
-        """Отправляет карточку владельца если выполнены условия."""
         async with lock:
             if uid in seen_owners or found[0] >= max_results:
                 return
@@ -549,7 +834,6 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             cnt = len(bucket["items"])
             if not gifts_in_range(cnt, min_gifts, max_gifts):
                 return
-            # Снимаем из map, помечаем как отправленного
             owner_map.pop(uid, None)
             seen_owners.add(uid)
             to_send = bucket
@@ -558,11 +842,24 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         owner_s = fmt_owner(to_send["owner"], to_send["username"], to_send["name"])
         cache_owner(uid, to_send["owner"], to_send["username"],
                     to_send["name"], to_send["profile_url"], to_send["items"])
-        txt = (
-            "<b>" + owner_s + "\nNFT на маркете: " + str(cnt) + "</b>"
-            + _make_nft_lines(to_send["items"])
+
+        first_nft_url = to_send["items"][0].get("nft_url") if to_send["items"] else None
+
+        if is_model:
+            txt = (
+                "<b>" + owner_s + "\nNFT на маркете: " + str(cnt) + "</b>"
+                + _make_nft_lines(to_send["items"], is_model=True)
+            )
+        else:
+            txt = (
+                "<b>" + owner_s + "\nNFT на маркете: " + str(cnt) + "</b>"
+                + _make_nft_lines(to_send["items"], is_model=False)
+            )
+
+        kb = owner_card_kb(
+            to_send["username"], to_send["profile_url"], uid,
+            nft_url=first_nft_url, is_model=is_model
         )
-        kb = owner_card_kb(to_send["username"], to_send["profile_url"], uid)
         try:
             await status_msg.bot.send_message(
                 chat_id=status_msg.chat.id, text=txt,
@@ -580,7 +877,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         if cat and cat != "all":
             fl = await get_floor(gid)
             if fl is not None and not floor_in_cat(fl, cat):
-                return  # коллекция не в нужном ценовом диапазоне
+                return
 
         offset = ""
         while is_searching and found[0] < max_results:
@@ -596,7 +893,6 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 nft_url = item.get("nft_url") or ""
                 slug    = nft_url.split("/")[-1] if nft_url else ""
 
-                # Пропускаем уже обработанные NFT и владельцев
                 async with lock:
                     if slug and slug in seen_nft_slugs:
                         continue
@@ -605,16 +901,17 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                     if slug:
                         seen_nft_slugs.add(slug)
 
-                # Фильтр по цене
                 price = item.get("price")
                 if cat and cat != "all" and fl and price and not price_ok(price, fl, boost):
                     continue
 
-                # Фильтр по девушкам
                 if girls_only and not is_girl(item["owner"], item["username"], item["name"]):
                     continue
 
-                # Накапливаем NFT для этого владельца
+                # Проверка страны
+                if country_code and not check_country_strict(item["owner"], country_code):
+                    continue
+
                 async with lock:
                     if oid in seen_owners:
                         continue
@@ -639,7 +936,6 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 break
             offset = nxt
 
-    # Финальный проход: отправляем накопленных владельцев которые не были отправлены
     async def flush_pending():
         async with lock:
             pending = list(owner_map.keys())
@@ -654,7 +950,8 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             parse_mode="HTML", reply_markup=stop_kb()
         )
 
-        valid_ids = list(gift_ids)
+        # Если ищем по конкретной модели — только один gid
+        valid_ids = [model_gid] if model_gid else list(gift_ids)
         random.shuffle(valid_ids)
         PARALLEL = 10
 
@@ -674,8 +971,99 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
 
     return found[0]
 
+# ── PROFILE SEARCH ─────────────────────────────────────────────────────────────
+async def do_profile_search(status_msg, max_results=30, girls_only=False, country_code=None):
+    global is_searching
+    is_searching = True
+    found = 0
+    seen_uids = set()
+
+    try:
+        await status_msg.edit_text(
+            "<b>👤 Собираю участников из чатов и каналов...</b>",
+            parse_mode="HTML", reply_markup=stop_kb()
+        )
+
+        users_map = await get_all_dialogs_users(limit_dialogs=50)
+        uids = list(users_map.keys())
+        random.shuffle(uids)
+
+        await status_msg.edit_text(
+            "<b>👤 Найдено " + str(len(uids)) + " пользователей, проверяю NFT...</b>",
+            parse_mode="HTML", reply_markup=stop_kb()
+        )
+
+        for uid in uids:
+            if not is_searching or found >= max_results:
+                break
+            if uid in seen_uids:
+                continue
+            seen_uids.add(uid)
+
+            user = users_map[uid]
+
+            # Фильтр по полу
+            if girls_only and not is_girl(user, getattr(user, "username", None), None):
+                continue
+
+            # Фильтр по стране
+            if country_code and not check_country_strict(user, country_code):
+                continue
+
+            # Получаем NFT
+            nfts = await get_user_nfts(uid)
+            if not nfts:
+                continue
+
+            username = getattr(user, "username", None)
+            fn = (getattr(user, "first_name", "") or "")
+            ln = (getattr(user, "last_name",  "") or "")
+            name = (fn + " " + ln).strip()
+            profile_url = ("https://t.me/" + username) if username else ("tg://user?id=" + str(uid))
+            owner_s = fmt_owner(user, username, name)
+
+            cache_owner(uid, user, username, name, profile_url, nfts)
+
+            first_nft_url = nfts[0].get("nft_url") if nfts else None
+            lines = ""
+            for nft in nfts[:5]:
+                nu = nft.get("nft_url")
+                t  = esc(str(nft.get("title", "?")))
+                n  = esc(str(nft.get("num", "?")))
+                p  = nft.get("price")
+                ps = " — " + str(p) + " ⭐" if p else ""
+                if nu:
+                    lines += '\n<a href="' + nu + '">' + t + " #" + n + ps + "</a>"
+                else:
+                    lines += "\n" + t + " #" + n + ps
+            if len(nfts) > 5:
+                lines += "\n+ ещё " + str(len(nfts) - 5) + " NFT"
+
+            txt = "<b>" + owner_s + "\nNFT в профиле: " + str(len(nfts)) + "</b>" + lines
+            kb = owner_card_kb(username, profile_url, uid, nft_url=first_nft_url)
+
+            try:
+                await status_msg.bot.send_message(
+                    chat_id=status_msg.chat.id, text=txt,
+                    parse_mode="HTML", reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
+                found += 1
+                stats["found"] += 1
+            except Exception as e:
+                logger.warning("profile send: %s", e)
+
+            await asyncio.sleep(0.1)
+
+    except Exception as e:
+        logger.error("do_profile_search: %s", e)
+    finally:
+        is_searching = False
+
+    return found
+
 # ── RUN HELPERS ───────────────────────────────────────────────────────────────
-async def _start_search(cb, cat, girls_only):
+async def _start_search(cb, cat, girls_only, model_gid=None, country_code=None):
     global is_searching
     if is_searching:
         await cb.answer("Поиск уже идёт!", show_alert=True)
@@ -696,6 +1084,11 @@ async def _start_search(cb, cat, girls_only):
     mx_s  = str(mx) if mx > 0 else "без лимита"
     cat_l = CAT_LABELS.get(cat, "Все коллекции") if cat and cat != "all" else "Все коллекции"
     who_l = "👧 Девушки" if girls_only else "👤 Все"
+    if country_code:
+        who_l = COUNTRY_CONFIG[country_code]["name"]
+    if model_gid:
+        model_title = next((t for t, i in NFT_COLLECTIONS.items() if i == model_gid), str(model_gid))
+        who_l = "🎁 " + model_title
 
     txt = (
         "<b>" + who_l + " / " + cat_l + "\n"
@@ -714,6 +1107,8 @@ async def _start_search(cb, cat, girls_only):
                 min_gifts=mn,
                 max_gifts=mx,
                 max_results=lim,
+                model_gid=model_gid,
+                country_code=country_code,
             ),
             timeout=300
         )
@@ -724,6 +1119,42 @@ async def _start_search(cb, cat, girls_only):
     try:
         await status.edit_text(
             "<b>✅ Готово. " + who_l + " / " + cat_l + "\nНайдено: " + str(found) + "</b>",
+            parse_mode="HTML", reply_markup=menu_kb()
+        )
+    except Exception:
+        pass
+
+async def _start_profile_search(cb, girls_only=False, country_code=None):
+    global is_searching
+    if is_searching:
+        await cb.answer("Поиск уже идёт!", show_alert=True)
+        return
+    await cb.answer("Запускаю...")
+    stats["checks"] += 1
+
+    uid = cb.from_user.id
+    lim = get_limit(uid)
+    who_l = "👧 Девушки (профили)" if girls_only else "👤 Профили"
+    if country_code:
+        who_l = COUNTRY_CONFIG[country_code]["name"] + " (профили)"
+
+    status = await cb.message.answer(
+        "<b>" + who_l + "\nЛимит: " + str(lim) + "</b>",
+        parse_mode="HTML", reply_markup=stop_kb()
+    )
+
+    try:
+        found = await asyncio.wait_for(
+            do_profile_search(status, max_results=lim, girls_only=girls_only, country_code=country_code),
+            timeout=600
+        )
+    except asyncio.TimeoutError:
+        is_searching = False
+        found = 0
+
+    try:
+        await status.edit_text(
+            "<b>✅ Готово. " + who_l + "\nНайдено: " + str(found) + "</b>",
             parse_mode="HTML", reply_markup=menu_kb()
         )
     except Exception:
@@ -799,6 +1230,10 @@ async def cmd_admin(message: Message, state: FSMContext):
     )
 
 # ── CALLBACKS: NAVIGATION ─────────────────────────────────────────────────────
+@dp.callback_query(F.data == "noop")
+async def cb_noop(cb: CallbackQuery):
+    await cb.answer()
+
 @dp.callback_query(F.data == "menu")
 async def cb_menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -831,6 +1266,75 @@ async def cb_mode_girls(cb: CallbackQuery):
     )
     await cb.answer()
 
+@dp.callback_query(F.data == "mode_country")
+async def cb_mode_country(cb: CallbackQuery):
+    await cb.message.answer(
+        "<b>🌍 Поиск по странам\nВыбери страну:</b>",
+        parse_mode="HTML", reply_markup=country_kb()
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data == "mode_models")
+async def cb_mode_models(cb: CallbackQuery):
+    if not ALL_GIFT_IDS:
+        await cb.answer("Коллекции ещё не загружены!", show_alert=True)
+        return
+    await cb.message.answer(
+        "<b>🎁 Поиск по моделям\nВыбери коллекцию:</b>",
+        parse_mode="HTML", reply_markup=models_kb()
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data == "mode_profiles")
+async def cb_mode_profiles(cb: CallbackQuery):
+    await cb.message.answer(
+        "<b>👤 Поиск по профилям\n\nИщет NFT у участников всех доступных чатов и каналов.</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Все пользователи", callback_data="prof_all")],
+            [InlineKeyboardButton(text="👧 Только девушки",   callback_data="prof_girls")],
+            [InlineKeyboardButton(text="◀️ Назад",            callback_data="menu")],
+        ])
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data == "prof_all")
+async def cb_prof_all(cb: CallbackQuery):
+    await _start_profile_search(cb, girls_only=False)
+
+@dp.callback_query(F.data == "prof_girls")
+async def cb_prof_girls(cb: CallbackQuery):
+    await _start_profile_search(cb, girls_only=True)
+
+# Страна выбрана — показываем ценовой диапазон для маркета или профили
+@dp.callback_query(F.data.startswith("country_"))
+async def cb_country(cb: CallbackQuery):
+    code = cb.data[8:]
+    if code not in COUNTRY_CONFIG:
+        await cb.answer("Неизвестная страна", show_alert=True)
+        return
+    cfg = COUNTRY_CONFIG[code]
+    await cb.message.answer(
+        "<b>" + cfg["name"] + "\nВыбери режим:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Маркет",   callback_data="cmarket_" + code)],
+            [InlineKeyboardButton(text="👤 Профили",  callback_data="cprof_" + code)],
+            [InlineKeyboardButton(text="◀️ Назад",    callback_data="mode_country")],
+        ])
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("cmarket_"))
+async def cb_cmarket(cb: CallbackQuery):
+    code = cb.data[8:]
+    await _start_search(cb, cat=None, girls_only=False, country_code=code)
+
+@dp.callback_query(F.data.startswith("cprof_"))
+async def cb_cprof(cb: CallbackQuery):
+    code = cb.data[6:]
+    await _start_profile_search(cb, girls_only=False, country_code=code)
+
 # mc_<cat> — маркет, все
 @dp.callback_query(F.data.startswith("mc_"))
 async def cb_mc(cb: CallbackQuery, state: FSMContext):
@@ -844,6 +1348,29 @@ async def cb_gc(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     cat = cb.data[3:]
     await _start_search(cb, cat=cat, girls_only=True)
+
+# model_<gid> — выбор модели
+@dp.callback_query(F.data.startswith("model_"))
+async def cb_model(cb: CallbackQuery):
+    gid = int(cb.data[6:])
+    title = next((t for t, i in NFT_COLLECTIONS.items() if i == gid), str(gid))
+    await cb.message.answer(
+        "<b>🎁 " + esc(title) + "\nВыбери ценовой диапазон:</b>",
+        parse_mode="HTML", reply_markup=model_cat_kb(gid)
+    )
+    await cb.answer()
+
+# mcat_<gid>_<cat> — поиск по модели + категория
+@dp.callback_query(F.data.startswith("mcat_"))
+async def cb_mcat(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    parts = cb.data[5:].rsplit("_", 1)
+    if len(parts) != 2:
+        await cb.answer("Ошибка", show_alert=True)
+        return
+    gid  = int(parts[0])
+    cat  = parts[1]
+    await _start_search(cb, cat=cat, girls_only=False, model_gid=gid)
 
 @dp.callback_query(F.data == "stop_search")
 async def cb_stop(cb: CallbackQuery):
