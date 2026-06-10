@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import urllib.parse
@@ -108,36 +109,38 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
 
     combined = full + " " + senders_text
 
-    # Пустой профиль — жёстко отклоняем (не знаем регион)
-    if not full or len(full.strip()) < 2:
+    # Пустой профиль — неизвестен регион, всегда отклоняем
+    if len(full.strip()) < 2:
         return False
 
-    cyr = sum(1 for c in combined if c in RU_LETTERS)
-    lat = sum(1 for c in combined if 'a' <= c <= 'z')
+    RU_LETTERS_SET = set("абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ")
+    UK_UA_ONLY_SET = set("іїєґІЇЄҐ")
+
+    cyr = sum(1 for c in combined if c in RU_LETTERS_SET)
+    lat = sum(1 for c in combined if 'a' <= c.lower() <= 'z')
     has_cyr = cyr >= 2
     has_lat = lat >= 2
 
     if region_key in ("ru", "ua", "by"):
         if not has_cyr:
-            # Нет кириллицы — проверяем только явные латинские маркеры
             ru_lat = any(k in combined for k in [
                 "russia","moscow","spb","rf","rus","ukraine","kyiv","belarus","minsk",
             ])
             if not ru_lat:
                 return False
-        ua_chars = sum(1 for c in combined if c in UK_UA_ONLY)
+        ua_chars = sum(1 for c in combined if c in UK_UA_ONLY_SET)
         ua_words = any(k in combined for k in [
-            "ukraine","kyiv","київ","харків","одеса","львів","укр","ua",
+            "ukraine","kyiv","київ","харків","одеса","львів","укр","ua ",
             "украин","україн",
         ])
         by_words = any(k in combined for k in [
-            "беларус","минск","белорус","bel","беларускі","мінск",
+            "беларус","минск","белорус","bel ","беларускі","мінск",
         ])
         if region_key == "ua":
             return ua_chars >= 2 or ua_words
         if region_key == "by":
             return by_words
-        # Россия — есть кириллица И нет явных ua/by маркеров
+        # Россия: есть кириллица И нет явных ua/by маркеров
         return has_cyr and not (ua_chars >= 2 or ua_words or by_words)
 
     if not has_lat:
@@ -145,7 +148,7 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
 
     de_c = set("äöüÄÖÜß")
     fr_c = set("àâæçéèêëîïôœùûüÿÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ")
-    es_c = set("áéíóúüñÁÉÍÓÚÜÑ")
+    es_c = set("áéíóúüñÁÉÍÓÚÜÑ¿¡")
     tr_c = set("ğüşıöçĞÜŞİÖÇ")
     has_de = any(c in de_c for c in full_raw)
     has_fr = any(c in fr_c for c in full_raw)
@@ -155,42 +158,43 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
     if region_key == "de":
         return has_de or any(k in combined for k in [
             "berlin","munich","hamburg","frankfurt","deutsch","german",
-            "münchen","köln","deutschland","düsseldorf","stuttgart",
+            "münchen","köln","deutschland","düsseldorf","stuttgart","dortmund",
         ])
     if region_key == "fr":
         return has_fr or any(k in combined for k in [
             "paris","france","french","lyon","marseille","française",
-            "bordeaux","strasbourg","nantes",
+            "bordeaux","strasbourg","nantes","toulouse","nice","lille",
         ])
     if region_key == "es":
         return has_es or any(k in combined for k in [
-            "spain","madrid","barcelona","español","españa","mexico",
-            "argentina","colombia","valencia","sevilla","bilbao",
+            "spain","madrid","barcelona","español","españa","mexico","méxico",
+            "argentina","colombia","valencia","sevilla","bilbao","latinoam",
         ])
     if region_key == "tr":
         return has_tr or any(k in combined for k in [
             "turkey","istanbul","ankara","türk","türkiye","izmir",
-            "antalya","bursa","adana",
+            "antalya","bursa","adana","gaziantep",
         ])
     if region_key == "ae":
         ar = sum(1 for c in full_raw if '\u0600' <= c <= '\u06ff')
         return ar >= 2 or any(k in combined for k in [
             "dubai","uae","emirates","sharjah","abu dhabi","abudhabi",
-            "ajman","ras al","fujairah",
+            "ajman","fujairah","ras al",
         ])
     if region_key == "cn":
-        return sum(1 for c in full_raw if '\u4e00' <= c <= '\u9fff') >= 2
+        zh = sum(1 for c in full_raw if '\u4e00' <= c <= '\u9fff')
+        return zh >= 2
     if region_key == "jp":
         hi = sum(1 for c in full_raw if '\u3040' <= c <= '\u309f')
         ka = sum(1 for c in full_raw if '\u30a0' <= c <= '\u30ff')
         return (hi + ka) >= 2 or any(k in combined for k in [
-            "japan","tokyo","osaka","japanese","kyoto","yokohama","nagoya",
+            "japan","tokyo","osaka","japanese","kyoto","yokohama","nagoya","sapporo",
         ])
     if region_key == "in":
         dev = sum(1 for c in full_raw if '\u0900' <= c <= '\u097f')
         return dev >= 2 or any(k in combined for k in [
             "india","indian","delhi","mumbai","bangalore","pakistan",
-            "bangladesh","chennai","kolkata","hyderabad",
+            "bangladesh","chennai","kolkata","hyderabad","pune","ahmedabad",
         ])
     if region_key == "uk":
         if has_de or has_fr or has_es or has_tr or has_cyr:
@@ -198,7 +202,7 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
         return any(k in combined for k in [
             "uk","london","britain","british","england","scotland",
             "wales","manchester","liverpool","glasgow","birmingham",
-            "leeds","sheffield","newcastle",
+            "leeds","sheffield","newcastle","edinburgh",
         ])
     if region_key == "us":
         if has_de or has_fr or has_es or has_tr or has_cyr:
@@ -207,6 +211,7 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
             "usa","america","american","newyork","nyc","california",
             "texas","miami","chicago","houston","losangeles","new york",
             "los angeles","seattle","boston","denver","atlanta","phoenix",
+            "brooklyn","manhattan","dallas","portland","las vegas","lasvegas",
         ])
     return False
 
@@ -264,56 +269,73 @@ BOY_SIGNALS = [
 ]
 
 def is_girl(owner, username=None, name=None):
-    bio   = (getattr(owner, "bio",        "") or "").lower() if owner else ""
-    uname = (getattr(owner, "username",   "") or "").lower() if owner else (username or "").lower()
-    fname = (getattr(owner, "first_name", "") or "").lower() if owner else ""
-    lname = (getattr(owner, "last_name",  "") or "").lower() if owner else ""
-    if not fname and name:
-        parts = name.lower().split()
-        fname = parts[0] if parts else ""
-        lname = parts[1] if len(parts) > 1 else ""
-    full = (bio + " " + uname + " " + fname + " " + lname).strip()
+    bio_raw   = (getattr(owner, "bio",        "") or "") if owner else ""
+    uname_raw = (getattr(owner, "username",   "") or "") if owner else (username or "")
+    fname_raw = (getattr(owner, "first_name", "") or "") if owner else ""
+    lname_raw = (getattr(owner, "last_name",  "") or "") if owner else ""
+    if not fname_raw and name:
+        parts = name.strip().split()
+        fname_raw = parts[0] if parts else ""
+        lname_raw = parts[1] if len(parts) > 1 else ""
 
-    # Мужское имя — сразу нет
+    bio   = bio_raw.lower()
+    uname = uname_raw.lower()
+    fname = fname_raw.lower()
+    lname = lname_raw.lower()
+    full  = (bio + " " + uname + " " + fname + " " + lname).strip()
+
+    # Мужское имя точное совпадение — сразу нет
     for bn in BOY_NAMES_SET:
-        if fname == bn or (len(bn) >= 4 and fname.startswith(bn)):
+        if fname == bn:
             return False
+        # Длинные (6+) — тоже строго
+        if len(bn) >= 6 and fname.startswith(bn):
+            return False
+
     # Мужские сигналы — сразу нет
     for sig in BOY_SIGNALS:
         if sig in full:
             return False
 
-    # Мужские окончания имён (рус) — сразу нет
-    MALE_ENDINGS = ("ев","ов","ин","ын","ий","ый","ой","ан","он","ор","ул","ур","им","ир")
-    if fname and any(fname.endswith(e) for e in MALE_ENDINGS):
-        # Проверяем что это не женское имя с таким окончанием
+    # Мужские окончания имён (рус) — нет, если имя не известно женским
+    MALE_ENDINGS = ("ев","ов","ый","ий","ой","ан","он","ор","ул","ур","им","ир","ён","ец")
+    if fname and len(fname) >= 4 and any(fname.endswith(e) for e in MALE_ENDINGS):
         is_known_girl = any(fname == gn or (len(gn) >= 4 and fname.startswith(gn)) for gn in GIRL_NAMES_SET)
         if not is_known_girl:
             return False
 
     score = 0
-    # Известное женское имя — +3 (сильный сигнал)
+
+    # Известное женское имя — +3
     for gn in GIRL_NAMES_SET:
         if fname == gn or (len(gn) >= 4 and fname.startswith(gn)):
             score += 3
             break
-    # Женские окончания (рус)
-    GIRL_ENDINGS = ("на","ья","ия","ая","яя","га","за","са","ша","ча","жа","ца","ка")
-    if fname and any(fname.endswith(e) for e in GIRL_ENDINGS):
+
+    # Женские окончания имён (рус)
+    GIRL_ENDINGS = ("на","ья","ия","ая","яя","га","за","са","ша","ча","жа","ца","ка","ла","ва")
+    if fname and len(fname) >= 3 and any(fname.endswith(e) for e in GIRL_ENDINGS):
         score += 1
-    # Женские сигналы в тексте
+
+    # Женские сигналы в тексте (каждый +1, max 3)
+    sig_count = 0
     for sig in GIRL_SIGNALS:
-        if sig in full:
-            score += 1
-    # Женские символы в username/bio
-    GIRL_CHARS = {"💅","👩","👸","💃","🌸","💖","💕","💗","👄","💄","🌺","🦋","🌷","🌹","🦄","💫","✨","💎","🌟","⭐"}
-    raw_bio = (getattr(owner, "bio", "") or "") if owner else ""
-    raw_uname = (getattr(owner, "username", "") or "") if owner else (username or "")
-    for ch in GIRL_CHARS:
-        if ch in raw_bio or ch in raw_uname:
-            score += 1
-    # Нужно минимум 3 очка (жёсткий порог)
-    return score >= 3
+        if sig in full or sig in bio_raw or sig in uname_raw:
+            sig_count += 1
+    score += min(sig_count, 3)
+
+    # Женские символы в username/bio (каждый +1, max 2)
+    GIRL_CHARS = {"💅","👩","👸","💃","🌸","💖","💕","💗","👄","💄","🌺","🦋","🌷","🌹","🦄","💫","✨","💎","🌟","🍑","👑"}
+    char_count = sum(1 for ch in GIRL_CHARS if ch in bio_raw or ch in uname_raw)
+    score += min(char_count, 2)
+
+    # Если вообще нет имени — требуем хотя бы 2 сигнала из bio/username
+    if not fname and score < 2:
+        return False
+
+    # Порог: с именем >= 3, без имени >= 2
+    threshold = 3 if fname else 2
+    return score >= threshold
 
 
 # ── MODEL DETECTION ───────────────────────────────────────────────────────────
@@ -587,7 +609,7 @@ def model_search_type_kb():
 def model_who_kb(search_type):
     """Выбор кого искать (все/девушки) для модели."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Всех моделей",   callback_data="mdlwho_" + search_type + "_all")],
+        [InlineKeyboardButton(text="Всех",           callback_data="mdlwho_" + search_type + "_all")],
         [InlineKeyboardButton(text="Только девушек", callback_data="mdlwho_" + search_type + "_girls")],
         [InlineKeyboardButton(text="Назад",          callback_data="mode_model")],
     ])
@@ -1109,13 +1131,12 @@ def _make_nft_lines(items):
         if count >= 5:
             break
         t  = esc(str(it.get("title","?")))
-        n  = esc(str(it.get("num","?")))
         p  = it.get("price")
         ps = " — " + str(p) + " ⭐" if p else ""
         if nu:
-            lines += '\n<a href="' + nu + '">' + t + " #" + n + ps + "</a>"
+            lines += '\n<a href="' + nu + '">' + t + ps + "</a>"
         else:
-            lines += "\n" + t + " #" + n + ps
+            lines += "\n" + t + ps
         count += 1
     extra = len(items) - count
     if extra > 0:
@@ -1192,14 +1213,10 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 await send_owner(uid, b)
 
     async def scan_col(gid, col_title_for_check):
-        fl = None
-        if cat:
-            fl = await get_floor(gid)
-            if fl is not None and not floor_in_cat(fl, cat):
-                return
+        # floor уже предзагружен (или None если не нужен)
+        fl = PRICE_FLOOR_CACHE.get(gid) if cat else None
 
         offset = ""
-        col_count_local = 0  # сколько NFT этой коллекции уже нашли
 
         while is_searching and found[0] < max_results:
             items, nxt = await fetch_market_page(gid, offset, limit=100)
@@ -1213,16 +1230,18 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 nft_url = item.get("nft_url") or ""
                 slug    = nft_url.split("/")[-1] if nft_url else ""
                 price   = item.get("price") or 0
+                oid     = item["owner_id"]
 
-                # Фильтр: дорогие (>100к) — только в extreme
                 if cat != "extreme" and price and price > 100000:
                     continue
 
+                # Атомарная проверка slug + oid сразу чтобы не было гонки
                 async with lock:
+                    if not oid:
+                        continue
                     if slug and slug in seen_slugs:
                         continue
-                    oid = item["owner_id"]
-                    if not oid or oid in seen_owners:
+                    if oid in seen_owners:
                         continue
                     if slug:
                         seen_slugs.add(slug)
@@ -1235,9 +1254,8 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                     continue
 
                 async with lock:
-                    if oid in seen_owners:
+                    if oid in seen_owners or found[0] >= max_results:
                         continue
-                    # Ограничение: не более 10 NFT одного владельца
                     existing = owner_map.get(oid, {}).get("items", [])
                     if len(existing) >= 10:
                         continue
@@ -1253,19 +1271,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                     b = owner_map.pop(oid) if should_send else None
 
                 if b:
-                    col_count_local += 1
-                    # Диверсификация: не более 5 NFT одной коллекции на каждые 10 выданных
-                    async with lock:
-                        total_sent = found[0]
-                        col_quota  = col_sent_count.get(gid, 0)
-                    # Если коллекция уже дала много — пропускаем временно
-                    if col_quota > 0 and col_quota >= max(3, max_results // max(len(gift_ids), 1) + 2):
-                        async with lock:
-                            owner_map[oid] = b  # вернуть обратно
-                        continue
                     await send_owner(oid, b)
-                    async with lock:
-                        col_sent_count[gid] = col_sent_count.get(gid, 0) + 1
                     if found[0] >= max_results:
                         return
 
@@ -1276,12 +1282,23 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
     try:
         await status_msg.edit_text("<b>Идёт парсинг подарка, ожидай</b>", parse_mode="HTML", reply_markup=stop_kb())
 
-        # Перемешиваем коллекции для равномерности
         valid_pairs = [(gid, title) for gid, title in ALL_GIFT_IDS if gid in gift_ids] if ALL_GIFT_IDS else [(gid, "") for gid in gift_ids]
         random.shuffle(valid_pairs)
 
-        # Запускаем по PARALLEL коллекций параллельно
-        PARALLEL = 12
+        # Предварительно загружаем floor для всех коллекций параллельно (ускоряет cat-поиск)
+        if cat:
+            all_gids = [gid for gid, _ in valid_pairs]
+            floors = await asyncio.gather(*[get_floor(gid) for gid in all_gids], return_exceptions=True)
+            # Фильтруем коллекции: оставляем только те у которых floor в нужной категории
+            filtered = []
+            for (gid, title), fl in zip(valid_pairs, floors):
+                if isinstance(fl, Exception) or fl is None:
+                    filtered.append((gid, title))  # нет данных — всё равно пробуем
+                elif floor_in_cat(fl, cat):
+                    filtered.append((gid, title))
+            valid_pairs = filtered
+
+        PARALLEL = 16
 
         for i in range(0, len(valid_pairs), PARALLEL):
             if not is_searching or found[0] >= max_results:
@@ -1305,9 +1322,8 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
     is_searching = True
     lock        = asyncio.Lock()
     found       = [0]
-    seen_slugs  = set()
-    seen_owners = set()
-    col_sent_count = {}
+    seen_slugs  = set()   # дедупликация NFT
+    seen_owners = set()   # дедупликация владельцев
 
     async def scan_col(gid):
         offset = ""
@@ -1323,18 +1339,22 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 slug    = nft_url.split("/")[-1] if nft_url else ""
                 price   = item.get("price") or 0
 
-                # Не показываем дорогие >100к
                 if price and price > 100000:
                     continue
 
+                # Атомарная проверка и регистрация slug + owner
                 async with lock:
+                    if not oid:
+                        continue
                     if slug and slug in seen_slugs:
                         continue
-                    if not oid or oid in seen_owners:
+                    if oid in seen_owners:
                         continue
+                    # Регистрируем сразу чтобы не было гонки
                     if slug:
                         seen_slugs.add(slug)
 
+                # Фильтры вне lock (они не изменяют state)
                 if not await region_match_async(item["owner"], item["username"], item["name"], region, uid=oid):
                     continue
                 if girls_only and not await is_girl_async(item["owner"], item["username"], item["name"], uid=oid):
@@ -1342,15 +1362,11 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 if not is_model(item["owner"], item["username"], item["name"]):
                     continue
 
+                # Финальная регистрация владельца
                 async with lock:
                     if oid in seen_owners or found[0] >= max_results:
                         continue
-                    # Диверсификация коллекций
-                    col_q = col_sent_count.get(gid, 0)
-                    if col_q >= max(3, max_results // max(len(gift_ids), 1) + 2):
-                        continue
                     seen_owners.add(oid)
-                    col_sent_count[gid] = col_q + 1
                     found[0] += 1
 
                 username = item["username"]
@@ -1359,19 +1375,17 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 price_s  = str(price) + " ⭐" if price else "нет цены"
                 owner_s  = fmt_owner(item["owner"], username, name)
                 title    = esc(str(item.get("title", "?")))
-                num      = esc(str(item.get("num", "?")))
 
                 nft_line = ""
                 if nft_url:
-                    nft_line = '\n<a href="' + nft_url + '">' + title + " #" + num + "</a>"
+                    nft_line = '\n<a href="' + nft_url + '">' + title + "</a>"
                 else:
-                    nft_line = "\n" + title + " #" + num
+                    nft_line = "\n" + title
                 nft_line += "\n" + price_s
 
                 txt = "<b>" + owner_s + "</b>" + nft_line
                 cache_owner(oid, item["owner"], username, name, p_url, [item])
 
-                # Кнопка написать с ссылкой на NFT (1 NFT — всегда 1 у модели)
                 kb = model_card_kb(username, p_url, oid, nft_url, nft_count=1)
                 try:
                     await status_msg.bot.send_message(
@@ -1382,14 +1396,14 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                     stats["found"] += 1
                 except Exception as e:
                     logger.warning("model send: %s", e)
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.15)
 
             if not nxt:
                 break
             offset = nxt
 
     try:
-        await status_msg.edit_text("<b>Идёт парсинг подарка, ожидай</b>", parse_mode="HTML", reply_markup=stop_kb())
+        await status_msg.edit_text("<b>Идёт парсинг, ожидай...</b>", parse_mode="HTML", reply_markup=stop_kb())
         valid_ids = list(gift_ids)
         random.shuffle(valid_ids)
         PARALLEL = 12
