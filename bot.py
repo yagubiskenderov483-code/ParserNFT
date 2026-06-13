@@ -25,7 +25,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 API_ID       = 36101343
 API_HASH     = "116195fa5e0459d25a9a6266b40807d7"
-BOT_TOKEN    = "7113650205:AAHT-9dk2rc1rz7G0zWdUgtq373-Eh4sC3M"
+BOT_TOKEN    = "8767675859:AAEGGro63v6rsGaHLj7PcE8Cp0S0wjh4cUU"
 ADMIN_ID     = 8726084830
 SESSION_NAME = "nft_session"
 USERS_FILE   = "users.json"
