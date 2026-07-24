@@ -2007,7 +2007,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                         "<b>Профиль:</b> БД PriceNFT (" + str(st.get("users", 0)) + ")...",
                         parse_mode="HTML", reply_markup=stop_kb()
                     )
-                    hits = await search_pricenftbot(limit=max(40, max_results * 2))
+                    hits = await search_pricenftbot(limit=max(40, max_results * 2), resolve=False)
                     for h in hits:
                         if not is_searching or found[0] >= max_results:
                             break
