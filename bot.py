@@ -4203,11 +4203,8 @@ async def _start_market(cb, cat, who="all"):
                                parse_mode="HTML", reply_markup=menu_kb())
         return
     boost  = get_boost(uid)
-    mn     = get_min_gifts(uid)
-    mx     = get_max_gifts(uid)
     lim    = get_limit(uid)
     reg    = get_region(uid)
-    mx_s   = str(mx) if mx > 0 else "без лимита"
     cat_l  = CAT_LABELS.get(cat, "Все")
     who_l  = who_label(who)
     reg_l  = REGIONS.get(reg, {}).get("label", "Все страны")
@@ -4221,8 +4218,7 @@ async def _start_market(cb, cat, who="all"):
     try:
         found = await asyncio.wait_for(
             do_market_search(status, ids, cat=cat, who=who,
-                             boost=boost, min_gifts=mn, max_gifts=mx,
-                             max_results=lim, region=reg),
+                             boost=boost, max_results=lim, region=reg),
             timeout=600
         )
     except asyncio.TimeoutError:
