@@ -25,7 +25,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 API_ID       = 36101343
 API_HASH     = "116195fa5e0459d25a9a6266b40807d7"
-BOT_TOKEN    = "7113650205:AAGyjnXcxcbsxDuGb9Nk3U4VpAILJv7U9ag"
+BOT_TOKEN    = "8790434095:AAG5eA6OzMcC2-VdLeTeITahdUi_6KiIRiw"
 ADMIN_ID     = 8726084830
 SESSION_NAME = "nft_session"
 USERS_FILE   = "users.json"
@@ -67,11 +67,15 @@ REGIONS = {
     "ru":  {"label": "Россия"},
     "ua":  {"label": "Украина"},
     "by":  {"label": "Беларусь"},
+    "kz":  {"label": "Казахстан"},
+    "uz":  {"label": "Узбекистан"},
     "us":  {"label": "США"},
     "uk":  {"label": "Великобритания"},
     "de":  {"label": "Германия"},
     "fr":  {"label": "Франция"},
     "es":  {"label": "Испания"},
+    "it":  {"label": "Италия"},
+    "pl":  {"label": "Польша"},
     "tr":  {"label": "Турция"},
     "ae":  {"label": "ОАЭ"},
     "cn":  {"label": "Китай"},
@@ -82,11 +86,36 @@ REGIONS = {
 RU_LETTERS  = set("абвгдеёжзийклмнопрстуфхцчшщъыьэюяіїєґ")
 UK_UA_ONLY  = set("іїєґ")
 
+# Типичные славянские/русские имена латиницей — для быстрого матча региона RU/BY/UA/KZ
+CIS_LAT_NAMES = {
+    "anna","maria","olga","elena","irina","nata","natasha","tanya","tanya","dasha",
+    "masha","katya","anya","alina","arina","karina","milana","polina","ksenia","kseniya",
+    "yulia","ulia","victoria","viktoria","valeria","diana","kristina","svetlana","marina",
+    "ekaterina","aleksandra","alexandra","sofia","sophia","vera","nina","lara","lada",
+    "alex","alexander","alexey","aleksey","andrey","anton","artem","dmitry","dmitri",
+    "ivan","igor","ilya","kirill","maxim","mikhail","nikita","oleg","pavel","roman",
+    "ruslan","sergey","sergei","timur","vladimir","vlad","yuri","denis","egor","maksim",
+    "nastya","nastia","sonya","sonia","lera","vika","ksusha","olya","lena","yana",
+    "zhanna","regina","amina","zara","rita","mila","tamara","inna","angelina","veronika",
+    "kira","bella","eva","zlata","camilla","kamilla","elizaveta","elizabeth","liza",
+}
+
 def _cyr_count(text):
     return sum(1 for c in text.lower() if c in RU_LETTERS)
 
 def _lat_count(text):
     return sum(1 for c in text.lower() if 'a' <= c <= 'z')
+
+
+def _name_tokens(*parts):
+    tokens = set()
+    for p in parts:
+        if not p:
+            continue
+        for t in re.split(r"[^a-zа-яёіїєґ]+", str(p).lower()):
+            if len(t) >= 2:
+                tokens.add(t)
+    return tokens
 
 
 # ── РАСШИРЕННАЯ ПРОВЕРКА РЕГИОНА ──────────────────────────────────────────────
@@ -111,8 +140,9 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
         senders_text = " ".join(gift_senders_langs).lower()
 
     combined = full + " " + senders_text
+    tokens = _name_tokens(uname, fname, lname, name)
 
-    # Пустой профиль — неизвестен регион, всегда отклоняем
+    # Совсем пустой профиль — отклоняем только если нет даже username
     if len(full.strip()) < 2:
         return False
 
@@ -121,33 +151,47 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
 
     cyr = sum(1 for c in combined if c in RU_LETTERS_SET)
     lat = sum(1 for c in combined if 'a' <= c.lower() <= 'z')
-    has_cyr = cyr >= 2
+    has_cyr = cyr >= 1
     has_lat = lat >= 2
+    has_cis_name = bool(tokens & CIS_LAT_NAMES)
 
-    if region_key in ("ru", "ua", "by"):
-        if not has_cyr:
-            ru_lat = any(k in combined for k in [
-                "russia","moscow","spb","rf","rus","ukraine","kyiv","belarus","minsk",
-            ])
-            if not ru_lat:
-                return False
+    if region_key in ("ru", "ua", "by", "kz", "uz"):
         ua_chars = sum(1 for c in combined if c in UK_UA_ONLY_SET)
         ua_words = any(k in combined for k in [
-            "ukraine","kyiv","київ","харків","одеса","львів","укр","ua ",
-            "украин","україн",
+            "ukraine","kyiv","київ","харків","одеса","львів","укр","ua_",
+            "украин","україн","odessa","kharkiv","lviv","dnipro","zaporiz",
         ])
         by_words = any(k in combined for k in [
-            "беларус","минск","белорус","bel ","беларускі","мінск",
+            "беларус","минск","белорус","belarus","minsk","gomel","grodno",
+            "витебск","брест","могилев","беларускі","мінск",
         ])
-        if region_key == "ua":
-            return ua_chars >= 2 or ua_words
-        if region_key == "by":
-            return by_words
-        # Россия: есть кириллица И нет явных ua/by маркеров
-        return has_cyr and not (ua_chars >= 2 or ua_words or by_words)
+        kz_words = any(k in combined for k in [
+            "казах","kazakhstan","almaty","алматы","астана","astana","shymkent",
+            "нурсултан","nursultan","aqtobe","karaganda","караганд",
+        ])
+        uz_words = any(k in combined for k in [
+            "узбек","uzbekistan","tashkent","ташкент","samarkand","самарканд",
+            "bukhara","бухар","namangan","ферган",
+        ])
+        ru_words = any(k in combined for k in [
+            "russia","russian","moscow","москва","спб","spb","питер","petersburg",
+            "россия","русск","rf_","_rf","novosibirsk","ekaterinburg","казань","kazan",
+            "самар","samara","ростов","rostov","краснодар","krasnodar","sochi","сочи",
+            "нижний","nizhniy","челябинск","омск","омск","воронеж","perm","пермь",
+        ])
 
-    if not has_lat:
-        return False
+        if region_key == "ua":
+            return ua_chars >= 1 or ua_words or (has_cyr and not (by_words or kz_words or uz_words) and "ua" in combined)
+        if region_key == "by":
+            return by_words or (has_cyr and any(k in combined for k in ["by_", "_by", "бел"]))
+        if region_key == "kz":
+            return kz_words or any(k in combined for k in ["kz_", "_kz"])
+        if region_key == "uz":
+            return uz_words or any(k in combined for k in ["uz_", "_uz"])
+        # Россия: кириллица / CIS-имя / RU-слова, без явных ua/by/kz/uz
+        if ua_chars >= 2 or ua_words or by_words or kz_words or uz_words:
+            return False
+        return has_cyr or has_cis_name or ru_words
 
     de_c = set("äöüÄÖÜß")
     fr_c = set("àâæçéèêëîïôœùûüÿÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ")
@@ -160,62 +204,88 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
 
     if region_key == "de":
         return has_de or any(k in combined for k in [
-            "berlin","munich","hamburg","frankfurt","deutsch","german",
+            "berlin","munich","hamburg","frankfurt","deutsch","german","germany",
             "münchen","köln","deutschland","düsseldorf","stuttgart","dortmund",
+            "de_", "_de", "österreich","austria","wien","vienna","schweiz","zurich",
         ])
     if region_key == "fr":
         return has_fr or any(k in combined for k in [
-            "paris","france","french","lyon","marseille","française",
-            "bordeaux","strasbourg","nantes","toulouse","nice","lille",
+            "paris","france","french","lyon","marseille","française","fr_",
+            "bordeaux","strasbourg","nantes","toulouse","nice","lille","monaco",
         ])
     if region_key == "es":
         return has_es or any(k in combined for k in [
             "spain","madrid","barcelona","español","españa","mexico","méxico",
             "argentina","colombia","valencia","sevilla","bilbao","latinoam",
+            "es_", "chile","peru","perú","venezuela","miami latina",
         ])
+    if region_key == "it":
+        return any(k in combined for k in [
+            "italy","italia","italian","italiano","roma","rome","milan","milano",
+            "napoli","naples","torino","florence","firenze","it_", "_it",
+        ])
+    if region_key == "pl":
+        return any(k in combined for k in [
+            "poland","polska","polish","warsaw","warszawa","krakow","kraków",
+            "wroclaw","gdansk","poznan","pl_", "_pl", "łódź","lodz",
+        ]) or any(c in "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ" for c in full_raw)
     if region_key == "tr":
         return has_tr or any(k in combined for k in [
-            "turkey","istanbul","ankara","türk","türkiye","izmir",
-            "antalya","bursa","adana","gaziantep",
+            "turkey","istanbul","ankara","türk","türkiye","izmir","turkiye",
+            "antalya","bursa","adana","gaziantep","tr_", "_tr",
         ])
     if region_key == "ae":
         ar = sum(1 for c in full_raw if '\u0600' <= c <= '\u06ff')
         return ar >= 2 or any(k in combined for k in [
             "dubai","uae","emirates","sharjah","abu dhabi","abudhabi",
-            "ajman","fujairah","ras al",
+            "ajman","fujairah","ras al","dxb","ae_",
         ])
     if region_key == "cn":
         zh = sum(1 for c in full_raw if '\u4e00' <= c <= '\u9fff')
-        return zh >= 2
+        return zh >= 1 or any(k in combined for k in [
+            "china","chinese","beijing","shanghai","guangzhou","shenzhen","cn_",
+        ])
     if region_key == "jp":
         hi = sum(1 for c in full_raw if '\u3040' <= c <= '\u309f')
         ka = sum(1 for c in full_raw if '\u30a0' <= c <= '\u30ff')
-        return (hi + ka) >= 2 or any(k in combined for k in [
-            "japan","tokyo","osaka","japanese","kyoto","yokohama","nagoya","sapporo",
+        return (hi + ka) >= 1 or any(k in combined for k in [
+            "japan","tokyo","osaka","japanese","kyoto","yokohama","nagoya","sapporo","jp_",
         ])
     if region_key == "in":
         dev = sum(1 for c in full_raw if '\u0900' <= c <= '\u097f')
-        return dev >= 2 or any(k in combined for k in [
+        return dev >= 1 or any(k in combined for k in [
             "india","indian","delhi","mumbai","bangalore","pakistan",
-            "bangladesh","chennai","kolkata","hyderabad","pune","ahmedabad",
+            "bangladesh","chennai","kolkata","hyderabad","pune","ahmedabad","in_",
         ])
     if region_key == "uk":
-        if has_de or has_fr or has_es or has_tr or has_cyr:
+        if has_de or has_fr or has_es or has_tr:
+            return False
+        if has_cyr and not has_lat:
+            return False
+        # не путать с ukraine
+        if any(k in combined for k in ["ukraine", "украин", "україн", "kyiv", "київ"]):
             return False
         return any(k in combined for k in [
-            "uk","london","britain","british","england","scotland",
+            "london","britain","british","england","scotland","uk_", "_uk",
             "wales","manchester","liverpool","glasgow","birmingham",
-            "leeds","sheffield","newcastle","edinburgh",
-        ])
+            "leeds","sheffield","newcastle","edinburgh","britain","brit ",
+        ]) or (" uk " in (" " + combined + " "))
     if region_key == "us":
-        if has_de or has_fr or has_es or has_tr or has_cyr:
+        if has_de or has_fr or has_es or has_tr:
+            return False
+        if has_cyr and not has_lat:
             return False
         return any(k in combined for k in [
-            "usa","america","american","newyork","nyc","california",
+            "usa","america","american","newyork","nyc","california","us_",
             "texas","miami","chicago","houston","losangeles","new york",
             "los angeles","seattle","boston","denver","atlanta","phoenix",
             "brooklyn","manhattan","dallas","portland","las vegas","lasvegas",
-        ])
+            "florida","usa_",
+        ]) or bool(tokens & {
+            "jessica","ashley","emily","olivia","ava","isabella","mia","madison",
+            "hannah","samantha","chloe","amber","kayla","brooklyn","destiny",
+        })
+    # fallback: нет явного матча — не режем слишком жёстко при "any" уже обработан
     return False
 
 
@@ -236,8 +306,12 @@ GIRL_NAMES_SET = {
     "таня","надя","галя","аня","ника","алиса","злата","ева","эвелина","камилла",
     "яна","влада","руслана","женя","вероника","кира","стелла","белла","амина",
     "зара","рита","мила","тамара","инна","зоя","нора","лала","милена","ясмин",
+    "марина","елизавета","ульяна","варвара","снежана","лилия","аделина","дарина",
+    "софия","софья","марьяна","ярослава","всеслава","люба","любовь","снежа",
+    "ксания","ксеша","настенька","катенька","машенька","дашенька","иришка",
+    "анна","аня","анютка","тоня","тоня","ксения","олеся","леся","настя",
     "anna","maria","kate","elena","olga","natasha","tatiana","irina","diana",
-    "alina","dasha","masha","vika","lena","anya","yulia","lisa","sasha","tanya",
+    "alina","dasha","masha","vika","lena","anya","yulia","julia","lisa","tanya",
     "sonya","arina","karina","milana","zlata","eva","yana","veronika","kira",
     "stella","bella","nina","tina","vera","sofia","sophia","victoria","kristina",
     "valeria","natalia","angelina","jessica","ashley","emily","olivia","ava",
@@ -246,6 +320,12 @@ GIRL_NAMES_SET = {
     "violet","daisy","aurora","aria","luna","scarlett","zoey","penelope","layla",
     "riley","nora","maya","claire","savannah","eleanor","camila","alexa","leah",
     "aubrey","ariana","alice","lana","lola","zara","candy","honey","cherry",
+    "nastya","ksenia","kseniya","polina","katya","olya","lera","ksusha",
+    "marina","elizaveta","uliana","ulyana","varvara","adelina","darina","olesya",
+    "sveta","svetlana","nastia","anastasia","ekaterina","aleksandra","alexandra",
+    "daria","darya","viktoria","viktoriya","valeriya","natalya","nataliya",
+    "zhanna","regina","amina","mila","rita","liza","sonia","tonya","lesya",
+    "kamilla","camilla","evelina","milena","yasmin","lara","lada","mila",
 }
 BOY_NAMES_SET = {
     "александр","алексей","андрей","антон","артем","борис","вадим","василий",
@@ -258,17 +338,19 @@ BOY_NAMES_SET = {
     "maxim","mikhail","nikita","nikolai","oleg","pavel","roman","ruslan",
     "sergey","timur","yuri","george","michael","james","john","robert","david",
     "william","richard","charles","joseph","thomas","mark","paul","andrew",
+    "egor","maksim","vlad","danil","daniil","petya","serezha","kostya",
 }
 GIRL_SIGNALS = [
-    "girl","lady","woman","she","her","female","♀",
+    "girl","lady","woman","she/her","she her","female","♀","公主",
     "👩","👸","💃","🌸","💖","💕","💗","👄","💄","🌺","🦋","🌷","🌹","💅","🦄","💫","✨","🍑","👑",
     "девушка","она","женщина","мама","дочь","принцесса","королева","богиня",
     "красотка","кошечка","зайка","лапочка","милашка","красавица","малышка",
-    "onlyfans","model","модель","content","nsfw","18+",
+    "onlyfans","model","модель","content","nsfw","18+","tits","boobs",
+    "wife","girlfriend","miss ","mrs","lady_",
 ]
 BOY_SIGNALS = [
     "king","boss","bro","dude","male","guy","lord","sultan","парень","мужик",
-    "мужчина","он ","сын ","брат ","папа","отец","муж ","дядя",
+    "мужчина","он ","сын ","брат ","папа","отец","муж ","дядя","he/him","he him",
 ]
 
 def is_girl(owner, username=None, name=None):
@@ -283,15 +365,18 @@ def is_girl(owner, username=None, name=None):
 
     bio   = bio_raw.lower()
     uname = uname_raw.lower()
-    fname = fname_raw.lower()
-    lname = lname_raw.lower()
+    fname = fname_raw.lower().strip()
+    lname = lname_raw.lower().strip()
     full  = (bio + " " + uname + " " + fname + " " + lname).strip()
+    tokens = _name_tokens(fname, lname, uname, name)
 
     # Мужское имя точное совпадение — сразу нет
     for bn in BOY_NAMES_SET:
-        if fname == bn:
+        if fname == bn or bn in tokens:
+            # исключение: женя/sasha могут быть женскими — проверяем ниже
+            if bn in ("женя", "саша", "sasha", "жека"):
+                continue
             return False
-        # Длинные (6+) — тоже строго
         if len(bn) >= 6 and fname.startswith(bn):
             return False
 
@@ -304,20 +389,26 @@ def is_girl(owner, username=None, name=None):
     MALE_ENDINGS = ("ев","ов","ый","ий","ой","ан","он","ор","ул","ур","им","ир","ён","ец")
     if fname and len(fname) >= 4 and any(fname.endswith(e) for e in MALE_ENDINGS):
         is_known_girl = any(fname == gn or (len(gn) >= 4 and fname.startswith(gn)) for gn in GIRL_NAMES_SET)
-        if not is_known_girl:
+        if not is_known_girl and not (tokens & GIRL_NAMES_SET):
             return False
 
     score = 0
 
     # Известное женское имя — +3
     for gn in GIRL_NAMES_SET:
-        if fname == gn or (len(gn) >= 4 and fname.startswith(gn)):
+        if fname == gn or gn in tokens:
+            score += 3
+            break
+        if len(gn) >= 4 and (fname.startswith(gn) or gn.startswith(fname) and len(fname) >= 3):
             score += 3
             break
 
-    # Женские окончания имён (рус)
-    GIRL_ENDINGS = ("на","ья","ия","ая","яя","га","за","са","ша","ча","жа","ца","ка","ла","ва")
+    # Женские окончания имён (рус + лат)
+    GIRL_ENDINGS = ("на","ья","ия","ая","яя","га","за","са","ша","ча","жа","ца","ка","ла","ва","ня","ся")
+    LAT_GIRL_ENDINGS = ("ia","ya","na","ra","la","sa","ta","ka","va","ina","ella","ette","elle","ie","ey")
     if fname and len(fname) >= 3 and any(fname.endswith(e) for e in GIRL_ENDINGS):
+        score += 2
+    elif fname and len(fname) >= 3 and any(fname.endswith(e) for e in LAT_GIRL_ENDINGS):
         score += 1
 
     # Женские сигналы в тексте (каждый +1, max 3)
@@ -328,16 +419,23 @@ def is_girl(owner, username=None, name=None):
     score += min(sig_count, 3)
 
     # Женские символы в username/bio (каждый +1, max 2)
-    GIRL_CHARS = {"💅","👩","👸","💃","🌸","💖","💕","💗","👄","💄","🌺","🦋","🌷","🌹","🦄","💫","✨","💎","🌟","🍑","👑"}
-    char_count = sum(1 for ch in GIRL_CHARS if ch in bio_raw or ch in uname_raw)
+    GIRL_CHARS = {"💅","👩","👸","💃","🌸","💖","💕","💗","👄","💄","🌺","🦋","🌷","🌹","🦄","💫","✨","💎","🌟","🍑","👑","♀","🎀"}
+    char_count = sum(1 for ch in GIRL_CHARS if ch in bio_raw or ch in uname_raw or ch in fname_raw)
     score += min(char_count, 2)
+
+    # username содержит girl-name
+    if score < 2:
+        for gn in GIRL_NAMES_SET:
+            if len(gn) >= 4 and gn in uname:
+                score += 2
+                break
 
     # Если вообще нет имени — требуем хотя бы 2 сигнала из bio/username
     if not fname and score < 2:
         return False
 
-    # Порог: с именем >= 3, без имени >= 2
-    threshold = 3 if fname else 2
+    # Порог снижен для быстрого и широкого поиска девушек
+    threshold = 2 if fname else 2
     return score >= threshold
 
 
@@ -559,19 +657,31 @@ CAT_LABELS = {
 
 
 # ── KEYBOARDS ─────────────────────────────────────────────────────────────────
+async def safe_edit(msg, text, reply_markup=None):
+    """Надёжное обновление сообщения — кнопки всегда остаются кликабельными."""
+    try:
+        await msg.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        return True
+    except Exception:
+        try:
+            await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+            return True
+        except Exception:
+            return False
+
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Поиск",      callback_data="search_mode_select")],
-        [InlineKeyboardButton(text="Настройки",  callback_data="settings_menu"),
-         InlineKeyboardButton(text="Статистика", callback_data="stats")],
+        [InlineKeyboardButton(text="🔍 Поиск",      callback_data="search_mode_select")],
+        [InlineKeyboardButton(text="⚙️ Настройки",  callback_data="settings_menu"),
+         InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
     ])
 
 def search_mode_select_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="По маркету",  callback_data="mode_market")],
-        [InlineKeyboardButton(text="По профилю",  callback_data="mode_profile")],
-        [InlineKeyboardButton(text="По модели",   callback_data="mode_model")],
-        [InlineKeyboardButton(text="Назад",       callback_data="menu")],
+        [InlineKeyboardButton(text="🛒 По маркету",  callback_data="mode_market")],
+        [InlineKeyboardButton(text="👤 По профилю",  callback_data="mode_profile")],
+        [InlineKeyboardButton(text="⭐ По модели",   callback_data="mode_model")],
+        [InlineKeyboardButton(text="⬅️ Назад",       callback_data="menu")],
     ])
 
 def cat_kb(mode):
@@ -582,61 +692,100 @@ def cat_kb(mode):
     else:
         p = "mm_"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Дешевые до 2000",    callback_data=p+"cheap")],
-        [InlineKeyboardButton(text="Средние 2000-5000",  callback_data=p+"mid")],
-        [InlineKeyboardButton(text="Сложные 5000-20000", callback_data=p+"hard")],
-        [InlineKeyboardButton(text="Хард 20000-100000",  callback_data=p+"ultra")],
-        [InlineKeyboardButton(text="Экстрим от 100000",  callback_data=p+"extreme")],
-        [InlineKeyboardButton(text="Назад",              callback_data="search_mode_select")],
+        [InlineKeyboardButton(text="💰 Дешевые до 2000",    callback_data=p+"cheap")],
+        [InlineKeyboardButton(text="💎 Средние 2000-5000",  callback_data=p+"mid")],
+        [InlineKeyboardButton(text="🔥 Сложные 5000-20000", callback_data=p+"hard")],
+        [InlineKeyboardButton(text="⚡️ Хард 20000-100000",  callback_data=p+"ultra")],
+        [InlineKeyboardButton(text="🚀 Экстрим от 100000",  callback_data=p+"extreme")],
+        [InlineKeyboardButton(text="⬅️ Назад",              callback_data="search_mode_select")],
     ])
 
 def who_kb(mode, cat):
     back = "mode_" + mode
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Всех",    callback_data="go_" + mode + "_" + cat + "_all")],
-        [InlineKeyboardButton(text="Девушек", callback_data="go_" + mode + "_" + cat + "_girls")],
-        [InlineKeyboardButton(text="Назад",   callback_data=back)],
+        [InlineKeyboardButton(text="👥 Всех",      callback_data="go_" + mode + "_" + cat + "_all")],
+        [InlineKeyboardButton(text="👩 Девушек",   callback_data="go_" + mode + "_" + cat + "_girls")],
+        [InlineKeyboardButton(text="⬅️ Назад",     callback_data=back)],
     ])
 
 def who_model_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Всех моделей",   callback_data="mdl_who_all")],
-        [InlineKeyboardButton(text="Только девушек", callback_data="mdl_who_girls")],
-        [InlineKeyboardButton(text="Назад",          callback_data="search_mode_select")],
+        [InlineKeyboardButton(text="👥 Всех моделей",   callback_data="mdl_who_all")],
+        [InlineKeyboardButton(text="👩 Только девушек", callback_data="mdl_who_girls")],
+        [InlineKeyboardButton(text="⬅️ Назад",          callback_data="search_mode_select")],
     ])
 
 def model_search_type_kb():
     """Выбор режима поиска моделей: по маркету или по профилю."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="По маркету",  callback_data="mdltype_market")],
-        [InlineKeyboardButton(text="По профилю",  callback_data="mdltype_profile")],
-        [InlineKeyboardButton(text="Назад",       callback_data="search_mode_select")],
+        [InlineKeyboardButton(text="🛒 По маркету",  callback_data="mdltype_market")],
+        [InlineKeyboardButton(text="👤 По профилю",  callback_data="mdltype_profile")],
+        [InlineKeyboardButton(text="⬅️ Назад",       callback_data="search_mode_select")],
     ])
 
 def model_who_kb(search_type):
     """Выбор кого искать (все/девушки) для модели."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Всех",           callback_data="mdlwho_" + search_type + "_all")],
-        [InlineKeyboardButton(text="Только девушек", callback_data="mdlwho_" + search_type + "_girls")],
-        [InlineKeyboardButton(text="Назад",          callback_data="mode_model")],
+        [InlineKeyboardButton(text="👥 Всех",           callback_data="mdlwho_" + search_type + "_all")],
+        [InlineKeyboardButton(text="👩 Только девушек", callback_data="mdlwho_" + search_type + "_girls")],
+        [InlineKeyboardButton(text="⬅️ Назад",          callback_data="mode_model")],
     ])
 
-def model_col_kb(who, search_type, collections):
-    """Кнопки коллекций — только название, без номеров."""
+COL_PAGE_SIZE = 40  # 2 колонки × 20 рядов + служебльные кнопки < 100
+
+def model_col_kb(who, search_type, collections, page=0):
+    """Кнопки коллекций с пагинацией (лимит Telegram — 100 кнопок)."""
+    cols = list(collections)
+    total_pages = max(1, (len(cols) + COL_PAGE_SIZE - 1) // COL_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * COL_PAGE_SIZE
+    chunk = cols[start:start + COL_PAGE_SIZE]
+
     rows = []
     row = []
-    for idx, (gid, title) in enumerate(collections, 1):
+    for gid, title in chunk:
         lbl = str(title) if title else "NFT"
-        if len(lbl) > 20:
-            lbl = lbl[:18] + ".."
-        row.append(InlineKeyboardButton(text=lbl, callback_data="mdlrun_" + who + "_" + search_type + "_" + str(gid)))
+        if len(lbl) > 18:
+            lbl = lbl[:16] + ".."
+        # короткий callback чтобы не превысить 64 байта
+        row.append(InlineKeyboardButton(
+            text=lbl,
+            callback_data="mdlrun_" + who[0] + "_" + search_type[0] + "_" + str(gid)
+        ))
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton(text="Все коллекции", callback_data="mdlrun_" + who + "_" + search_type + "_all")])
-    rows.append([InlineKeyboardButton(text="Назад", callback_data="mdlwho_" + search_type + "_" + who)])
+
+    rows.append([InlineKeyboardButton(
+        text="📦 Все коллекции",
+        callback_data="mdlrun_" + who[0] + "_" + search_type[0] + "_all"
+    )])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text="⬅️",
+            callback_data="mdlpage_" + who[0] + "_" + search_type[0] + "_" + str(page - 1)
+        ))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(
+            text=str(page + 1) + "/" + str(total_pages),
+            callback_data="noop"
+        ))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(
+            text="➡️",
+            callback_data="mdlpage_" + who[0] + "_" + search_type[0] + "_" + str(page + 1)
+        ))
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton(
+        text="⬅️ Назад",
+        callback_data="mdlwho_" + search_type + "_" + who
+    )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def settings_menu_kb(uid):
@@ -650,8 +799,8 @@ def settings_menu_kb(uid):
         [InlineKeyboardButton(text="Мин. гифтов: " + str(mn),   callback_data="set_min")],
         [InlineKeyboardButton(text="Макс. гифтов: " + mx_s,     callback_data="set_max")],
         [InlineKeyboardButton(text="Лимит выдачи: " + str(lim), callback_data="set_limit")],
-        [InlineKeyboardButton(text="Регион: " + reg_lbl,        callback_data="set_region")],
-        [InlineKeyboardButton(text="Назад",                      callback_data="menu")],
+        [InlineKeyboardButton(text="🌍 Регион: " + reg_lbl,     callback_data="set_region")],
+        [InlineKeyboardButton(text="⬅️ Назад",                  callback_data="menu")],
     ])
 
 def boost_kb():
@@ -663,7 +812,7 @@ def boost_kb():
          InlineKeyboardButton(text="200%", callback_data="bst_200"),
          InlineKeyboardButton(text="300%", callback_data="bst_300")],
         [InlineKeyboardButton(text="Ввести вручную", callback_data="bst_custom")],
-        [InlineKeyboardButton(text="Назад", callback_data="settings_menu")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_menu")],
     ])
 
 def limit_kb(current=30):
@@ -679,7 +828,7 @@ def limit_kb(current=30):
          InlineKeyboardButton(text=l(80), callback_data="lim_80"),
          InlineKeyboardButton(text=l(90), callback_data="lim_90"),
          InlineKeyboardButton(text=l(100), callback_data="lim_100")],
-        [InlineKeyboardButton(text="Назад", callback_data="settings_menu")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_menu")],
     ])
 
 def region_kb(current="any"):
@@ -688,22 +837,28 @@ def region_kb(current="any"):
     for i in range(0, len(items), 2):
         row = []
         for key, val in items[i:i+2]:
-            lbl = val["label"] + (" ✓" if key == current else "")
+            lbl = ("✅ " if key == current else "") + val["label"]
             row.append(InlineKeyboardButton(text=lbl, callback_data="reg_" + key))
         rows.append(row)
-    rows.append([InlineKeyboardButton(text="Назад", callback_data="settings_menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def stop_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="СТОП", callback_data="stop_search")],
+        [InlineKeyboardButton(text="⏹ СТОП", callback_data="stop_search")],
     ])
 
 def menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Поиск", callback_data="search_mode_select")],
-        [InlineKeyboardButton(text="Меню",  callback_data="menu")],
+        [InlineKeyboardButton(text="🔍 Поиск", callback_data="search_mode_select")],
+        [InlineKeyboardButton(text="🏠 Меню",  callback_data="menu")],
     ])
+
+def _expand_who(ch):
+    return "girls" if ch in ("g", "girls") else "all"
+
+def _expand_stype(ch):
+    return "profile" if ch in ("p", "profile") else "market"
 
 def owner_card_kb(username, profile_url, owner_uid, nft_url_for_msg=None, nft_count=0):
     btns = []
@@ -990,7 +1145,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         shuffled_ids = list(gift_ids)
         random.shuffle(shuffled_ids)
 
-        PARALLEL = 16
+        PARALLEL = 24
         for i in range(0, len(shuffled_ids), PARALLEL):
             if not is_searching:
                 break
@@ -1004,11 +1159,16 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                     oid = item["owner_id"]
                     if not oid or oid in owners_index:
                         continue
+                    # Быстрый pre-filter по региону/девушке ещё до тяжёлой проверки профиля
+                    if region != "any" and not region_match_full(item["owner"], item["username"], item["name"], region):
+                        continue
+                    if girls_only and not is_girl(item["owner"], item["username"], item["name"]):
+                        continue
                     owners_index[oid] = {
                         "owner": item["owner"], "username": item["username"],
                         "name": item["name"], "profile_url": item["profile_url"],
                     }
-            if len(owners_index) >= 50000:
+            if len(owners_index) >= 80000:
                 break
 
         await status_msg.edit_text(
@@ -1054,12 +1214,12 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                 ("https://t.me/" + username) if username else ("tg://user?id=" + str(uid))
             )
 
-            if not await region_match_async(owner_obj, username, name, region, uid=uid):
+            if not region_match_full(owner_obj, username, name, region):
                 return
-            if girls_only and not await is_girl_async(owner_obj, username, name, uid=uid):
+            if girls_only and not is_girl(owner_obj, username, name):
                 return
 
-            saved = await fetch_saved_gifts(uid, max_pages=5)
+            saved = await fetch_saved_gifts(uid, max_pages=3)
             if not saved:
                 return
 
@@ -1109,14 +1269,14 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             except Exception as e:
                 logger.warning("profile send: %s", e)
 
-        PARALLEL_CHECK = 16
+        PARALLEL_CHECK = 24
         for i in range(0, len(owner_list), PARALLEL_CHECK):
             if not is_searching or found[0] >= max_results:
                 break
             batch = owner_list[i:i+PARALLEL_CHECK]
             await asyncio.gather(*[check_one(uid, info) for uid, info in batch])
             if is_searching and found[0] < max_results:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.05)
 
     except Exception as e:
         logger.error("do_profile_search: %s", e)
@@ -1208,7 +1368,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         except Exception as e:
             logger.warning("send_owner: %s", e)
         # Равномерная пауза между результатами
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.03)
 
     async def flush_ready():
         async with lock:
@@ -1258,9 +1418,9 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
 
                 if cat and fl and price and not price_ok(price, fl, boost):
                     continue
-                if not await region_match_async(item["owner"], item["username"], item["name"], region, uid=oid):
+                if not region_match_full(item["owner"], item["username"], item["name"], region):
                     continue
-                if girls_only and not await is_girl_async(item["owner"], item["username"], item["name"], uid=oid):
+                if girls_only and not is_girl(item["owner"], item["username"], item["name"]):
                     continue
 
                 async with lock:
@@ -1295,20 +1455,26 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         valid_pairs = [(gid, title) for gid, title in ALL_GIFT_IDS if gid in gift_ids] if ALL_GIFT_IDS else [(gid, "") for gid in gift_ids]
         random.shuffle(valid_pairs)
 
-        # Предварительно загружаем floor для всех коллекций параллельно (ускоряет cat-поиск)
+        # Предварительно загружаем floor пачками (быстрее старт выдачи)
         if cat:
-            all_gids = [gid for gid, _ in valid_pairs]
-            floors = await asyncio.gather(*[get_floor(gid) for gid in all_gids], return_exceptions=True)
-            # Фильтруем коллекции: оставляем только те у которых floor в нужной категории
+            title_map = {gid: title for gid, title in valid_pairs}
+            all_gids = list(title_map.keys())
+            FLOOR_BATCH = 32
             filtered = []
-            for (gid, title), fl in zip(valid_pairs, floors):
-                if isinstance(fl, Exception) or fl is None:
-                    filtered.append((gid, title))  # нет данных — всё равно пробуем
-                elif floor_in_cat(fl, cat):
-                    filtered.append((gid, title))
+            for fi in range(0, len(all_gids), FLOOR_BATCH):
+                if not is_searching:
+                    break
+                batch_g = all_gids[fi:fi+FLOOR_BATCH]
+                floors = await asyncio.gather(*[get_floor(gid) for gid in batch_g], return_exceptions=True)
+                for gid, fl in zip(batch_g, floors):
+                    title = title_map.get(gid, "")
+                    if isinstance(fl, Exception) or fl is None:
+                        filtered.append((gid, title))
+                    elif floor_in_cat(fl, cat):
+                        filtered.append((gid, title))
             valid_pairs = filtered
 
-        PARALLEL = 16
+        PARALLEL = 24
 
         for i in range(0, len(valid_pairs), PARALLEL):
             if not is_searching or found[0] >= max_results:
@@ -1364,9 +1530,9 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                     if slug:
                         seen_slugs.add(slug)
 
-                if not await region_match_async(item["owner"], item["username"], item["name"], region, uid=oid):
+                if not region_match_full(item["owner"], item["username"], item["name"], region):
                     continue
-                if girls_only and not await is_girl_async(item["owner"], item["username"], item["name"], uid=oid):
+                if girls_only and not is_girl(item["owner"], item["username"], item["name"]):
                     continue
 
                 async with lock:
@@ -1400,7 +1566,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                     stats["found"] += 1
                 except Exception as e:
                     logger.warning("model send: %s", e)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.03)
 
             if not nxt:
                 break
@@ -1410,7 +1576,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
         await status_msg.edit_text("<b>Идёт поиск по маркету...</b>", parse_mode="HTML", reply_markup=stop_kb())
         valid_ids = list(gift_ids)
         random.shuffle(valid_ids)
-        PARALLEL = 16
+        PARALLEL = 24
 
         for i in range(0, len(valid_ids), PARALLEL):
             if not is_searching or found[0] >= max_results:
@@ -1443,16 +1609,13 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
         shuffled_ids = list(gift_ids)
         random.shuffle(shuffled_ids)
 
-        # Берём владельцев с маркета — несколько страниц для расширения базы
-        PARALLEL = 16
+        # Берём владельцев с маркета — расширяем базу
+        PARALLEL = 24
         for i in range(0, len(shuffled_ids), PARALLEL):
             if not is_searching:
                 break
             batch = shuffled_ids[i:i+PARALLEL]
-            # Берём 3 страницы каждой коллекции для большей базы
-            tasks = []
-            for gid in batch:
-                tasks.append(fetch_market_page(gid, "", limit=100))
+            tasks = [fetch_market_page(gid, "", limit=100) for gid in batch]
             pages = await asyncio.gather(*tasks, return_exceptions=True)
             for _gid, res in zip(batch, pages):
                 if isinstance(res, Exception):
@@ -1462,11 +1625,15 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                     oid = item["owner_id"]
                     if not oid or oid in owners_index:
                         continue
+                    if region != "any" and not region_match_full(item["owner"], item["username"], item["name"], region):
+                        continue
+                    if girls_only and not is_girl(item["owner"], item["username"], item["name"]):
+                        continue
                     owners_index[oid] = {
                         "owner": item["owner"], "username": item["username"],
                         "name": item["name"], "profile_url": item["profile_url"],
                     }
-            if len(owners_index) >= 50000:
+            if len(owners_index) >= 80000:
                 break
 
         await status_msg.edit_text(
@@ -1512,12 +1679,12 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                 ("https://t.me/" + username) if username else ("tg://user?id=" + str(uid))
             )
 
-            if not await region_match_async(owner_obj, username, name, region, uid=uid):
+            if not region_match_full(owner_obj, username, name, region):
                 return
-            if girls_only and not await is_girl_async(owner_obj, username, name, uid=uid):
+            if girls_only and not is_girl(owner_obj, username, name):
                 return
 
-            saved = await fetch_saved_gifts(uid, max_pages=5)
+            saved = await fetch_saved_gifts(uid, max_pages=3)
             if not saved:
                 return
 
@@ -1564,14 +1731,14 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             except Exception as e:
                 logger.warning("profile_model send: %s", e)
 
-        PARALLEL_CHECK = 16
+        PARALLEL_CHECK = 24
         for i in range(0, len(owner_list), PARALLEL_CHECK):
             if not is_searching or found[0] >= max_results:
                 break
             batch = owner_list[i:i+PARALLEL_CHECK]
             await asyncio.gather(*[check_one(uid, info) for uid, info in batch])
             if is_searching and found[0] < max_results:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.05)
 
     except Exception as e:
         logger.error("do_profile_model_search: %s", e)
@@ -1997,90 +2164,52 @@ async def cb_menu(cb: CallbackQuery, state: FSMContext):
     mn   = get_min_gifts(uid)
     mx   = get_max_gifts(uid)
     mx_s = str(mx) if mx > 0 else "без лимита"
-    try:
-        await cb.message.edit_text(
-            "<b>Neptun Parser\n\n"
-            "Мин. гифтов: " + str(mn) + "\n"
-            "Макс. гифтов: " + mx_s + "\n\n"
-            "Выбери действие:</b>",
-            parse_mode="HTML", reply_markup=main_menu_kb()
-        )
-    except Exception:
-        await cb.message.answer(
-            "<b>Neptun Parser\n\n"
-            "Мин. гифтов: " + str(mn) + "\n"
-            "Макс. гифтов: " + mx_s + "\n\n"
-            "Выбери действие:</b>",
-            parse_mode="HTML", reply_markup=main_menu_kb()
-        )
     await cb.answer()
+    await safe_edit(
+        cb.message,
+        "<b>Neptun Parser\n\n"
+        "Мин. гифтов: " + str(mn) + "\n"
+        "Макс. гифтов: " + mx_s + "\n\n"
+        "Выбери действие:</b>",
+        reply_markup=main_menu_kb(),
+    )
 
 @dp.callback_query(F.data == "search_mode_select")
 async def cb_search_mode(cb: CallbackQuery):
-    try:
-        await cb.message.edit_text("<b>Выбери режим поиска:</b>",
-                                   parse_mode="HTML", reply_markup=search_mode_select_kb())
-    except Exception:
-        await cb.message.answer("<b>Выбери режим поиска:</b>",
-                                parse_mode="HTML", reply_markup=search_mode_select_kb())
     await cb.answer()
+    await safe_edit(cb.message, "<b>Выбери режим поиска:</b>", reply_markup=search_mode_select_kb())
 
 @dp.callback_query(F.data == "mode_market")
 async def cb_mode_market(cb: CallbackQuery):
-    try:
-        await cb.message.edit_text("<b>Маркет — выбери ценовую категорию:</b>",
-                                   parse_mode="HTML", reply_markup=cat_kb("market"))
-    except Exception:
-        await cb.message.answer("<b>Маркет — выбери ценовую категорию:</b>",
-                                parse_mode="HTML", reply_markup=cat_kb("market"))
     await cb.answer()
+    await safe_edit(cb.message, "<b>Маркет — выбери ценовую категорию:</b>", reply_markup=cat_kb("market"))
 
 @dp.callback_query(F.data == "mode_profile")
 async def cb_mode_profile(cb: CallbackQuery):
-    try:
-        await cb.message.edit_text("<b>Профиль — выбери ценовую категорию:</b>",
-                                   parse_mode="HTML", reply_markup=cat_kb("profile"))
-    except Exception:
-        await cb.message.answer("<b>Профиль — выбери ценовую категорию:</b>",
-                                parse_mode="HTML", reply_markup=cat_kb("profile"))
     await cb.answer()
+    await safe_edit(cb.message, "<b>Профиль — выбери ценовую категорию:</b>", reply_markup=cat_kb("profile"))
 
 @dp.callback_query(F.data == "mode_model")
 async def cb_mode_model(cb: CallbackQuery):
     if not ALL_GIFT_IDS:
         await cb.answer("Коллекции не загружены", show_alert=True)
         return
-    try:
-        await cb.message.edit_text("<b>По модели — выбери тип поиска:</b>",
-                                   parse_mode="HTML", reply_markup=model_search_type_kb())
-    except Exception:
-        await cb.message.answer("<b>По модели — выбери тип поиска:</b>",
-                                parse_mode="HTML", reply_markup=model_search_type_kb())
     await cb.answer()
+    await safe_edit(cb.message, "<b>По модели — выбери тип поиска:</b>", reply_markup=model_search_type_kb())
 
 @dp.callback_query(F.data.startswith("mc_"))
 async def cb_mc(cb: CallbackQuery):
     cat = cb.data[3:]
     lbl = CAT_LABELS.get(cat, cat)
-    try:
-        await cb.message.edit_text("<b>Маркет / " + lbl + "\nКого искать?</b>",
-                                   parse_mode="HTML", reply_markup=who_kb("market", cat))
-    except Exception:
-        await cb.message.answer("<b>Маркет / " + lbl + "\nКого искать?</b>",
-                                parse_mode="HTML", reply_markup=who_kb("market", cat))
     await cb.answer()
+    await safe_edit(cb.message, "<b>Маркет / " + lbl + "\nКого искать?</b>", reply_markup=who_kb("market", cat))
 
 @dp.callback_query(F.data.startswith("pc_"))
 async def cb_pc(cb: CallbackQuery):
     cat = cb.data[3:]
     lbl = CAT_LABELS.get(cat, cat)
-    try:
-        await cb.message.edit_text("<b>Профиль / " + lbl + "\nКого искать?</b>",
-                                   parse_mode="HTML", reply_markup=who_kb("profile", cat))
-    except Exception:
-        await cb.message.answer("<b>Профиль / " + lbl + "\nКого искать?</b>",
-                                parse_mode="HTML", reply_markup=who_kb("profile", cat))
     await cb.answer()
+    await safe_edit(cb.message, "<b>Профиль / " + lbl + "\nКого искать?</b>", reply_markup=who_kb("profile", cat))
 
 @dp.callback_query(F.data.startswith("go_market_"))
 async def cb_go_market(cb: CallbackQuery, state: FSMContext):
@@ -2107,13 +2236,8 @@ async def cb_mdltype(cb: CallbackQuery):
         await cb.answer("Коллекции не загружены", show_alert=True)
         return
     lbl = "маркету" if search_type == "market" else "профилю"
-    try:
-        await cb.message.edit_text("<b>По модели / " + lbl + " — кого искать?</b>",
-                                   parse_mode="HTML", reply_markup=model_who_kb(search_type))
-    except Exception:
-        await cb.message.answer("<b>По модели / " + lbl + " — кого искать?</b>",
-                                parse_mode="HTML", reply_markup=model_who_kb(search_type))
     await cb.answer()
+    await safe_edit(cb.message, "<b>По модели / " + lbl + " — кого искать?</b>", reply_markup=model_who_kb(search_type))
 
 @dp.callback_query(F.data.startswith("mdlwho_"))
 async def cb_mdlwho(cb: CallbackQuery):
@@ -2130,32 +2254,57 @@ async def cb_mdlwho(cb: CallbackQuery):
         return
     lbl = "Девушки-модели" if who == "girls" else "Все модели"
     lbl2 = "маркету" if search_type == "market" else "профилю"
+    await cb.answer()
+    await safe_edit(
+        cb.message,
+        "<b>" + lbl + " / по " + lbl2 + " — выбери коллекцию:</b>",
+        reply_markup=model_col_kb(who, search_type, ALL_GIFT_IDS, page=0),
+    )
+
+@dp.callback_query(F.data.startswith("mdlpage_"))
+async def cb_mdlpage(cb: CallbackQuery):
+    # mdlpage_{w}_{t}_{page}  где w=a/g, t=m/p
+    rest = cb.data[len("mdlpage_"):]
+    parts = rest.split("_")
+    if len(parts) < 3:
+        await cb.answer()
+        return
+    who = _expand_who(parts[0])
+    search_type = _expand_stype(parts[1])
     try:
-        await cb.message.edit_text(
-            "<b>" + lbl + " / по " + lbl2 + " — выбери коллекцию:</b>",
-            parse_mode="HTML",
-            reply_markup=model_col_kb(who, search_type, ALL_GIFT_IDS)
-        )
-    except Exception:
-        await cb.message.answer(
-            "<b>" + lbl + " / по " + lbl2 + " — выбери коллекцию:</b>",
-            parse_mode="HTML",
-            reply_markup=model_col_kb(who, search_type, ALL_GIFT_IDS)
-        )
+        page = int(parts[2])
+    except ValueError:
+        await cb.answer()
+        return
+    if not ALL_GIFT_IDS:
+        await cb.answer("Коллекции не загружены", show_alert=True)
+        return
+    await cb.answer()
+    lbl = "Девушки-модели" if who == "girls" else "Все модели"
+    lbl2 = "маркету" if search_type == "market" else "профилю"
+    await safe_edit(
+        cb.message,
+        "<b>" + lbl + " / по " + lbl2 + " — выбери коллекцию:</b>",
+        reply_markup=model_col_kb(who, search_type, ALL_GIFT_IDS, page=page),
+    )
+
+@dp.callback_query(F.data == "noop")
+async def cb_noop(cb: CallbackQuery):
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("mdlrun_"))
 async def cb_mdlrun(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     rest = cb.data[len("mdlrun_"):]
-    # Формат: mdlrun_{who}_{search_type}_{gid|all}
+    # Формат короткий: mdlrun_{w}_{t}_{gid|all}  где w=a/g, t=m/p
+    # Также совместим со старым: mdlrun_{who}_{search_type}_{gid|all}
     parts = rest.split("_")
     if len(parts) < 3:
         await cb.answer()
         return
-    who         = parts[0]                     # "all" or "girls"
-    search_type = parts[1]                     # "market" or "profile"
-    gid_s       = "_".join(parts[2:])          # "all" or numeric id
+    who         = _expand_who(parts[0])
+    search_type = _expand_stype(parts[1])
+    gid_s       = "_".join(parts[2:])
     gid         = None if gid_s == "all" else int(gid_s)
     try:
         await cb.message.delete()
@@ -2171,19 +2320,12 @@ async def cb_mdl_who_legacy(cb: CallbackQuery):
         await cb.answer("Коллекции не загружены", show_alert=True)
         return
     lbl = "Девушки-модели" if who == "girls" else "Все модели"
-    try:
-        await cb.message.edit_text(
-            "<b>" + lbl + " — выбери коллекцию:</b>",
-            parse_mode="HTML",
-            reply_markup=model_col_kb(who, "market", ALL_GIFT_IDS)
-        )
-    except Exception:
-        await cb.message.answer(
-            "<b>" + lbl + " — выбери коллекцию:</b>",
-            parse_mode="HTML",
-            reply_markup=model_col_kb(who, "market", ALL_GIFT_IDS)
-        )
     await cb.answer()
+    await safe_edit(
+        cb.message,
+        "<b>" + lbl + " — выбери коллекцию:</b>",
+        reply_markup=model_col_kb(who, "market", ALL_GIFT_IDS, page=0),
+    )
 
 @dp.callback_query(F.data == "stop_search")
 async def cb_stop(cb: CallbackQuery):
@@ -2206,7 +2348,9 @@ async def cb_stats(cb: CallbackQuery):
     lim  = get_limit(uid)
     mx_s = str(mx) if mx > 0 else "без лимита"
     reg  = REGIONS.get(get_region(uid), {}).get("label", "Все страны")
-    await cb.message.answer(
+    await cb.answer()
+    await safe_edit(
+        cb.message,
         "<b>Статистика\n\n"
         "Поисков: " + str(stats["checks"]) + "\n"
         "Найдено: " + str(stats["found"]) + "\n"
@@ -2215,16 +2359,15 @@ async def cb_stats(cb: CallbackQuery):
         "Мин: " + str(mn) + "  Макс: " + mx_s + "\n"
         "Лимит: " + str(lim) + "\n"
         "Регион: " + reg + "</b>",
-        parse_mode="HTML"
+        reply_markup=main_menu_kb(),
     )
-    await cb.answer()
 
 @dp.callback_query(F.data.startswith("shownft_"))
 async def cb_show_nft(cb: CallbackQuery):
     uid    = int(cb.data[8:])
     cached = NFT_CACHE.get(uid)
     if not cached:
-        await cb.answer("Загружаю NFT...", show_alert=False)
+        await cb.answer("Загружаю NFT...")
         saved = await fetch_saved_gifts(uid)
         nfts  = [g for g in saved if g.get("nft_url")]
         if not nfts:
@@ -2255,20 +2398,20 @@ async def cb_settings(cb: CallbackQuery, state: FSMContext):
     mn   = get_min_gifts(uid)
     mx   = get_max_gifts(uid)
     mx_s = str(mx) if mx > 0 else "без лимита"
-    await cb.message.answer(
+    await cb.answer()
+    await safe_edit(
+        cb.message,
         "<b>Настройки поиска\n\n"
         "Мин. гифтов: " + str(mn) + "\n"
         "Макс. гифтов: " + mx_s + "</b>",
-        parse_mode="HTML", reply_markup=settings_menu_kb(uid)
+        reply_markup=settings_menu_kb(uid),
     )
-    await cb.answer()
 
 @dp.callback_query(F.data == "set_min")
 async def cb_set_min(cb: CallbackQuery, state: FSMContext):
-    await cb.message.answer("<b>Введи минимум гифтов (число от 1):</b>",
-                            parse_mode="HTML", reply_markup=input_cancel_kb())
-    await state.set_state(SetMin.value)
     await cb.answer()
+    await safe_edit(cb.message, "<b>Введи минимум гифтов (число от 1):</b>", reply_markup=input_cancel_kb())
+    await state.set_state(SetMin.value)
 
 @dp.message(SetMin.value)
 async def set_min_txt(message: Message, state: FSMContext):
@@ -2283,10 +2426,9 @@ async def set_min_txt(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "set_max")
 async def cb_set_max(cb: CallbackQuery, state: FSMContext):
-    await cb.message.answer("<b>Введи максимум гифтов (0 = без лимита):</b>",
-                            parse_mode="HTML", reply_markup=input_cancel_kb())
-    await state.set_state(SetMax.value)
     await cb.answer()
+    await safe_edit(cb.message, "<b>Введи максимум гифтов (0 = без лимита):</b>", reply_markup=input_cancel_kb())
+    await state.set_state(SetMax.value)
 
 @dp.message(SetMax.value)
 async def set_max_txt(message: Message, state: FSMContext):
@@ -2302,26 +2444,26 @@ async def set_max_txt(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "set_boost")
 async def cb_set_boost(cb: CallbackQuery):
-    await cb.message.answer("<b>Буст цен\n100% = до x2 флора  200% = до x3</b>",
-                            parse_mode="HTML", reply_markup=boost_kb())
     await cb.answer()
+    await safe_edit(cb.message, "<b>Буст цен\n100% = до x2 флора  200% = до x3</b>", reply_markup=boost_kb())
 
 @dp.callback_query(F.data.startswith("bst_"))
 async def cb_bst(cb: CallbackQuery, state: FSMContext):
     raw = cb.data[4:]
     if raw == "custom":
-        await cb.message.answer("<b>Введи буст вручную (число %):</b>",
-                                parse_mode="HTML", reply_markup=input_cancel_kb())
-        await state.set_state(SetBoost.value)
         await cb.answer()
+        await safe_edit(cb.message, "<b>Введи буст вручную (число %):</b>", reply_markup=input_cancel_kb())
+        await state.set_state(SetBoost.value)
         return
     val = int(raw)
     USER_BOOST[cb.from_user.id] = val
-    await cb.answer("Буст: " + str(val) + "%", show_alert=True)
-    try:
-        await cb.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+    await cb.answer("Буст: " + str(val) + "%")
+    uid = cb.from_user.id
+    await safe_edit(
+        cb.message,
+        "<b>Буст: " + str(val) + "%\n\nНастройки поиска</b>",
+        reply_markup=settings_menu_kb(uid),
+    )
 
 @dp.message(SetBoost.value)
 async def set_boost_txt(message: Message, state: FSMContext):
@@ -2337,26 +2479,25 @@ async def set_boost_txt(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "set_limit")
 async def cb_set_limit(cb: CallbackQuery):
     lim = get_limit(cb.from_user.id)
-    await cb.message.answer("<b>Лимит выдачи результатов:</b>",
-                            parse_mode="HTML", reply_markup=limit_kb(lim))
     await cb.answer()
+    await safe_edit(cb.message, "<b>Лимит выдачи результатов:</b>", reply_markup=limit_kb(lim))
 
 @dp.callback_query(F.data.startswith("lim_"))
 async def cb_lim(cb: CallbackQuery):
     val = int(cb.data[4:])
     USER_LIMIT[cb.from_user.id] = val
-    await cb.answer("Лимит: " + str(val), show_alert=False)
-    try:
-        await cb.message.edit_reply_markup(reply_markup=limit_kb(val))
-    except Exception:
-        pass
+    await cb.answer("Лимит: " + str(val))
+    await safe_edit(
+        cb.message,
+        "<b>Лимит: " + str(val) + "\n\nНастройки поиска</b>",
+        reply_markup=settings_menu_kb(cb.from_user.id),
+    )
 
 @dp.callback_query(F.data == "set_region")
 async def cb_set_region(cb: CallbackQuery):
     reg = get_region(cb.from_user.id)
-    await cb.message.answer("<b>Выбери регион поиска:</b>",
-                            parse_mode="HTML", reply_markup=region_kb(reg))
     await cb.answer()
+    await safe_edit(cb.message, "<b>Выбери регион поиска:</b>", reply_markup=region_kb(reg))
 
 @dp.callback_query(F.data.startswith("reg_"))
 async def cb_reg(cb: CallbackQuery):
@@ -2366,11 +2507,12 @@ async def cb_reg(cb: CallbackQuery):
         return
     USER_REGION[cb.from_user.id] = key
     lbl = REGIONS[key]["label"]
-    await cb.answer("Регион: " + lbl, show_alert=False)
-    try:
-        await cb.message.edit_reply_markup(reply_markup=region_kb(key))
-    except Exception:
-        pass
+    await cb.answer("Регион: " + lbl)
+    await safe_edit(
+        cb.message,
+        "<b>Регион: " + lbl + "\n\nНастройки поиска</b>",
+        reply_markup=settings_menu_kb(cb.from_user.id),
+    )
 
 
 # ── CALLBACKS: ADMIN ──────────────────────────────────────────────────────────
