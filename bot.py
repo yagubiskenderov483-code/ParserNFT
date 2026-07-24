@@ -966,9 +966,9 @@ def price_in_cat(price, cat):
 def price_ok(price, floor, boost):
     if not price or not floor:
         return True
-    # Шире окно — иначе свежие лоты часто отсекаются
-    lo = floor * 0.5
-    hi = floor * (1.0 + max(boost, 50) / 100.0) * 1.5
+    # Очень широкое окно: буст режет только явный перекуп относительно флора
+    lo = floor * 0.3
+    hi = floor * (1.0 + max(boost, 50) / 100.0) * 3.0
     return lo <= price <= hi
 
 def cache_owner(uid, owner, username, name, profile_url, items):
@@ -1799,8 +1799,9 @@ def load_seen_into_memory():
     """Быстрая загрузка антидубля в RAM при старте."""
     global SEEN_GLOBAL, SEEN_GIFTS
     conn = _db()
-    SEEN_GLOBAL = {r[0] for r in conn.execute("SELECT key FROM seen_owners")}
-    SEEN_GIFTS = {r[0] for r in conn.execute("SELECT slug FROM seen_gifts")}
+    with _db_lock:
+        SEEN_GLOBAL = {r[0] for r in conn.execute("SELECT key FROM seen_owners")}
+        SEEN_GIFTS = {r[0] for r in conn.execute("SELECT slug FROM seen_gifts")}
     logger.info("Seen loaded: owners=%s gifts=%s", len(SEEN_GLOBAL), len(SEEN_GIFTS))
 
 def clear_seen_db():
@@ -1864,9 +1865,10 @@ def save_pricenft_db():
 def pricenft_db_stats():
     try:
         conn = _db()
-        models = conn.execute("SELECT COUNT(DISTINCT model) FROM gifts").fetchone()[0] or 0
-        users = conn.execute("SELECT COUNT(DISTINCT lower(username)) FROM gifts WHERE username IS NOT NULL AND username!=''").fetchone()[0] or 0
-        nfts = conn.execute("SELECT COUNT(*) FROM gifts").fetchone()[0] or 0
+        with _db_lock:
+            models = conn.execute("SELECT COUNT(DISTINCT model) FROM gifts").fetchone()[0] or 0
+            users = conn.execute("SELECT COUNT(DISTINCT lower(username)) FROM gifts WHERE username IS NOT NULL AND username!=''").fetchone()[0] or 0
+            nfts = conn.execute("SELECT COUNT(*) FROM gifts").fetchone()[0] or 0
         return {
             "models": int(models),
             "users": int(users),
@@ -2027,13 +2029,22 @@ def item_matches_collections(item, allowed_gids=None, allowed_titles=None):
         return True
     return False
 
+
+class _LockedDB:
+    """Обёртка: каждый execute под _db_lock."""
+    def __init__(self, conn):
+        self._c = conn
+    def execute(self, *a, **k):
+        with _db_lock:
+            return self._c.execute(*a, **k)
+
 def random_from_pricenft_db(limit=25, model=None, exact=False):
     """
     Быстрый рандом из sqlite.
     exact=True — только точное имя модели (для поиска по конкретной коллекции).
     """
     load_pricenft_db(force=False)
-    conn = _db()
+    conn = _LockedDB(_db())
     results = []
     seen_u = set()
     try:
@@ -2117,7 +2128,7 @@ def random_users_from_db(limit=400, models=None):
     out = []
     norms = {_norm_col_name(m) for m in (models or []) if _norm_col_name(m)}
     try:
-        conn = _db()
+        conn = _LockedDB(_db())
         rows = []
         if norms:
             # сначала пробуем точные имена моделей
@@ -3295,12 +3306,9 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                 tmp = {"owner": owner_obj, "owner_id": uid, "username": username, "name": name}
                 try:
                     res = await enrich_owner_for_weird(tmp)
-                    if res is None:
+                    if res is not True:
                         async with weird_lock:
                             weird_checks[0] = max(0, weird_checks[0] - 1)
-                        stats_skip["girl"] += 1
-                        return
-                    if not res:
                         stats_skip["girl"] += 1
                         return
                     owner_obj = tmp.get("owner") or owner_obj
@@ -3431,7 +3439,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                     )
                 except Exception:
                     pass
-                return 0
+                return -1  # сигнал _start_profile: не перетирать сообщение
         else:
             allowed_gids = set(int(g) for g in (gift_ids or []))
             title_by = {gid: title for gid, title in ALL_GIFT_IDS}
@@ -3569,11 +3577,9 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                                     continue
                                 try:
                                     res = await enrich_owner_for_weird(tmp)
-                                    if res is None:
+                                    if res is not True:
                                         async with weird_lock:
                                             weird_checks[0] = max(0, weird_checks[0] - 1)
-                                        continue
-                                    if not res:
                                         continue
                                     owner_obj = tmp.get("owner") or owner_obj
                                     username = tmp.get("username") or username
@@ -3591,7 +3597,8 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                         if is_trader_account(owner_obj, username, name):
                             continue
                         saved = await fetch_saved_gifts(
-                            peer, max_pages=1, only_off_market=True, require_zero_on_market=True
+                            peer, max_pages=1, only_off_market=True,
+                            require_zero_on_market=use_global_seen,
                         )
                         if saved is None or not saved:
                             continue
@@ -3887,8 +3894,11 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                     item["title"] = title
                 if not pass_filters(item):
                     continue
-                if floor is not None and not price_ok(item.get("price"), floor, boost):
-                    continue
+                # при выбранной ценовой категории абсолютный фильтр уже в pass_filters;
+                # price_ok(floor) иначе убивает extreme/ultra на дешёвых коллекциях
+                if (not cat or cat in ("any", "all", "none")) and floor is not None:
+                    if not price_ok(item.get("price"), floor, boost):
+                        continue
                 if not item.get("owner_id") and not item.get("username"):
                     continue
                 out.append(item)
@@ -4561,51 +4571,62 @@ async def _start_market(cb, cat, who="all"):
     if token is None:
         await cb.answer("Поиск уже идёт! Нажми Стоп или /clear", show_alert=True)
         return
-    await cb.answer("Запускаю...")
-    stats["checks"] += 1
-    uid = cb.from_user.id
-    ids = await ensure_collections()
-    if not ids:
-        end_search(chat_id, token)
-        await bot.send_message(chat_id, "<b>Коллекции не загружены. Авторизуй Telethon в /admin</b>",
-                               parse_mode="HTML", reply_markup=menu_kb())
-        return
-    boost = get_boost(uid)
-    lim = get_limit(uid)
-    reg = get_region(uid)
-    cat_l = CAT_LABELS.get(cat, "Все")
-    who_l = who_label(who)
-    reg_l = REGIONS.get(reg, {}).get("label", "Все страны")
-    bst = get_boost(uid)
-    txt = (
-        "<b>Маркет / " + cat_l + " / " + who_l + "\n"
-        "Режим: свежие лоты · буст флора: " + str(bst) + "%\n"
-        "Регион: " + reg_l + "\n"
-        "Карточек за поиск: " + str(lim) + " (макс)</b>"
-    )
-    status = await bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=stop_kb())
+    status = None
     try:
-        found = await asyncio.wait_for(
-            do_market_search(status, ids, cat=cat, who=who,
-                             boost=boost, max_results=lim, region=reg,
-                             chat_id=chat_id, search_token=token),
-            timeout=600
+        await cb.answer("Запускаю...")
+        stats["checks"] += 1
+        uid = cb.from_user.id
+        ids = await ensure_collections()
+        if not ids:
+            await bot.send_message(chat_id, "<b>Коллекции не загружены. Авторизуй Telethon в /admin</b>",
+                                   parse_mode="HTML", reply_markup=menu_kb())
+            return
+        boost = get_boost(uid)
+        lim = get_limit(uid)
+        reg = get_region(uid)
+        cat_l = CAT_LABELS.get(cat, "Все")
+        who_l = who_label(who)
+        reg_l = REGIONS.get(reg, {}).get("label", "Все страны")
+        bst = get_boost(uid)
+        txt = (
+            "<b>Маркет / " + cat_l + " / " + who_l + "\n"
+            "Режим: свежие лоты · буст флора: " + str(bst) + "%\n"
+            "Регион: " + reg_l + "\n"
+            "Карточек за поиск: " + str(lim) + " (макс)</b>"
         )
-    except asyncio.TimeoutError:
-        end_search(chat_id, token)
-        found = 0
-    except Exception as e:
-        end_search(chat_id, token)
-        found = 0
-        logger.error("_start_market: %s", e)
-    done = "<b>✅ Поиск закончен\nМаркет / " + cat_l + " / " + who_l + "\nНайдено: " + str(found) + "</b>"
-    try:
-        await status.edit_text(done, parse_mode="HTML", reply_markup=menu_kb())
-    except Exception:
+        status = await bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=stop_kb())
         try:
-            await bot.send_message(chat_id, done, parse_mode="HTML", reply_markup=menu_kb())
+            found = await asyncio.wait_for(
+                do_market_search(status, ids, cat=cat, who=who,
+                                 boost=boost, max_results=lim, region=reg,
+                                 chat_id=chat_id, search_token=token),
+                timeout=600
+            )
+        except asyncio.TimeoutError:
+            end_search(chat_id, token)
+            found = 0
+        except Exception as e:
+            end_search(chat_id, token)
+            found = 0
+            logger.error("_start_market: %s", e)
+        done = "<b>✅ Поиск закончен\nМаркет / " + cat_l + " / " + who_l + "\nНайдено: " + str(found) + "</b>"
+        try:
+            await status.edit_text(done, parse_mode="HTML", reply_markup=menu_kb())
+        except Exception:
+            try:
+                await bot.send_message(chat_id, done, parse_mode="HTML", reply_markup=menu_kb())
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error("_start_market setup: %s", e)
+        try:
+            await bot.send_message(chat_id, "<b>Ошибка запуска: " + esc(str(e)) + "</b>",
+                                   parse_mode="HTML", reply_markup=menu_kb())
         except Exception:
             pass
+    finally:
+        # токен мог остаться если упали до do_* или wait_for отменил без finally do_*
+        end_search(chat_id, token)
 
 async def _start_profile(cb, cat, who="all"):
     chat_id = cb.message.chat.id
@@ -4613,54 +4634,65 @@ async def _start_profile(cb, cat, who="all"):
     if token is None:
         await cb.answer("Поиск уже идёт! Нажми Стоп или /clear", show_alert=True)
         return
-    await cb.answer("Запускаю...")
-    stats["checks"] += 1
-    uid = cb.from_user.id
-    ids = await ensure_collections()
-    if not ids:
-        end_search(chat_id, token)
-        await cb.message.answer("<b>Коллекции не загружены.</b>", parse_mode="HTML", reply_markup=menu_kb())
-        return
-    mn = get_min_gifts(uid)
-    mx = get_max_gifts(uid)
-    lim = get_limit(uid)
-    reg = get_region(uid)
-    mx_s = str(mx) if mx > 0 else "без лимита"
-    cat_l = CAT_LABELS.get(cat, "Все")
-    who_l = who_label(who)
-    reg_l = REGIONS.get(reg, {}).get("label", "Все страны")
-    txt = (
-        "<b>Профиль / " + cat_l + " / " + who_l + "\n"
-        "Режим: строго 0 гифтов на маркете\n"
-        "Фильтр цены: флор коллекции NFT\n"
-        "Регион: " + reg_l + "\n"
-        "Мин. NFT в профиле: " + str(mn) + " (" + mx_s + ")\n"
-        "Лимит выдачи: " + str(lim) + "</b>"
-    )
-    status = await cb.message.answer(txt, parse_mode="HTML", reply_markup=stop_kb())
     try:
-        found = await asyncio.wait_for(
-            do_profile_search(status, ids, cat=cat, who=who,
-                              min_gifts=mn, max_gifts=mx,
-                              max_results=lim, region=reg,
-                              chat_id=chat_id, search_token=token),
-            timeout=600,
+        await cb.answer("Запускаю...")
+        stats["checks"] += 1
+        uid = cb.from_user.id
+        ids = await ensure_collections()
+        if not ids:
+            await cb.message.answer("<b>Коллекции не загружены.</b>", parse_mode="HTML", reply_markup=menu_kb())
+            return
+        mn = get_min_gifts(uid)
+        mx = get_max_gifts(uid)
+        lim = get_limit(uid)
+        reg = get_region(uid)
+        mx_s = str(mx) if mx > 0 else "без лимита"
+        cat_l = CAT_LABELS.get(cat, "Все")
+        who_l = who_label(who)
+        reg_l = REGIONS.get(reg, {}).get("label", "Все страны")
+        txt = (
+            "<b>Профиль / " + cat_l + " / " + who_l + "\n"
+            "Режим: строго 0 гифтов на маркете\n"
+            "Фильтр цены: флор коллекции NFT\n"
+            "Регион: " + reg_l + "\n"
+            "Мин. NFT в профиле: " + str(mn) + " (" + mx_s + ")\n"
+            "Лимит выдачи: " + str(lim) + "</b>"
         )
-    except asyncio.TimeoutError:
-        end_search(chat_id, token)
-        found = 0
-    except Exception as e:
-        end_search(chat_id, token)
-        found = 0
-        logger.error("_start_profile: %s", e)
-    done = "<b>✅ Поиск закончен\nПрофиль / " + cat_l + " / " + who_l + "\nНайдено: " + str(found) + "</b>"
-    try:
-        await status.edit_text(done, parse_mode="HTML", reply_markup=menu_kb())
-    except Exception:
+        status = await cb.message.answer(txt, parse_mode="HTML", reply_markup=stop_kb())
         try:
-            await bot.send_message(chat_id, done, parse_mode="HTML", reply_markup=menu_kb())
+            found = await asyncio.wait_for(
+                do_profile_search(status, ids, cat=cat, who=who,
+                                  min_gifts=mn, max_gifts=mx,
+                                  max_results=lim, region=reg,
+                                  chat_id=chat_id, search_token=token),
+                timeout=600,
+            )
+        except asyncio.TimeoutError:
+            end_search(chat_id, token)
+            found = 0
+        except Exception as e:
+            end_search(chat_id, token)
+            found = 0
+            logger.error("_start_profile: %s", e)
+        if found == -1:
+            return
+        done = "<b>✅ Поиск закончен\nПрофиль / " + cat_l + " / " + who_l + "\nНайдено: " + str(found) + "</b>"
+        try:
+            await status.edit_text(done, parse_mode="HTML", reply_markup=menu_kb())
+        except Exception:
+            try:
+                await bot.send_message(chat_id, done, parse_mode="HTML", reply_markup=menu_kb())
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error("_start_profile setup: %s", e)
+        try:
+            await bot.send_message(chat_id, "<b>Ошибка запуска: " + esc(str(e)) + "</b>",
+                                   parse_mode="HTML", reply_markup=menu_kb())
         except Exception:
             pass
+    finally:
+        end_search(chat_id, token)
 
 async def _start_model(cb, who="all", single_gid=None, search_type="market",
                        already_answered=False, skip_begin=False, girls=False,
