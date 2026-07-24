@@ -2637,12 +2637,6 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                 for w in sw:
                     w.cancel()
 
-        # ждём основные воркеры
-        try:
-            await asyncio.wait_for(asyncio.gather(*workers, return_exceptions=True), timeout=30)
-        except asyncio.TimeoutError:
-            for w in workers:
-                w.cancel()
         logger.info("profile_search done found=%s skips=%s checked=%s", found[0], stats_skip, len(checked))
     except Exception as e:
         logger.error("do_profile_search: %s", e)
