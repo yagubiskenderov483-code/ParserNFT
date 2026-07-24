@@ -4446,7 +4446,7 @@ async def cb_admin_stats(cb: CallbackQuery):
         "Найдено: " + str(stats["found"]) + "\n"
         "Коллекций: " + str(len(ALL_GIFT_IDS)) + "\n"
         "PriceNFT БД: " + str(pn.get("models", 0)) + " моделей / "
-        + str(pn.get("users", 0)) + " юзеров / "
+        + str(pn.get("users", 0)) + " юзеров (цель " + str(DB_TARGET_USERS) + ") / "
         + str(pn.get("nfts", 0)) + " nft\n"
         "Антидубль: " + str(pn.get("seen_owners", 0)) + " аккаунтов / "
         + str(pn.get("seen_gifts", 0)) + " гифтов</b>",
