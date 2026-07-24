@@ -57,6 +57,7 @@ DEFAULT_MIN_GIFTS = 1
 DEFAULT_MAX_GIFTS = 5
 DEFAULT_LIMIT     = 30
 DEFAULT_REGION    = "any"
+DB_TARGET_USERS   = 100_000   # цель локальной БД владельцев
 
 # Глобальный антидубль (персистентный, между поисками)
 SEEN_GLOBAL: set = set()          # owner keys: uid или u:username
@@ -710,6 +711,29 @@ def floor_in_cat(floor, cat):
         return False
     return True
 
+def price_in_cat(price, cat):
+    """Фильтр по цене лота (не по floor коллекции) — иначе маркет пустой."""
+    if not cat or cat in ("any", "all", "none"):
+        return True
+    if price is None:
+        return True
+    try:
+        price = int(price)
+    except Exception:
+        return True
+    CATS = {
+        "cheap":   (0,      2000),
+        "mid":     (2000,   5000),
+        "hard":    (5000,   20000),
+        "ultra":   (20000,  100000),
+        "extreme": (100000, 10**12),
+    }
+    c = CATS.get(cat)
+    if not c:
+        return True
+    mn, mx = c
+    return mn <= price <= mx
+
 def price_ok(price, floor, boost):
     if not price or not floor:
         return True
@@ -996,12 +1020,12 @@ def admin_kb():
     seen_n = int(st.get("seen_owners", 0) or 0)
     if _pricenft_collecting:
         db_btn = InlineKeyboardButton(
-            text="⏹ Стоп сбор БД (" + str(users_n) + " юзеров)",
+            text="⏹ Стоп сбор БД (" + str(users_n) + "/" + str(DB_TARGET_USERS) + ")",
             callback_data="admin_pricenft_stop",
         )
     else:
         db_btn = InlineKeyboardButton(
-            text="📦 База данных PriceNFT (" + str(users_n) + ")",
+            text="📦 База данных (" + str(users_n) + " / " + str(DB_TARGET_USERS) + ")",
             callback_data="admin_pricenft_collect",
         )
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1803,13 +1827,20 @@ async def _pricenft_click_or_send(msg, text):
     await _pricenft_send(text)
     return True
 
-async def fill_db_from_market_fast(progress_cb=None, parallel=22):
-    """Быстрое наполнение БД с маркета (без PriceNFTbot / без ResolveUsername)."""
+async def fill_db_from_market_fast(progress_cb=None, parallel=24, target_users=None):
+    """
+    Быстрое наполнение БД с маркета до цели (по умолчанию 100к юзеров).
+    Несколько кругов по коллекциям + пагинация. Можно Стопнуть.
+    """
+    if target_users is None:
+        target_users = DB_TARGET_USERS
     await ensure_collections()
     load_pricenft_db()
     pairs = list(ALL_GIFT_IDS)
-    random.shuffle(pairs)
+    if not pairs:
+        return {"ok": False, "error": "no_collections", **pricenft_db_stats()}
     total = 0
+    rounds = 0
 
     async def prog(t):
         if progress_cb:
@@ -1818,45 +1849,81 @@ async def fill_db_from_market_fast(progress_cb=None, parallel=22):
             except Exception:
                 pass
 
-    await prog("Маркет→БД: коллекций " + str(len(pairs)))
-    for i in range(0, len(pairs), parallel):
+    # круги пока не набрали цель / не стоп
+    while True:
         if _pricenft_stop:
             break
-        chunk = pairs[i:i + parallel]
-
-        async def one(gid, title):
-            try:
-                items, _ = await fetch_market_page(gid, "", limit=100, newest=True)
-            except Exception:
-                return 0
-            n = 0
-            for it in items:
-                it = dict(it)
-                if title and (not it.get("title") or str(it.get("title")) in ("?", "NFT")):
-                    it["title"] = title
-                it["gift_id"] = gid
-                seed_pricenft_from_item(it, commit=False)
-                n += 1
-            return n
-
-        parts = await asyncio.gather(
-            *[one(gid, title) for gid, title in chunk],
-            return_exceptions=True,
+        st0 = pricenft_db_stats()
+        users0 = int(st0.get("users", 0) or 0)
+        if users0 >= target_users:
+            await prog("✅ Цель БД достигнута: " + str(users0) + " / " + str(target_users))
+            break
+        rounds += 1
+        random.shuffle(pairs)
+        await prog(
+            "Маркет→БД круг " + str(rounds)
+            + "\nЮзеров: " + str(users0) + " / " + str(target_users)
+            + "\nКоллекций: " + str(len(pairs))
         )
-        for p in parts:
-            if isinstance(p, int):
-                total += p
-        db_flush(force=True)
-        if (i // parallel) % 3 == 0:
-            st = pricenft_db_stats()
-            await prog(
-                "Маркет→БД: " + str(min(i + parallel, len(pairs))) + "/" + str(len(pairs))
-                + "\nЮзеров: " + str(st.get("users", 0)) + " | NFT: " + str(st.get("nfts", 0))
+        for i in range(0, len(pairs), parallel):
+            if _pricenft_stop:
+                break
+            if int(pricenft_db_stats().get("users", 0) or 0) >= target_users:
+                break
+            chunk = pairs[i:i + parallel]
+
+            async def one(gid, title):
+                n = 0
+                offset = ""
+                for _page in range(3):
+                    try:
+                        items, nxt = await fetch_market_page(gid, offset, limit=100, newest=True)
+                    except Exception:
+                        break
+                    if not items:
+                        break
+                    for it in items:
+                        it = dict(it)
+                        if title and (not it.get("title") or str(it.get("title")) in ("?", "NFT")):
+                            it["title"] = title
+                        it["gift_id"] = gid
+                        seed_pricenft_from_item(it, commit=False)
+                        n += 1
+                    if not nxt:
+                        break
+                    offset = nxt
+                return n
+
+            parts = await asyncio.gather(
+                *[one(gid, title) for gid, title in chunk],
+                return_exceptions=True,
             )
+            for p in parts:
+                if isinstance(p, int):
+                    total += p
+            db_flush(force=True)
+            if (i // parallel) % 2 == 0:
+                st = pricenft_db_stats()
+                await prog(
+                    "Маркет→БД круг " + str(rounds) + ": "
+                    + str(min(i + parallel, len(pairs))) + "/" + str(len(pairs))
+                    + "\nЮзеров: " + str(st.get("users", 0)) + " / " + str(target_users)
+                    + " | NFT: " + str(st.get("nfts", 0))
+                )
+        db_flush(force=True)
+        save_pricenft_db()
+        # защита от бесконечного круга если юзеры не растут
+        st1 = pricenft_db_stats()
+        if int(st1.get("users", 0) or 0) <= users0 and rounds >= 3:
+            await prog("Рост юзеров остановился на " + str(st1.get("users", 0)))
+            break
+        if rounds >= 30:
+            break
+
     db_flush(force=True)
     save_pricenft_db()
     st = pricenft_db_stats()
-    return {"ok": True, "seeded": total, **st}
+    return {"ok": True, "seeded": total, "rounds": rounds, "target": target_users, **st}
 
 async def _pricenft_ingest_messages(model_name, messages):
     """Парсим ответы бота и кладём юзеров в БД под model_name."""
@@ -2355,8 +2422,18 @@ async def background_db_keeper():
                 await asyncio.sleep(20)
                 continue
             random.shuffle(pairs)
-            PARALLEL = 20
-            # быстрый проход маркета — основной объём БД
+            PARALLEL = 22
+            # быстрый проход маркета — основной объём БД до 100к
+            st0 = pricenft_db_stats()
+            if int(st0.get("users", 0) or 0) < DB_TARGET_USERS:
+                # глубокий fill раз в несколько циклов
+                if cycle % 3 == 0:
+                    try:
+                        await fill_db_from_market_fast(
+                            progress_cb=None, parallel=22, target_users=DB_TARGET_USERS
+                        )
+                    except Exception as e:
+                        logger.warning("keeper fill: %s", e)
             for i in range(0, len(pairs), PARALLEL):
                 if is_searching:
                     break
@@ -2919,52 +2996,52 @@ def _make_nft_lines(items):
 async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                            boost=100, min_gifts=1, max_gifts=0,
                            max_results=30, region="any"):
-    """Маркет: быстрый рандомный цикл по коллекциям до лимита."""
+    """Маркет: быстрый стрим лотов. Жёсткий лимит выдачи. Цена лота по категории."""
     global is_searching
     is_searching = True
+    try:
+        max_results = max(1, int(max_results or 1))
+    except Exception:
+        max_results = 30
 
     lock        = asyncio.Lock()
     found       = [0]
     seen_slugs  = set()
     seen_owners = set()
-    col_sent    = {}
-    n_cols = max(1, len(gift_ids) if gift_ids else 1)
-    # хватает места до лимита: при 1 коллекции — весь лимит
-    MAX_COL = max_results if n_cols <= 2 else max(3, (max_results + 4) // min(n_cols, 12))
-    MAX_PAGES = 2
 
-    async def send_one(item):
+    async def send_one(item, ignore_global=False):
         oid = item.get("owner_id")
         uname = item.get("username")
         if not oid and not uname:
             return False
-        gid = item.get("gift_id")
         nft_url = item.get("nft_url")
         slug = gift_slug_of(nft_url)
-        if is_owner_seen(oid, uname) or is_gift_seen(slug):
-            return False
+        ok_key = oid if oid else ("u:" + str(uname).lower())
+        if not ignore_global:
+            if is_owner_seen(oid, uname) or is_gift_seen(slug):
+                return False
         async with lock:
             if found[0] >= max_results:
                 return False
-            ok = oid if oid else ("u:" + str(uname).lower())
-            if ok in seen_owners:
+            if ok_key in seen_owners:
                 return False
             if slug and slug in seen_slugs:
                 return False
-            if gid is not None and col_sent.get(gid, 0) >= MAX_COL:
-                return False
-            seen_owners.add(ok)
+            seen_owners.add(ok_key)
             if slug:
                 seen_slugs.add(slug)
-            if gid is not None:
-                col_sent[gid] = col_sent.get(gid, 0) + 1
             found[0] += 1
+            slot = found[0]
+        # жёсткий стоп после резерва
+        if slot > max_results:
+            async with lock:
+                found[0] = max(0, found[0] - 1)
+            return False
         mark_seen(oid, uname, nft_url)
         try:
             seed_pricenft_from_item(item, commit=False)
         except Exception:
             pass
-
         name  = item.get("name") or ""
         p_url = item.get("profile_url")
         title = esc(str(item.get("title") or "?"))
@@ -2987,58 +3064,52 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             return True
         except Exception as e:
             logger.warning("market send: %s", e)
+            async with lock:
+                found[0] = max(0, found[0] - 1)
+                seen_owners.discard(ok_key)
+                if slug:
+                    seen_slugs.discard(slug)
             return False
 
-    async def fetch_bucket(gid, title=""):
-        """Собрать рандомный пул лотов коллекции."""
+    async def scan_col(gid, title="", ignore_global=False):
         if not is_searching or found[0] >= max_results:
-            return []
-        fl = None
-        if cat:
-            fl = PRICE_FLOOR_CACHE.get(gid)
-            if fl is None:
-                try:
-                    fl = await get_floor(gid)
-                except Exception:
-                    fl = None
-            if fl is not None and not floor_in_cat(fl, cat):
-                return []
-        out = []
+            return
         offset = ""
-        for _page in range(MAX_PAGES):
-            if not is_searching:
-                break
+        for _page in range(2):
+            if not is_searching or found[0] >= max_results:
+                return
             try:
-                items, nxt = await fetch_market_page(gid, offset, limit=80, newest=True)
-            except Exception:
-                break
+                items, nxt = await fetch_market_page(gid, offset, limit=60, newest=True)
+            except Exception as e:
+                logger.debug("scan_col %s: %s", gid, e)
+                return
             if not items:
-                break
+                return
+            random.shuffle(items)
             for item in items:
+                if not is_searching or found[0] >= max_results:
+                    return
                 item = dict(item)
                 item["gift_id"] = gid
                 if title and (not item.get("title") or str(item.get("title")) in ("?", "NFT")):
                     item["title"] = title
-                price = item.get("price") or 0
-                if cat != "extreme" and price and price > 150000:
-                    continue
-                if cat and fl and price and not price_ok(price, fl, boost):
+                price = item.get("price")
+                # фильтр по цене ЛОТА в категории (не floor коллекции)
+                if not price_in_cat(price, cat):
                     continue
                 if girls_only and not is_girl(item.get("owner"), item.get("username"), item.get("name")):
                     continue
                 if region and region != "any":
                     if not region_match_full(item.get("owner"), item.get("username"), item.get("name"), region):
                         continue
-                out.append(item)
+                await send_one(item, ignore_global=ignore_global)
             if not nxt:
-                break
+                return
             offset = nxt
-        random.shuffle(out)
-        return out
 
     try:
         await status_msg.edit_text(
-            "<b>Ищу свежие лоты на маркете...</b>",
+            "<b>Ищу свежие лоты на маркете...\nЛимит выдачи: " + str(max_results) + "</b>",
             parse_mode="HTML", reply_markup=stop_kb()
         )
         id_set = set(gift_ids)
@@ -3047,64 +3118,28 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             valid_pairs = [(gid, "") for gid in gift_ids]
         random.shuffle(valid_pairs)
 
-        # параллельно набираем бакеты, потом рандомный цикл выдачи
-        PARALLEL = 22
-        buckets = {}
-        for i in range(0, len(valid_pairs), PARALLEL):
-            if not is_searching or found[0] >= max_results:
-                break
-            chunk = valid_pairs[i:i+PARALLEL]
-            parts = await asyncio.gather(
-                *[fetch_bucket(gid, t) for gid, t in chunk],
-                return_exceptions=True,
-            )
-            for (gid, _t), part in zip(chunk, parts):
-                if isinstance(part, Exception) or not part:
-                    continue
-                buckets[gid] = list(part)
-
-            # сразу отдаём по циклу: 1 из каждой коллекции рандомно
-            active = [g for g, lst in buckets.items() if lst]
-            random.shuffle(active)
-            while is_searching and found[0] < max_results and active:
-                random.shuffle(active)
-                progressed = False
-                next_active = []
-                for gid in active:
-                    if not is_searching or found[0] >= max_results:
-                        break
-                    lst = buckets.get(gid) or []
-                    while lst:
-                        item = lst.pop()
-                        oid = item.get("owner_id")
-                        uname = item.get("username")
-                        slug = gift_slug_of(item.get("nft_url"))
-                        if is_owner_seen(oid, uname) or is_gift_seen(slug):
-                            continue
-                        if oid and oid in seen_owners:
-                            continue
-                        if slug and slug in seen_slugs:
-                            continue
-                        if col_sent.get(gid, 0) >= MAX_COL:
-                            lst.clear()
-                            break
-                        ok = await send_one(item)
-                        if ok:
-                            progressed = True
-                            break
-                    if buckets.get(gid):
-                        next_active.append(gid)
-                active = next_active
-                if not progressed:
+        PARALLEL = 20
+        async def run_pass(ignore_global=False):
+            for i in range(0, len(valid_pairs), PARALLEL):
+                if not is_searching or found[0] >= max_results:
                     break
-            try:
-                await status_msg.edit_text(
-                    "<b>Маркет:</b> " + str(found[0]) + "/" + str(max_results)
-                    + " | коллекций " + str(len(col_sent)),
-                    parse_mode="HTML", reply_markup=stop_kb()
+                chunk = valid_pairs[i:i+PARALLEL]
+                await asyncio.gather(
+                    *[scan_col(gid, t, ignore_global=ignore_global) for gid, t in chunk],
+                    return_exceptions=True,
                 )
-            except Exception:
-                pass
+                try:
+                    await status_msg.edit_text(
+                        "<b>Маркет:</b> " + str(found[0]) + "/" + str(max_results),
+                        parse_mode="HTML", reply_markup=stop_kb()
+                    )
+                except Exception:
+                    pass
+
+        await run_pass(ignore_global=False)
+        # если антидубль всё съел — второй проход без глобального seen (только в рамках поиска)
+        if is_searching and found[0] < max_results:
+            await run_pass(ignore_global=True)
 
         db_flush(force=True)
         try:
@@ -3115,21 +3150,24 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         logger.error("do_market_search: %s", e)
     finally:
         is_searching = False
-    return found[0]
+    return min(found[0], max_results)
 
 
 # ── SEARCH CORE: MODEL ────────────────────────────────────────────────────────
 async def do_model_search(status_msg, gift_ids, girls_only=False,
                           max_results=30, region="any"):
-    """Модель: рандомный цикл по коллекциям до лимита + добор из БД."""
+    """Модель: быстрый стрим + добор из БД. Жёсткий лимит выдачи."""
     global is_searching
     is_searching = True
+    try:
+        max_results = max(1, int(max_results or 1))
+    except Exception:
+        max_results = 30
 
     lock        = asyncio.Lock()
     found       = [0]
     seen_slugs  = set()
     seen_owners = set()
-    col_sent    = {}
     title_by_gid = {gid: title for gid, title in ALL_GIFT_IDS}
     for gid in gift_ids:
         if gid not in title_by_gid:
@@ -3137,35 +3175,34 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 if i == gid:
                     title_by_gid[gid] = t
                     break
-    n_cols = max(1, len(gift_ids) if gift_ids else 1)
-    MAX_COL = max_results if n_cols <= 2 else max(3, (max_results + 3) // min(n_cols, 15))
 
-    async def send_item(item, source="market"):
+    async def send_item(item, ignore_global=False):
         oid = item.get("owner_id")
         uname = item.get("username")
         nft_url = item.get("nft_url")
         slug = gift_slug_of(nft_url)
         if not oid and not uname:
             return False
-        if is_owner_seen(oid, uname) or is_gift_seen(slug):
-            return False
+        ok_key = oid if oid else ("u:" + str(uname).lower())
+        if not ignore_global:
+            if is_owner_seen(oid, uname) or is_gift_seen(slug):
+                return False
         async with lock:
             if found[0] >= max_results:
                 return False
-            ok = oid if oid else ("u:" + str(uname).lower())
-            if ok in seen_owners:
+            if ok_key in seen_owners:
                 return False
             if slug and slug in seen_slugs:
                 return False
-            gid = item.get("gift_id")
-            if gid is not None and col_sent.get(gid, 0) >= MAX_COL:
-                return False
-            seen_owners.add(ok)
+            seen_owners.add(ok_key)
             if slug:
                 seen_slugs.add(slug)
-            if gid is not None:
-                col_sent[gid] = col_sent.get(gid, 0) + 1
             found[0] += 1
+            slot = found[0]
+        if slot > max_results:
+            async with lock:
+                found[0] = max(0, found[0] - 1)
+            return False
         mark_seen(oid, uname, nft_url)
         try:
             seed_pricenft_from_item(item, commit=False)
@@ -3202,120 +3239,93 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             return True
         except Exception as e:
             logger.warning("model send: %s", e)
+            async with lock:
+                found[0] = max(0, found[0] - 1)
+                seen_owners.discard(ok_key)
+                if slug:
+                    seen_slugs.discard(slug)
             return False
 
-    async def fetch_bucket(gid):
+    async def scan_col(gid, ignore_global=False):
         title = title_by_gid.get(gid) or ""
-        out = []
         offset = ""
         for _ in range(2):
-            if not is_searching:
-                break
+            if not is_searching or found[0] >= max_results:
+                return
             try:
                 items, nxt = await fetch_market_page(gid, offset, limit=80, newest=True)
             except Exception:
-                break
+                return
             if not items:
-                break
+                return
+            random.shuffle(items)
             for it in items:
+                if not is_searching or found[0] >= max_results:
+                    return
                 it = dict(it)
                 it["gift_id"] = gid
                 if title:
                     it["title"] = title
-                price = it.get("price") or 0
-                if price and price > 150000:
-                    continue
                 if girls_only and not is_girl(it.get("owner"), it.get("username"), it.get("name")):
                     continue
                 if region and region != "any":
                     if not region_match_full(it.get("owner"), it.get("username"), it.get("name"), region):
                         continue
-                out.append(it)
+                await send_item(it, ignore_global=ignore_global)
             if not nxt:
-                break
+                return
             offset = nxt
-        random.shuffle(out)
-        return out
 
     try:
         label = title_by_gid.get(gift_ids[0], "модели") if len(gift_ids) == 1 else (str(len(gift_ids)) + " коллекций")
         await status_msg.edit_text(
-            "<b>Ищу по модели: " + esc(str(label)) + "...</b>",
+            "<b>Ищу по модели: " + esc(str(label))
+            + "\nЛимит выдачи: " + str(max_results) + "</b>",
             parse_mode="HTML", reply_markup=stop_kb()
         )
 
         gids = list(gift_ids) if gift_ids else [gid for gid, _ in ALL_GIFT_IDS]
         random.shuffle(gids)
         PARALLEL = 16
-        buckets = {}
-        for i in range(0, len(gids), PARALLEL):
-            if not is_searching or found[0] >= max_results:
-                break
-            chunk = gids[i:i+PARALLEL]
-            parts = await asyncio.gather(*[fetch_bucket(g) for g in chunk], return_exceptions=True)
-            for gid, part in zip(chunk, parts):
-                if isinstance(part, Exception) or not part:
-                    continue
-                buckets[gid] = list(part)
 
-            # рандомный цикл: по 1 гифту с разных коллекций
-            active = [g for g, lst in buckets.items() if lst]
-            while is_searching and found[0] < max_results and active:
-                random.shuffle(active)
-                progressed = False
-                next_active = []
-                for gid in active:
-                    if not is_searching or found[0] >= max_results:
-                        break
-                    if col_sent.get(gid, 0) >= MAX_COL:
-                        buckets[gid] = []
-                        continue
-                    lst = buckets.get(gid) or []
-                    while lst:
-                        it = lst.pop()
-                        oid = it.get("owner_id")
-                        uname = it.get("username")
-                        slug = gift_slug_of(it.get("nft_url"))
-                        if is_owner_seen(oid, uname) or is_gift_seen(slug):
-                            continue
-                        ok_key = oid if oid else (("u:" + uname.lower()) if uname else None)
-                        if ok_key and ok_key in seen_owners:
-                            continue
-                        if slug and slug in seen_slugs:
-                            continue
-                        if await send_item(it, "market"):
-                            progressed = True
-                            break
-                    if buckets.get(gid):
-                        next_active.append(gid)
-                active = next_active
-                if not progressed:
+        async def run_pass(ignore_global=False):
+            for i in range(0, len(gids), PARALLEL):
+                if not is_searching or found[0] >= max_results:
                     break
-            try:
-                await status_msg.edit_text(
-                    "<b>Модель:</b> " + str(found[0]) + "/" + str(max_results),
-                    parse_mode="HTML", reply_markup=stop_kb()
+                await asyncio.gather(
+                    *[scan_col(g, ignore_global=ignore_global) for g in gids[i:i+PARALLEL]],
+                    return_exceptions=True,
                 )
-            except Exception:
-                pass
+                try:
+                    await status_msg.edit_text(
+                        "<b>Модель:</b> " + str(min(found[0], max_results)) + "/" + str(max_results),
+                        parse_mode="HTML", reply_markup=stop_kb()
+                    )
+                except Exception:
+                    pass
 
-        # добор из БД до лимита
+        await run_pass(ignore_global=False)
+
+        # добор из БД строго до лимита
         if is_searching and found[0] < max_results:
             titles = [title_by_gid[g] for g in gift_ids if title_by_gid.get(g)]
             need = max_results - found[0]
             hits = []
             if titles:
                 for t in titles:
-                    hits.extend(random_from_pricenft_db(limit=max(need * 3, 40), model=t))
+                    hits.extend(random_from_pricenft_db(limit=max(need * 4, 40), model=t))
             else:
-                hits = random_from_pricenft_db(limit=max(need * 4, 60))
+                hits = random_from_pricenft_db(limit=max(need * 5, 60))
             random.shuffle(hits)
             for h in hits:
                 if not is_searching or found[0] >= max_results:
                     break
                 if girls_only and not is_girl(None, h.get("username"), h.get("name")):
                     continue
-                await send_item(h, "pricenft")
+                await send_item(h, ignore_global=False)
+
+        if is_searching and found[0] < max_results:
+            await run_pass(ignore_global=True)
 
         db_flush(force=True)
         try:
@@ -3326,7 +3336,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
         logger.error("do_model_search: %s", e)
     finally:
         is_searching = False
-    return found[0]
+    return min(found[0], max_results)
 
 
 # ── SEARCH CORE: MODEL BY PROFILE ─────────────────────────────────────────────
@@ -3370,8 +3380,8 @@ async def _start_market(cb, cat, girls):
         "<b>Маркет / " + cat_l + " / " + who_l + "\n"
         "Режим: свежие лоты\n"
         "Регион: " + reg_l + "\n"
-        "Гифтов: от " + str(mn) + " до " + mx_s + "\n"
-        "Лимит: " + str(lim) + "</b>"
+        "Гифтов в профиле: от " + str(mn) + " до " + mx_s + "\n"
+        "Лимит выдачи: " + str(lim) + "</b>"
     )
     status = await bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=stop_kb())
     try:
@@ -3423,7 +3433,7 @@ async def _start_profile(cb, cat, girls):
         "Режим: строго 0 гифтов на маркете\n"
         "Регион: " + reg_l + "\n"
         "Мин. NFT в профиле: " + str(mn) + "\n"
-        "Лимит: " + str(lim) + "</b>"
+        "Лимит выдачи: " + str(lim) + "</b>"
     )
     status = await cb.message.answer(txt, parse_mode="HTML", reply_markup=stop_kb())
     found = await do_profile_search(status, ids, cat=cat, girls_only=girls,
@@ -3479,7 +3489,7 @@ async def _start_model(cb, girls=False, single_gid=None, search_type="market",
             "<b>Модели / " + who_l + " / " + type_l + "\n"
             "Коллекция: " + col_l + "\n"
             "Регион: " + reg_l + "\n"
-            "Лимит: " + str(lim) + "</b>"
+            "Лимит выдачи: " + str(lim) + "</b>"
         )
         status = await bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=stop_kb())
         if search_type == "profile":
@@ -4264,9 +4274,12 @@ async def cb_pricenft_collect(cb: CallbackQuery):
         [InlineKeyboardButton(text="Админ", callback_data="admin_panel")],
     ])
     status = await cb.message.answer(
-        "<b>📦 База данных PriceNFT</b>\n"
-        "Собираю всех владельцев из @PriceNFTbot\n"
-        "CD 3 сек · можно остановить в любой момент",
+        "<b>📦 База данных</b>\n"
+        "Цель: " + str(DB_TARGET_USERS) + " юзеров\n"
+        "Сейчас: " + str(pricenft_db_stats().get("users", 0)) + "\n"
+        "1) Быстрый маркет→БД\n"
+        "2) @PriceNFTbot (если нет FloodWait)\n"
+        "Можно остановить в любой момент",
         parse_mode="HTML",
         reply_markup=stop_kb_db,
     )
@@ -4274,7 +4287,7 @@ async def cb_pricenft_collect(cb: CallbackQuery):
     async def prog(text):
         try:
             await status.edit_text(
-                "<b>📦 База данных PriceNFT</b>\n" + esc(text),
+                "<b>📦 База данных</b>\n" + esc(text),
                 parse_mode="HTML",
                 reply_markup=stop_kb_db,
             )
@@ -4282,39 +4295,64 @@ async def cb_pricenft_collect(cb: CallbackQuery):
             pass
 
     async def runner():
-        result = await collect_pricenft_db(progress_cb=prog, max_models=0)
+        global _pricenft_collecting, _pricenft_stop
+        _pricenft_collecting = True
+        _pricenft_stop = False
         try:
-            if result.get("ok"):
-                if result.get("flood_fallback"):
-                    wait = int(result.get("flood_wait", 0) or 0)
-                    hrs = max(1, wait // 3600) if wait else "?"
+            # сначала быстро набираем с маркета к 100к
+            await prog("Старт: маркет→БД до " + str(DB_TARGET_USERS) + " юзеров...")
+            mres = await fill_db_from_market_fast(progress_cb=prog, target_users=DB_TARGET_USERS)
+            if _pricenft_stop:
+                try:
                     await status.edit_text(
-                        "<b>⚠️ PriceNFT FloodWait ~" + str(hrs) + "ч</b>\n"
-                        "Telegram временно режет ResolveUsername.\n"
-                        "БД наполнена с <b>маркета</b> (без ожидания):\n"
-                        "Моделей: " + str(result.get("models", 0)) + "\n"
-                        "Юзеров: " + str(result.get("users", 0)) + "\n"
-                        "NFT: " + str(result.get("nfts", 0)) + "\n\n"
-                        "PriceNFTbot можно снова через ~" + str(hrs) + "ч\n"
-                        "(или раньше, если откроешь диалог с ним вручную)",
+                        "<b>⏹ Сбор остановлен</b>\n"
+                        "Юзеров: " + str(mres.get("users", 0)) + " / " + str(DB_TARGET_USERS) + "\n"
+                        "NFT: " + str(mres.get("nfts", 0)),
                         parse_mode="HTML", reply_markup=admin_kb()
                     )
+                except Exception:
+                    pass
+                return
+            # collect_pricenft_db сам ставит flag — временно снимем чтобы не got already_running
+            _pricenft_collecting = False
+            result = await collect_pricenft_db(progress_cb=prog, max_models=0)
+            _pricenft_collecting = True
+            # ещё раз маркет если не добили
+            if int(pricenft_db_stats().get("users", 0) or 0) < DB_TARGET_USERS and not _pricenft_stop:
+                await fill_db_from_market_fast(progress_cb=prog, target_users=DB_TARGET_USERS)
+                result = {**(result or {}), **pricenft_db_stats()}
+            try:
+                if result.get("ok") or mres.get("ok"):
+                    if result.get("flood_fallback"):
+                        wait = int(result.get("flood_wait", 0) or 0)
+                        hrs = max(1, wait // 3600) if wait else "?"
+                        await status.edit_text(
+                            "<b>⚠️ PriceNFT FloodWait ~" + str(hrs) + "ч</b>\n"
+                            "БД наполнена с маркета:\n"
+                            "Юзеров: " + str(result.get("users", mres.get("users", 0))) + " / " + str(DB_TARGET_USERS) + "\n"
+                            "NFT: " + str(result.get("nfts", mres.get("nfts", 0))),
+                            parse_mode="HTML", reply_markup=admin_kb()
+                        )
+                    else:
+                        prefix = "⏹ Сбор остановлен" if result.get("stopped") else "✅ БД обновлена"
+                        st = pricenft_db_stats()
+                        await status.edit_text(
+                            "<b>" + prefix + "</b>\n"
+                            "Моделей: " + str(st.get("models", 0)) + "\n"
+                            "Юзеров: " + str(st.get("users", 0)) + " / " + str(DB_TARGET_USERS) + "\n"
+                            "NFT: " + str(st.get("nfts", 0)),
+                            parse_mode="HTML", reply_markup=admin_kb()
+                        )
                 else:
-                    prefix = "⏹ Сбор остановлен" if result.get("stopped") else "✅ БД обновлена"
                     await status.edit_text(
-                        "<b>" + prefix + "</b>\n"
-                        "Моделей: " + str(result.get("models", 0)) + "\n"
-                        "Юзеров: " + str(result.get("users", 0)) + "\n"
-                        "NFT: " + str(result.get("nfts", 0)),
+                        "<b>❌ Сбор не удался:</b> " + esc(str((result or {}).get("error", "?"))),
                         parse_mode="HTML", reply_markup=admin_kb()
                     )
-            else:
-                await status.edit_text(
-                    "<b>❌ Сбор не удался:</b> " + esc(str(result.get("error", "?"))),
-                    parse_mode="HTML", reply_markup=admin_kb()
-                )
-        except Exception:
-            pass
+            except Exception:
+                pass
+        finally:
+            _pricenft_collecting = False
+            _pricenft_stop = False
 
     _pricenft_task = asyncio.create_task(runner())
 
