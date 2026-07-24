@@ -2590,8 +2590,6 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 price = it.get("price") or 0
                 if price and price > 150000:
                     continue
-                if is_trader_account(it.get("owner"), it.get("username"), it.get("name")):
-                    continue
                 if girls_only and not is_girl(it.get("owner"), it.get("username"), it.get("name")):
                     continue
                 if region and region != "any":
