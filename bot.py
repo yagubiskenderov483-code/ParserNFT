@@ -77,6 +77,8 @@ WRITE_MSG = "привет, ты продаешь свой нфт подарок 
 _pricenft_collecting = False
 _pricenft_stop = False
 _pricenft_task = None
+_pricenft_entity = None                 # кэш peer — без ResolveUsername
+_pricenft_flood_until = 0.0             # unix time, пока нельзя трогать PriceNFT
 _bootstrap_task = None
 _keeper_task = None
 _search_started_at = 0.0
@@ -1632,6 +1634,123 @@ async def _pricenft_wait_cd():
         await asyncio.sleep(wait)
     _pricenft_last_send = time.time()
 
+def _pricenft_flood_active():
+    return time.time() < float(_pricenft_flood_until or 0)
+
+def _set_pricenft_flood(seconds):
+    """Запомнить FloodWait, не резолвить username снова часами."""
+    global _pricenft_flood_until
+    sec = int(max(0, seconds or 0))
+    # не ждём 20 часов в UI — просто блокируем PriceNFT до этого момента
+    _pricenft_flood_until = time.time() + sec
+    try:
+        conn = _db()
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(k,v) VALUES ('pricenft_flood_until', ?)",
+            (str(int(_pricenft_flood_until)),),
+        )
+        conn.commit()
+    except Exception:
+        pass
+    logger.warning("PriceNFT flood until +%ss (~%.1fh)", sec, sec / 3600.0)
+
+def _load_pricenft_flood():
+    global _pricenft_flood_until
+    try:
+        row = _db().execute("SELECT v FROM meta WHERE k='pricenft_flood_until'").fetchone()
+        if row:
+            _pricenft_flood_until = float(row[0] or 0)
+    except Exception:
+        pass
+
+def _save_pricenft_peer_id(ent_or_uid, access_hash=None):
+    """Сохраняем id+access_hash, чтобы не вызывать ResolveUsername снова."""
+    try:
+        uid = None
+        ah = access_hash
+        if hasattr(ent_or_uid, "id") or hasattr(ent_or_uid, "user_id"):
+            ent = ent_or_uid
+            uid = getattr(ent, "user_id", None) or getattr(ent, "id", None)
+            if ah is None:
+                ah = getattr(ent, "access_hash", None)
+        else:
+            uid = int(ent_or_uid)
+        if not uid:
+            return
+        val = str(int(uid)) + ((":" + str(int(ah))) if ah is not None else "")
+        conn = _db()
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(k,v) VALUES ('pricenft_peer_id', ?)",
+            (val,),
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+class PriceNftFloodError(Exception):
+    def __init__(self, seconds=0):
+        self.seconds = int(seconds or 0)
+        super().__init__("PriceNFT FloodWait " + str(self.seconds) + "s")
+
+async def _pricenft_peer():
+    """
+    Peer @PriceNFTbot БЕЗ повторного ResolveUsernameRequest.
+    1) RAM-кэш  2) id+hash из sqlite  3) диалоги  4) один resolve
+    """
+    global _pricenft_entity
+    if _pricenft_entity is not None:
+        return _pricenft_entity
+    if _pricenft_flood_active():
+        left = max(1, int(_pricenft_flood_until - time.time()))
+        raise PriceNftFloodError(left)
+
+    # 1) id+hash из БД — InputPeerUser без ResolveUsername
+    try:
+        from telethon.tl.types import InputPeerUser
+        row = _db().execute("SELECT v FROM meta WHERE k='pricenft_peer_id'").fetchone()
+        if row and row[0]:
+            parts = str(row[0]).split(":")
+            uid = int(parts[0])
+            if len(parts) >= 2 and parts[1]:
+                ah = int(parts[1])
+                _pricenft_entity = InputPeerUser(uid, ah)
+                return _pricenft_entity
+            try:
+                _pricenft_entity = await tg_client.get_input_entity(uid)
+                return _pricenft_entity
+            except Exception:
+                pass
+    except FloodWaitError as e:
+        _set_pricenft_flood(getattr(e, "seconds", 0) or 0)
+        raise PriceNftFloodError(getattr(e, "seconds", 0) or 0)
+    except Exception:
+        pass
+
+    # 2) уже открытый диалог
+    try:
+        async for d in tg_client.iter_dialogs(limit=80):
+            ent = getattr(d, "entity", None)
+            uname = (getattr(ent, "username", None) or "").lower()
+            if uname == "pricenftbot":
+                _pricenft_entity = ent
+                _save_pricenft_peer_id(ent)
+                return _pricenft_entity
+    except FloodWaitError as e:
+        _set_pricenft_flood(getattr(e, "seconds", 0) or 0)
+        raise PriceNftFloodError(getattr(e, "seconds", 0) or 0)
+    except Exception as e:
+        logger.debug("pricenft dialogs: %s", e)
+
+    # 3) один раз resolve username
+    try:
+        ent = await tg_client.get_entity(PRICENFT_BOT)
+        _pricenft_entity = ent
+        _save_pricenft_peer_id(ent)
+        return _pricenft_entity
+    except FloodWaitError as e:
+        _set_pricenft_flood(getattr(e, "seconds", 0) or 0)
+        raise PriceNftFloodError(getattr(e, "seconds", 0) or 0)
+
 def _btn_texts_from_msg(msg):
     """Все подписи кнопок (reply + inline) из сообщения."""
     texts = []
@@ -1656,10 +1775,12 @@ def _find_btn_text(texts, keywords):
 
 async def _pricenft_send(text):
     await _pricenft_wait_cd()
-    return await tg_client.send_message(PRICENFT_BOT, text)
+    peer = await _pricenft_peer()
+    return await tg_client.send_message(peer, text)
 
 async def _pricenft_latest(limit=6):
-    return await tg_client.get_messages(PRICENFT_BOT, limit=limit)
+    peer = await _pricenft_peer()
+    return await tg_client.get_messages(peer, limit=limit)
 
 async def _pricenft_click_or_send(msg, text):
     """Кликаем inline/reply кнопку, иначе шлём текст."""
@@ -1681,6 +1802,61 @@ async def _pricenft_click_or_send(msg, text):
                 pass
     await _pricenft_send(text)
     return True
+
+async def fill_db_from_market_fast(progress_cb=None, parallel=22):
+    """Быстрое наполнение БД с маркета (без PriceNFTbot / без ResolveUsername)."""
+    await ensure_collections()
+    load_pricenft_db()
+    pairs = list(ALL_GIFT_IDS)
+    random.shuffle(pairs)
+    total = 0
+
+    async def prog(t):
+        if progress_cb:
+            try:
+                await progress_cb(t)
+            except Exception:
+                pass
+
+    await prog("Маркет→БД: коллекций " + str(len(pairs)))
+    for i in range(0, len(pairs), parallel):
+        if _pricenft_stop:
+            break
+        chunk = pairs[i:i + parallel]
+
+        async def one(gid, title):
+            try:
+                items, _ = await fetch_market_page(gid, "", limit=100, newest=True)
+            except Exception:
+                return 0
+            n = 0
+            for it in items:
+                it = dict(it)
+                if title and (not it.get("title") or str(it.get("title")) in ("?", "NFT")):
+                    it["title"] = title
+                it["gift_id"] = gid
+                seed_pricenft_from_item(it, commit=False)
+                n += 1
+            return n
+
+        parts = await asyncio.gather(
+            *[one(gid, title) for gid, title in chunk],
+            return_exceptions=True,
+        )
+        for p in parts:
+            if isinstance(p, int):
+                total += p
+        db_flush(force=True)
+        if (i // parallel) % 3 == 0:
+            st = pricenft_db_stats()
+            await prog(
+                "Маркет→БД: " + str(min(i + parallel, len(pairs))) + "/" + str(len(pairs))
+                + "\nЮзеров: " + str(st.get("users", 0)) + " | NFT: " + str(st.get("nfts", 0))
+            )
+    db_flush(force=True)
+    save_pricenft_db()
+    st = pricenft_db_stats()
+    return {"ok": True, "seeded": total, **st}
 
 async def _pricenft_ingest_messages(model_name, messages):
     """Парсим ответы бота и кладём юзеров в БД под model_name."""
@@ -1798,7 +1974,29 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
         if not await check_authorized():
             return {"ok": False, "error": "not_authorized"}
 
+        _load_pricenft_flood()
+        if _pricenft_flood_active():
+            left = max(1, int(_pricenft_flood_until - time.time()))
+            hrs = left / 3600.0
+            await prog(
+                "⏳ Telegram FloodWait ~" + str(int(hrs)) + "ч\n"
+                "PriceNFTbot временно недоступен.\n"
+                "Переключаюсь на быстрый сбор с маркета..."
+            )
+            m = await fill_db_from_market_fast(progress_cb=progress_cb)
+            return {
+                "ok": True,
+                "flood_fallback": True,
+                "flood_wait": left,
+                **stats,
+                **m,
+            }
+
         async with _pricenft_lock:
+            # один раз резолвим peer в кэш
+            await prog("PriceNFTbot: подключение (кэш peer)...")
+            await _pricenft_peer()
+
             await prog("PriceNFTbot: /start ...")
             await _pricenft_send("/start")
             await asyncio.sleep(PRICENFT_MSG_CD)
@@ -1986,9 +2184,47 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
                 + "Кликов: " + str(stats["models_clicked"]) + " | +записей: " + str(stats["added"])
             )
             return {"ok": True, **stats, **st}
+    except (FloodWaitError, PriceNftFloodError) as e:
+        sec = int(getattr(e, "seconds", 0) or 0)
+        _set_pricenft_flood(sec)
+        save_pricenft_db()
+        hrs = max(1, sec // 3600)
+        await prog(
+            "⏳ FloodWait ~" + str(hrs) + "ч на ResolveUsername\n"
+            "Сохранил что есть. Добиваю БД с маркета..."
+        )
+        try:
+            m = await fill_db_from_market_fast(progress_cb=progress_cb)
+            return {
+                "ok": True,
+                "flood_fallback": True,
+                "flood_wait": sec,
+                **stats,
+                **m,
+            }
+        except Exception as e2:
+            return {
+                "ok": False,
+                "error": "flood_wait_" + str(sec) + "s: " + str(e2),
+                "flood_wait": sec,
+                **stats,
+                **pricenft_db_stats(),
+            }
     except Exception as e:
         logger.error("collect_pricenft_db: %s", e)
         save_pricenft_db()
+        # если это flood в тексте — тоже fallback
+        msg = str(e)
+        if "FloodWait" in msg or "wait of" in msg.lower():
+            mnum = re.search(r"(\d+)\s*seconds?", msg, re.I)
+            sec = int(mnum.group(1)) if mnum else 3600
+            _set_pricenft_flood(sec)
+            try:
+                await prog("⏳ FloodWait — добиваю БД с маркета...")
+                m = await fill_db_from_market_fast(progress_cb=progress_cb)
+                return {"ok": True, "flood_fallback": True, "flood_wait": sec, **stats, **m}
+            except Exception:
+                pass
         return {"ok": False, "error": str(e), **stats}
     finally:
         _pricenft_collecting = False
@@ -2156,8 +2392,13 @@ async def background_db_keeper():
                 cycle, st.get("models"), st.get("users"), st.get("nfts"),
             )
 
-            # PriceNFTbot — раз в 2 цикла маркета, если не идёт поиск/сбор
-            if cycle % 2 == 0 and not _pricenft_collecting and not is_searching:
+            # PriceNFTbot — только если нет FloodWait
+            if (
+                cycle % 2 == 0
+                and not _pricenft_collecting
+                and not is_searching
+                and not _pricenft_flood_active()
+            ):
                 try:
                     await collect_pricenft_db(progress_cb=None, max_models=40)
                     db_flush(force=True)
@@ -4044,14 +4285,29 @@ async def cb_pricenft_collect(cb: CallbackQuery):
         result = await collect_pricenft_db(progress_cb=prog, max_models=0)
         try:
             if result.get("ok"):
-                prefix = "⏹ Сбор остановлен" if result.get("stopped") else "✅ БД обновлена"
-                await status.edit_text(
-                    "<b>" + prefix + "</b>\n"
-                    "Моделей: " + str(result.get("models", 0)) + "\n"
-                    "Юзеров: " + str(result.get("users", 0)) + "\n"
-                    "NFT: " + str(result.get("nfts", 0)),
-                    parse_mode="HTML", reply_markup=admin_kb()
-                )
+                if result.get("flood_fallback"):
+                    wait = int(result.get("flood_wait", 0) or 0)
+                    hrs = max(1, wait // 3600) if wait else "?"
+                    await status.edit_text(
+                        "<b>⚠️ PriceNFT FloodWait ~" + str(hrs) + "ч</b>\n"
+                        "Telegram временно режет ResolveUsername.\n"
+                        "БД наполнена с <b>маркета</b> (без ожидания):\n"
+                        "Моделей: " + str(result.get("models", 0)) + "\n"
+                        "Юзеров: " + str(result.get("users", 0)) + "\n"
+                        "NFT: " + str(result.get("nfts", 0)) + "\n\n"
+                        "PriceNFTbot можно снова через ~" + str(hrs) + "ч\n"
+                        "(или раньше, если откроешь диалог с ним вручную)",
+                        parse_mode="HTML", reply_markup=admin_kb()
+                    )
+                else:
+                    prefix = "⏹ Сбор остановлен" if result.get("stopped") else "✅ БД обновлена"
+                    await status.edit_text(
+                        "<b>" + prefix + "</b>\n"
+                        "Моделей: " + str(result.get("models", 0)) + "\n"
+                        "Юзеров: " + str(result.get("users", 0)) + "\n"
+                        "NFT: " + str(result.get("nfts", 0)),
+                        parse_mode="HTML", reply_markup=admin_kb()
+                    )
             else:
                 await status.edit_text(
                     "<b>❌ Сбор не удался:</b> " + esc(str(result.get("error", "?"))),
