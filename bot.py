@@ -1404,6 +1404,17 @@ def searching():
     cur = ACTIVE_SEARCHES.get(chat_id)
     return bool(cur and cur.get("token") == token)
 
+def search_alive(chat_id, token):
+    """Явная проверка токена (не зависит от ContextVar в воркерах)."""
+    if chat_id is None or token is None:
+        return searching()
+    try:
+        chat_id = int(chat_id)
+    except Exception:
+        return False
+    cur = ACTIVE_SEARCHES.get(chat_id)
+    return bool(cur and cur.get("token") == token)
+
 def any_searching():
     """Есть ли хоть один активный поиск (для keeper)."""
     now = time.time()
@@ -1597,10 +1608,15 @@ async def resolve_collections_for_cat(cat, gift_ids=None):
         return [g for g, _ in pairs], [t for _, t in pairs if t]
 
     out_g, out_t = [], []
-    PARALLEL = 16
+    PARALLEL = 4  # не флудим GetResaleStarGifts
 
     async def _one(gid, title):
-        fl = await get_floor(gid)
+        fl = PRICE_FLOOR_CACHE.get(gid)
+        if fl is None:
+            try:
+                fl = await get_floor(gid)
+            except Exception:
+                return None
         if fl is None:
             return None
         if floor_in_cat(fl, cat):
@@ -1608,7 +1624,8 @@ async def resolve_collections_for_cat(cat, gift_ids=None):
         return None
 
     for i in range(0, len(pairs), PARALLEL):
-        if not searching():
+        # стоп поиска — если токен снят
+        if _ctx_search_token.get() is not None and not searching():
             break
         chunk = pairs[i:i + PARALLEL]
         parts = await asyncio.gather(
@@ -1620,6 +1637,7 @@ async def resolve_collections_for_cat(cat, gift_ids=None):
                 out_g.append(p[0])
                 if p[1]:
                     out_t.append(p[1])
+        await asyncio.sleep(0.15)
     if not out_g:
         logger.warning("resolve_collections_for_cat(%s): no floors in category", cat)
         return [], []
@@ -3205,6 +3223,8 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
     chat_id = chat_id or (status_msg.chat.id if getattr(status_msg, "chat", None) else None)
     if search_token is not None and chat_id is not None:
         attach_search(chat_id, search_token)
+    def still():
+        return search_alive(chat_id, search_token)
     who = who or ("girls" if girls_only else "all")
     weird_mode = who in ("weird", "cringe", "pozor")
     try:
@@ -3269,7 +3289,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         await check_q.put(info)
 
     async def check_one(info):
-        if not searching() or found[0] >= max_results:
+        if not still() or found[0] >= max_results:
             return
         owner_obj = info.get("owner")
         username  = (info.get("username") or "").lstrip("@") or None
@@ -3402,7 +3422,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
 
     async def worker():
         while True:
-            if not searching() or found[0] >= max_results:
+            if not still() or found[0] >= max_results:
                 return
             try:
                 info = await asyncio.wait_for(check_q.get(), timeout=0.4)
@@ -3452,7 +3472,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         workers = [asyncio.create_task(worker()) for _ in range(8)]
 
         # 1) Быстрый рандом из БД (с приоритетом моделей категории)
-        if searching() and found[0] < max_results:
+        if still() and found[0] < max_results:
             st = pricenft_db_stats()
             try:
                 await status_msg.edit_text(
@@ -3470,7 +3490,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             )
             random.shuffle(cands)
             for h in cands:
-                if not searching() or found[0] >= max_results:
+                if not still() or found[0] >= max_results:
                     break
                 uname = h.get("username")
                 if not uname:
@@ -3485,7 +3505,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                 })
 
         # 2) Чаты
-        if searching() and found[0] < max_results:
+        if still() and found[0] < max_results:
             try:
                 await status_msg.edit_text(
                     "<b>Профиль:</b> чаты...\nНайдено: " + str(found[0]) + "/" + str(max_results),
@@ -3494,7 +3514,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             except Exception:
                 pass
             for ch in NFT_SCAN_CHATS[:8]:
-                if not searching() or found[0] >= max_results:
+                if not still() or found[0] >= max_results:
                     break
                 try:
                     res = await asyncio.wait_for(
@@ -3503,7 +3523,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                 except Exception:
                     continue
                 for (u_obj, uid) in res:
-                    if not searching() or found[0] >= max_results:
+                    if not still() or found[0] >= max_results:
                         break
                     fn = (getattr(u_obj, "first_name", "") or "")
                     ln = (getattr(u_obj, "last_name", "") or "")
@@ -3525,7 +3545,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                 w.cancel()
 
         async def run_soft_wave(use_global_seen=True, label="добор"):
-            if not searching() or found[0] >= max_results:
+            if not still() or found[0] >= max_results:
                 return
             ignore_global[0] = not use_global_seen
             try:
@@ -3541,7 +3561,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
 
             async def soft_worker():
                 while True:
-                    if not searching() or found[0] >= max_results:
+                    if not still() or found[0] >= max_results:
                         return
                     try:
                         info = await asyncio.wait_for(soft_q.get(), timeout=0.4)
@@ -3550,7 +3570,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                             return
                         continue
                     try:
-                        if not searching() or found[0] >= max_results:
+                        if not still() or found[0] >= max_results:
                             continue
                         owner_obj = info.get("owner")
                         username = (info.get("username") or "").lstrip("@") or None
@@ -3664,7 +3684,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             )
             random.shuffle(more)
             for h in more:
-                if not searching() or found[0] >= max_results:
+                if not still() or found[0] >= max_results:
                     break
                 uname = h.get("username")
                 if not uname:
@@ -3689,7 +3709,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         # добор 1: скрытые NFT (можно с лотами на маркете), с anti-dup
         await run_soft_wave(use_global_seen=True, label="добор (скрытые NFT)")
         # добор 2: без global seen, если всё ещё мало
-        if searching() and found[0] < max_results:
+        if still() and found[0] < max_results:
             await run_soft_wave(use_global_seen=False, label="повтор без старого антидубля")
 
         logger.info("profile_search done found=%s skips=%s checked=%s", found[0], stats_skip, len(checked))
@@ -3745,6 +3765,8 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
     chat_id = chat_id or (status_msg.chat.id if getattr(status_msg, "chat", None) else None)
     if search_token is not None and chat_id is not None:
         attach_search(chat_id, search_token)
+    def still():
+        return search_alive(chat_id, search_token)
     who = who or ("girls" if girls_only else "all")
     weird_mode = who in ("weird", "cringe", "pozor")
     try:
@@ -3872,13 +3894,10 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
     async def fetch_bucket(gid, title=""):
         out = []
         offset = ""
-        floor = None
-        try:
-            floor = await get_floor(gid)
-        except Exception:
-            floor = None
+        # только кэш — get_floor() тут душил API (FloodWait) и парсинг вставал
+        floor = PRICE_FLOOR_CACHE.get(gid)
         for _ in range(3):
-            if not searching():
+            if not still():
                 break
             try:
                 items, nxt = await fetch_market_page(gid, offset, limit=100, newest=True)
@@ -3894,11 +3913,18 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                     item["title"] = title
                 if not pass_filters(item):
                     continue
-                # при выбранной ценовой категории абсолютный фильтр уже в pass_filters;
-                # price_ok(floor) иначе убивает extreme/ultra на дешёвых коллекциях
-                if (not cat or cat in ("any", "all", "none")) and floor is not None:
-                    if not price_ok(item.get("price"), floor, boost):
-                        continue
+                # буст: режем только явный перекуп над флором (низ не трогаем —
+                # ценовая категория уже задаёт абсолютный диапазон)
+                if floor is not None:
+                    p = item.get("price")
+                    try:
+                        p = int(p) if p is not None else None
+                    except Exception:
+                        p = None
+                    if p:
+                        hi = floor * (1.0 + max(boost, 50) / 100.0) * 3.0
+                        if p > hi:
+                            continue
                 if not item.get("owner_id") and not item.get("username"):
                     continue
                 out.append(item)
@@ -3929,7 +3955,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
 
     async def emit_pool(pool, use_global_seen=True, enforce_cap=False):
         for item in diversify(pool):
-            if not searching() or found[0] >= max_results:
+            if not still() or found[0] >= max_results:
                 break
             # дешёвые проверки ДО enrich — не жжём WEIRD бюджет впустую
             oid = item.get("owner_id")
@@ -3968,7 +3994,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         PARALLEL = 16
         all_pool = []
         for i in range(0, len(valid_pairs), PARALLEL):
-            if not searching() or found[0] >= max_results:
+            if not still() or found[0] >= max_results:
                 break
             chunk = valid_pairs[i:i + PARALLEL]
             parts = await asyncio.gather(
@@ -3988,19 +4014,19 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             await emit_pool(all_pool, use_global_seen=True, enforce_cap=True)
 
         # ДОБОР 1: без soft-cap (главный фикс недобора 4–6)
-        if searching() and found[0] < max_results and leftover:
+        if still() and found[0] < max_results and leftover:
             await progress("добор без cap...")
             batch = leftover
             leftover = []
             await emit_pool(batch, use_global_seen=True, enforce_cap=False)
 
         # ДОБОР 2: ещё страницы маркета без cap
-        if searching() and found[0] < max_results:
+        if still() and found[0] < max_results:
             await progress("добор лотов...")
             random.shuffle(valid_pairs)
             more = []
             for i in range(0, min(len(valid_pairs), 160), PARALLEL):
-                if not searching() or found[0] >= max_results:
+                if not still() or found[0] >= max_results:
                     break
                 chunk = valid_pairs[i:i + PARALLEL]
                 parts = await asyncio.gather(
@@ -4017,12 +4043,12 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 await emit_pool(more, use_global_seen=True, enforce_cap=False)
 
         # ДОБОР 3: без global seen, если всё ещё мало
-        if searching() and found[0] < max_results:
+        if still() and found[0] < max_results:
             await progress("повтор без старого антидубля...")
             random.shuffle(valid_pairs)
             pool2 = []
             for i in range(0, min(len(valid_pairs), 120), PARALLEL):
-                if not searching() or found[0] >= max_results:
+                if not still() or found[0] >= max_results:
                     break
                 chunk = valid_pairs[i:i + PARALLEL]
                 parts = await asyncio.gather(
@@ -4056,6 +4082,8 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
     chat_id = chat_id or (status_msg.chat.id if getattr(status_msg, "chat", None) else None)
     if search_token is not None and chat_id is not None:
         attach_search(chat_id, search_token)
+    def still():
+        return search_alive(chat_id, search_token)
     who = who or ("girls" if girls_only else "all")
     weird_mode = who in ("weird", "cringe", "pozor")
     try:
@@ -4217,7 +4245,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
         out = []
         offset = ""
         for _ in range(4 if single else 3):
-            if not searching():
+            if not still():
                 break
             try:
                 items, nxt = await fetch_market_page(gid, offset, limit=100, newest=True)
@@ -4246,7 +4274,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
 
     async def emit_pool(pool, use_global_seen=True, enforce_cap=False):
         for it in diversify(pool):
-            if not searching() or found[0] >= max_results:
+            if not still() or found[0] >= max_results:
                 break
             oid = it.get("owner_id")
             uname = it.get("username")
@@ -4282,7 +4310,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
         PARALLEL = 8 if single else 14
         pool = []
         for i in range(0, len(gids), PARALLEL):
-            if not searching() or found[0] >= max_results:
+            if not still() or found[0] >= max_results:
                 break
             chunk = gids[i:i + PARALLEL]
             parts = await asyncio.gather(*[fetch_col(g) for g in chunk], return_exceptions=True)
@@ -4299,13 +4327,13 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             await emit_pool(pool, use_global_seen=True, enforce_cap=(not single))
 
         # добор без soft-cap
-        if searching() and found[0] < max_results and leftover:
+        if still() and found[0] < max_results and leftover:
             batch = leftover
             leftover = []
             await emit_pool(batch, use_global_seen=True, enforce_cap=False)
 
         # добор из БД по exact slug
-        if searching() and found[0] < max_results and allowed_titles:
+        if still() and found[0] < max_results and allowed_titles:
             await progress("добор из БД...")
             need = max_results - found[0]
             hits = []
@@ -4326,11 +4354,11 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             await emit_pool(hits, use_global_seen=True, enforce_cap=False)
 
         # повтор без global seen — по ВСЕМ коллекциям, пока не набрали лимит
-        if searching() and found[0] < max_results:
+        if still() and found[0] < max_results:
             await progress("повтор без антидубля...")
             soft = []
             for g in gids:
-                if not searching() or found[0] >= max_results:
+                if not still() or found[0] >= max_results:
                     break
                 soft.extend(await fetch_col(g))
                 if len(soft) >= max_results * 4:
@@ -4358,6 +4386,8 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
     chat_id = chat_id or (status_msg.chat.id if getattr(status_msg, "chat", None) else None)
     if search_token is not None and chat_id is not None:
         attach_search(chat_id, search_token)
+    def still():
+        return search_alive(chat_id, search_token)
     who = who or ("girls" if girls_only else "all")
     weird_mode = who in ("weird", "cringe", "pozor")
     try:
@@ -4418,7 +4448,7 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             return False
 
     async def check_user(info):
-        if not searching() or found[0] >= max_results:
+        if not still() or found[0] >= max_results:
             return
         username = (info.get("username") or "").lstrip("@") or None
         uid = info.get("owner_id") or info.get("uid")
@@ -4496,7 +4526,7 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
 
     async def worker():
         while True:
-            if not searching() or found[0] >= max_results:
+            if not still() or found[0] >= max_results:
                 return
             try:
                 info = await asyncio.wait_for(q.get(), timeout=0.35)
@@ -4527,7 +4557,7 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             cands.extend(random_from_pricenft_db(limit=100, model=t, exact=True))
         random.shuffle(cands)
         for h in cands:
-            if not searching() or found[0] >= max_results:
+            if not still() or found[0] >= max_results:
                 break
             await q.put(h)
         feeder_done.set()
@@ -4537,7 +4567,7 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             for w in workers:
                 w.cancel()
         # soft: реально без global seen
-        if searching() and found[0] < max_results:
+        if still() and found[0] < max_results:
             ignore_global[0] = True
             feeder_done.clear()
             workers2 = [asyncio.create_task(worker()) for _ in range(6)]
@@ -4546,7 +4576,7 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                 more.extend(random_from_pricenft_db(limit=50, model=t, exact=True))
             random.shuffle(more)
             for h in more:
-                if not searching() or found[0] >= max_results:
+                if not still() or found[0] >= max_results:
                     break
                 await q.put(h)
             feeder_done.set()
