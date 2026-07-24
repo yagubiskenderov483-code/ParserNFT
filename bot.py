@@ -905,11 +905,11 @@ def settings_menu_kb(uid):
     mx_s    = str(mx) if mx > 0 else "без лимита"
     reg_lbl = REGIONS.get(reg, {}).get("label", "Все страны")
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Мин. гифтов: " + str(mn),   callback_data="set_min")],
-        [InlineKeyboardButton(text="Макс. гифтов: " + mx_s,     callback_data="set_max")],
-        [InlineKeyboardButton(text="Лимит выдачи: " + str(lim), callback_data="set_limit")],
-        [InlineKeyboardButton(text="🌍 Регион: " + reg_lbl,     callback_data="set_region")],
-        [InlineKeyboardButton(text="⬅️ Назад",                  callback_data="menu")],
+        [InlineKeyboardButton(text="Мин. гифтов в профиле: " + str(mn), callback_data="set_min")],
+        [InlineKeyboardButton(text="Макс. гифтов в профиле: " + mx_s,   callback_data="set_max")],
+        [InlineKeyboardButton(text="📌 Карточек за поиск: " + str(lim), callback_data="set_limit")],
+        [InlineKeyboardButton(text="🌍 Регион: " + reg_lbl,             callback_data="set_region")],
+        [InlineKeyboardButton(text="⬅️ Назад",                          callback_data="menu")],
     ])
 
 def boost_kb():
@@ -3521,7 +3521,7 @@ async def _start_market(cb, cat, girls):
         "Режим: свежие лоты\n"
         "Регион: " + reg_l + "\n"
         "Гифтов в профиле: от " + str(mn) + " до " + mx_s + "\n"
-        "Лимит выдачи: " + str(lim) + "</b>"
+        "Карточек за поиск: " + str(lim) + " (макс)</b>"
     )
     status = await bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=stop_kb())
     try:
