@@ -375,27 +375,33 @@ BOY_NAMES_SET = {
     "egor","maksim","vlad","danil","daniil","petya","serezha","kostya",
 }
 GIRL_SIGNALS = [
-    "girl","lady","woman","she/her","she her","♀","公主",
-    "👩","👸","💃","🌸","💖","💕","💗","👄","💄","🌺","🦋","🌷","🌹","💅","🦄","💫","✨","🍑","👑","🎀",
+    "girl","lady","woman","she/her","she her","♀",
+    "👩","👸","💃","🌸","💖","💕","💗","👄","💄","🌺","🦋","🌷","🌹","💅","🦄","💫","✨","🍑","👑","🎀","💋","❤","❤️","🩷","😻",
     "девушка","женщина","принцесса","королева","богиня",
     "красотка","кошечка","зайка","лапочка","милашка","красавица","малышка",
-    "onlyfans","модель","wife","girlfriend","miss_","mrs_","lady_",
+    "onlyfans","girlfriend",
 ]
-BOY_SIGNALS = [
-    "king","boss","dude","he/him","he him","♂",
-    "парень","мужик","мужчина","папа","отец","дядя",
-]
-# Короткие boy-сигналы — только как отдельные токены (не подстроки: male⊂female)
-BOY_SIGNAL_WORDS = {"bro", "guy", "male", "man", "boy", "он", "сын", "брат", "муж"}
+BOY_SIGNAL_WORDS = {
+    "bro","guy","male","man","boy","king","boss","dude","lord","sultan",
+    "парень","мужик","мужчина","папа","отец","дядя","сын","брат","муж","он",
+    "he","him",
+}
+MALE_NAME_EXCEPTIONS_A = {
+    # мужские имена на -a/-я
+    "dima","дима","nikita","никита","ilya","илья","ilja","foma","фома",
+    "luka","лука","kostya","костя","vanya","ваня","tolya","толя","petya","петя",
+    "seryozha","сережа","serezha","misha","миша","sasha","саша","zhenechka",
+    "мустафа","mustafa","joshua","cuba","dakota",
+}
 
 def is_girl(owner, username=None, name=None):
-    """Мягкий детект девушки по имени/username/эмодзи (маркет часто без bio)."""
+    """Детект девушки: имена, окончания, эмодзи, username. Без ложных male/king подстрок."""
     bio_raw   = (getattr(owner, "bio",        "") or "") if owner else ""
     uname_raw = (getattr(owner, "username",   "") or "") if owner else (username or "")
     fname_raw = (getattr(owner, "first_name", "") or "") if owner else ""
     lname_raw = (getattr(owner, "last_name",  "") or "") if owner else ""
     if not fname_raw and name:
-        parts = name.strip().split()
+        parts = str(name).strip().split()
         fname_raw = parts[0] if parts else ""
         lname_raw = parts[1] if len(parts) > 1 else ""
 
@@ -405,35 +411,29 @@ def is_girl(owner, username=None, name=None):
         s = re.sub(r"[^\w\sа-яёіїєґa-z]", " ", s, flags=re.IGNORECASE)
         return re.sub(r"\s+", " ", s).strip()
 
-    bio   = bio_raw.lower()
-    uname = uname_raw.lower()
-    fname = _clean(fname_raw)
-    lname = _clean(lname_raw)
+    uname  = (uname_raw or "").lower()
+    fname  = _clean(fname_raw)
+    lname  = _clean(lname_raw)
     fname0 = fname.split()[0] if fname else ""
     tokens = _name_tokens(fname, lname, uname, name, fname0)
-    full   = (bio + " " + uname + " " + fname + " " + lname).strip()
+    full   = ((bio_raw or "").lower() + " " + uname + " " + fname + " " + lname).strip()
     full_tokens = set(re.findall(r"[a-zа-яёіїєґ]+", full))
 
-    # Явный мужской сигнал-слово (не подстрока!)
-    bad = full_tokens & BOY_SIGNAL_WORDS
-    if bad and "female" not in full and "girl" not in full:
+    # Женские маркеры заранее — чтобы не срезать female/girl
+    has_girl_kw = any(x in full for x in ("girl", "female", "woman", "lady", "девушка", "женщина", "she/her"))
+
+    # Мужские слова только как целые токены
+    if (full_tokens & BOY_SIGNAL_WORDS) and not has_girl_kw:
         if fname0 not in GIRL_NAMES_SET and not (tokens & GIRL_NAMES_SET):
             return False
 
-    for sig in BOY_SIGNALS:
-        if sig and sig in full:
+    # Точное мужское имя
+    if fname0 in BOY_NAMES_SET and fname0 not in GIRL_NAMES_SET:
+        return False
+    if (tokens & BOY_NAMES_SET) and not (tokens & GIRL_NAMES_SET) and fname0 not in GIRL_NAMES_SET:
+        # если токен мужской и нет женского
+        if any(t in BOY_NAMES_SET and t not in GIRL_NAMES_SET for t in tokens):
             return False
-
-    # Мужское имя — точное совпадение
-    for bn in BOY_NAMES_SET:
-        if len(bn) < 3:
-            continue
-        if fname0 == bn and bn not in ("женя", "саша", "sasha", "жека"):
-            return False
-        if bn in tokens and bn not in GIRL_NAMES_SET and bn not in ("женя", "саша", "sasha", "жека"):
-            # alex в tokens при имени alexandra — alexandra тоже в tokens/GIRL
-            if not (tokens & GIRL_NAMES_SET):
-                return False
 
     score = 0
 
@@ -442,44 +442,41 @@ def is_girl(owner, username=None, name=None):
         score += 3
     else:
         for gn in GIRL_NAMES_SET:
-            if len(gn) >= 4 and fname0 and (fname0.startswith(gn) or (len(fname0) >= 3 and gn.startswith(fname0))):
+            if len(gn) >= 3 and fname0 and len(fname0) >= 3 and (fname0.startswith(gn) or gn.startswith(fname0)):
                 score += 3
                 break
 
-    # Женские окончания
-    GIRL_ENDINGS = ("на","ья","ия","ая","яя","га","за","са","ша","ча","жа","ца","ка","ла","ва","ня","ся","та","ра","да")
-    LAT_GIRL_ENDINGS = ("ia","ya","na","ra","la","sa","ta","ka","va","ina","ella","ette","elle","ie","ey","ine","lyn")
+    # Окончания имён
+    GIRL_ENDINGS = ("на","ья","ия","ая","яя","га","за","са","ша","ча","жа","ца","ка","ла","ва","ня","ся","та","ра","да","ма","па")
+    LAT_GIRL_ENDINGS = ("ia","ya","na","ra","la","sa","ta","ka","va","ina","ella","ette","elle","ine","lyn","ey","ie")
     if fname0 and len(fname0) >= 3:
         if any(fname0.endswith(e) for e in GIRL_ENDINGS):
             score += 2
         elif any(fname0.endswith(e) for e in LAT_GIRL_ENDINGS):
             score += 2
+        # эвристика: имя на -a/-я (кроме мужских исключений)
+        elif fname0[-1] in ("a", "а", "я", "я") and fname0 not in MALE_NAME_EXCEPTIONS_A:
+            if fname0 not in BOY_NAMES_SET:
+                score += 1
 
-    # Сигналы / эмодзи
+    # Эмодзи / сигналы
     for sig in GIRL_SIGNALS:
-        if sig and (sig in full or sig in bio_raw or sig in uname_raw or sig in fname_raw):
-            score += 1
+        if sig and (sig in full or sig in (bio_raw or "") or sig in uname_raw or sig in fname_raw):
+            score += 2
             break
-    GIRL_CHARS = {"💅","👩","👸","💃","🌸","💖","💕","💗","👄","💄","🌺","🦋","🌷","🌹","🦄","💫","✨","🍑","👑","♀","🎀","❤","😻","💋","🩷","❤️"}
-    if any(ch in bio_raw or ch in uname_raw or ch in fname_raw for ch in GIRL_CHARS):
+    GIRL_CHARS = set("💅👩👸💃🌸💖💕💗👄💄🌺🦋🌷🌹🦄💫✨🍑👑♀🎀❤😻💋🩷❤️💕💞💘💝")
+    if any(ch in (bio_raw or "") or ch in uname_raw or ch in fname_raw for ch in GIRL_CHARS):
         score += 2
 
     # username
-    if any(x in uname for x in ("girl", "lady", "miss", "princess", "queen", "babe")):
+    if any(x in uname for x in ("girl", "lady", "miss", "princess", "queen", "babe", "fem", "wife")):
         score += 2
     for gn in GIRL_NAMES_SET:
         if len(gn) >= 4 and gn in uname:
             score += 2
             break
 
-    # Порог 1 — маркет без bio
-    if score >= 1 and (fname0 or uname):
-        MALE_ENDINGS = ("ев","ов","ый","ий","ой")
-        if fname0 and len(fname0) >= 4 and any(fname0.endswith(e) for e in MALE_ENDINGS):
-            if fname0 not in GIRL_NAMES_SET and not (tokens & GIRL_NAMES_SET):
-                return False
-        return True
-    return False
+    return score >= 1 and bool(fname0 or uname)
 
 
 # ── MODEL DETECTION ───────────────────────────────────────────────────────────
@@ -1215,8 +1212,8 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                             min_gifts=1, max_gifts=0,
                             max_results=30, region="any"):
     """
-    Профиль: владельцы у которых ВООБЩЕ 0 гифтов на маркете.
-    Показываем только скрытые NFT.
+    Профиль: ищем владельцев со СКРЫТЫМИ NFT (не выставлены на маркет).
+    Показываем только гифты, которые НЕ на рынке.
     """
     global is_searching, SEEN_GLOBAL
     is_searching = True
@@ -1228,9 +1225,10 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
     owners_index = {}
     check_q = asyncio.Queue()
     checker_done = asyncio.Event()
+    stats_skip = {"market": 0, "empty": 0, "girl": 0, "range": 0}
 
     async def emit_owner(uid, info):
-        if uid in owners_index:
+        if not uid or uid in owners_index:
             return
         owners_index[uid] = info
         await check_q.put((uid, info))
@@ -1242,31 +1240,29 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             if uid in seen_sent:
                 return
 
-        owner_obj   = info["owner"]
-        username    = info["username"]
-        name        = info["name"]
-        profile_url = info["profile_url"] or (
+        owner_obj   = info.get("owner")
+        username    = info.get("username")
+        name        = info.get("name") or ""
+        profile_url = info.get("profile_url") or (
             ("https://t.me/" + username) if username else ("tg://user?id=" + str(uid))
         )
 
-        if region and region != "any":
-            if not region_match_full(owner_obj, username, name, region):
-                return
         if girls_only and not is_girl(owner_obj, username, name):
+            stats_skip["girl"] += 1
             return
 
-        # Строго: если хоть 1 гифт на маркете — пропускаем профиль
-        saved = await fetch_saved_gifts(
-            uid, max_pages=2, only_off_market=True, require_zero_on_market=True
-        )
-        if saved is None:
-            return  # есть лоты на маркете
+        # Все гифты профиля, потом оставляем только НЕ на маркете
+        saved = await fetch_saved_gifts(uid, max_pages=2, only_off_market=False, require_zero_on_market=False)
         if not saved:
+            stats_skip["empty"] += 1
             return
 
+        on_mkt = [g for g in saved if g.get("on_market")]
         hidden = []
         for g in saved:
-            if g.get("on_market") or not g.get("nft_url"):
+            if g.get("on_market"):
+                continue
+            if not g.get("nft_url"):
                 continue
             slug = g["nft_url"].split("/")[-1]
             async with lock:
@@ -1275,13 +1271,17 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                 seen_nfts.add(slug)
             hidden.append(g)
 
+        # Нужны скрытые; если на маркете тоже есть — всё равно показываем ТОЛЬКО скрытые
+        # (в выдаче 0 лотов с маркета). Если скрытых нет — пропуск.
         if not hidden:
+            stats_skip["market"] += 1
             return
 
         async with lock:
             if uid in seen_sent or found[0] >= max_results:
                 return
             if not gifts_in_range(len(hidden), min_gifts, max_gifts):
+                stats_skip["range"] += 1
                 return
             seen_sent.add(uid)
             SEEN_GLOBAL.add(uid)
@@ -1290,7 +1290,8 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         owner_s = fmt_owner(owner_obj, username, name)
         first_nft_url = hidden[0].get("nft_url")
         nft_count = len(hidden)
-        txt = ("<b>" + owner_s + "\nСкрытых NFT (0 на маркете): " + str(nft_count) + "</b>"
+        mkt_note = "" if not on_mkt else ""
+        txt = ("<b>" + owner_s + "\nСкрытых NFT (не на рынке): " + str(nft_count) + "</b>"
                + _make_nft_lines(hidden))
         kb = owner_card_kb(username, profile_url, uid,
                            nft_url_for_msg=first_nft_url if nft_count == 1 else None,
@@ -1312,7 +1313,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             if not is_searching or found[0] >= max_results:
                 return
             try:
-                item = await asyncio.wait_for(check_q.get(), timeout=0.5)
+                item = await asyncio.wait_for(check_q.get(), timeout=0.6)
             except asyncio.TimeoutError:
                 if checker_done.is_set() and check_q.empty():
                     return
@@ -1325,44 +1326,74 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
 
     try:
         await status_msg.edit_text(
-            "<b>Ищу профили с 0 гифтов на маркете...</b>",
+            "<b>Ищу скрытые NFT (не на рынке)...</b>",
             parse_mode="HTML", reply_markup=stop_kb()
         )
-        workers = [asyncio.create_task(worker()) for _ in range(12)]
+        workers = [asyncio.create_task(worker()) for _ in range(14)]
 
-        # Кандидаты: участники NFT-чатов (не текущие продавцы маркета —
-        # у продавцов уже есть лоты на рынке)
-        chat_tasks = [get_chat_members_with_gifts(ch, max_users=400) for ch in NFT_SCAN_CHATS]
-        chat_results = await asyncio.gather(*chat_tasks, return_exceptions=True)
-        for res in chat_results:
+        # 1) Кандидаты с маркета — у них часто есть ещё скрытые гифты
+        shuffled = list(gift_ids)
+        random.shuffle(shuffled)
+        PARALLEL = 12
+        for i in range(0, len(shuffled), PARALLEL):
             if not is_searching or found[0] >= max_results:
                 break
-            if isinstance(res, Exception):
-                continue
-            for (u_obj, uid) in res:
-                fn    = (getattr(u_obj, "first_name", "") or "")
-                ln    = (getattr(u_obj, "last_name",  "") or "")
-                uname = getattr(u_obj, "username", None)
-                name  = (fn + " " + ln).strip()
-                if region and region != "any" and not region_match_full(u_obj, uname, name, region):
-                    continue
-                if girls_only and not is_girl(u_obj, uname, name):
-                    continue
-                p_url = ("https://t.me/" + uname) if uname else ("tg://user?id=" + str(uid))
-                await emit_owner(uid, {"owner": u_obj, "username": uname,
-                                       "name": name, "profile_url": p_url})
-
-        try:
-            await status_msg.edit_text(
-                "<b>Проверяю профили...</b>\nВ очереди: " + str(len(owners_index))
-                + "\nНайдено: " + str(found[0]),
-                parse_mode="HTML", reply_markup=stop_kb()
+            batch = shuffled[i:i+PARALLEL]
+            pages = await asyncio.gather(
+                *[fetch_market_page(gid, "", limit=100, newest=True) for gid in batch],
+                return_exceptions=True,
             )
-        except Exception:
-            pass
+            for res in pages:
+                if isinstance(res, Exception):
+                    continue
+                items, _ = res
+                for item in items:
+                    oid = item.get("owner_id")
+                    if not oid:
+                        continue
+                    if girls_only and not is_girl(item.get("owner"), item.get("username"), item.get("name")):
+                        continue
+                    await emit_owner(oid, {
+                        "owner": item.get("owner"),
+                        "username": item.get("username"),
+                        "name": item.get("name") or "",
+                        "profile_url": item.get("profile_url"),
+                    })
+            if len(owners_index) >= 8000:
+                break
+            try:
+                await status_msg.edit_text(
+                    "<b>Собираю владельцев...</b>\nВ очереди: " + str(len(owners_index))
+                    + "\nНайдено скрытых: " + str(found[0]),
+                    parse_mode="HTML", reply_markup=stop_kb()
+                )
+            except Exception:
+                pass
+
+        # 2) Чаты — доп. база
+        if is_searching and found[0] < max_results:
+            chat_results = await asyncio.gather(
+                *[get_chat_members_with_gifts(ch, max_users=300) for ch in NFT_SCAN_CHATS],
+                return_exceptions=True,
+            )
+            for res in chat_results:
+                if not is_searching or found[0] >= max_results:
+                    break
+                if isinstance(res, Exception):
+                    continue
+                for (u_obj, uid) in res:
+                    fn = (getattr(u_obj, "first_name", "") or "")
+                    ln = (getattr(u_obj, "last_name", "") or "")
+                    uname = getattr(u_obj, "username", None)
+                    name = (fn + " " + ln).strip()
+                    if girls_only and not is_girl(u_obj, uname, name):
+                        continue
+                    p_url = ("https://t.me/" + uname) if uname else ("tg://user?id=" + str(uid))
+                    await emit_owner(uid, {"owner": u_obj, "username": uname, "name": name, "profile_url": p_url})
 
         checker_done.set()
         await asyncio.gather(*workers, return_exceptions=True)
+        logger.info("profile_search done found=%s skips=%s queue=%s", found[0], stats_skip, len(owners_index))
     except Exception as e:
         logger.error("do_profile_search: %s", e)
     finally:
