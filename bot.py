@@ -359,7 +359,7 @@ GIRL_NAMES_SET = {
     "zhanna","regina","amina","mila","rita","liza","sonia","tonya","lesya",
     "kamilla","camilla","evelina","milena","yasmin","lara","lada","mila",
     "dashka","mashka","katusha","yulya","uliya","nastenka","polinka","alenka",
-    "karinka","alinа".replace("а","a") if False else "alina",
+    "karinka",
 }
 BOY_NAMES_SET = {
     "александр","алексей","андрей","антон","артем","борис","вадим","василий",
