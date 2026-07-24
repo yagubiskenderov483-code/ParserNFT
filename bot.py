@@ -4466,7 +4466,17 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                 nft_url = h.get("nft_url")
                 if use_global_seen and (is_owner_seen(uid, uname) or is_gift_seen(nft_url)):
                     continue
-                if not who_pass(None, uname, name, who):
+                # girls: на БД часто нет имени — в soft-волне не режем так жёстко
+                if who == "girls":
+                    if use_global_seen:
+                        if not is_girl(None, uname, name, strict=False):
+                            continue
+                    else:
+                        # только явных пацанов режем
+                        low = ((name or "") + " " + (uname or "")).lower()
+                        if any(x in low for x in ("boy", "male", "парень", "мужик", "he/him")):
+                            continue
+                elif not who_pass(None, uname, name, who):
                     continue
                 if region and region != "any":
                     if not region_match_full(None, uname, name, region):
