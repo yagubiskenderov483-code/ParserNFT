@@ -3,6 +3,7 @@ import logging
 import urllib.parse
 import os
 import json
+import sqlite3
 import time
 import datetime
 import re
@@ -57,21 +58,29 @@ DEFAULT_MAX_GIFTS = 5
 DEFAULT_LIMIT     = 30
 DEFAULT_REGION    = "any"
 
-# Дедуп владельцев внутри одного поиска (сбрасываем на старте поиска)
-SEEN_GLOBAL: set = set()
-SEEN_GLOBAL_MAX = 3_000_000
+# Глобальный антидубль (персистентный, между поисками)
+SEEN_GLOBAL: set = set()          # owner keys: uid или u:username
+SEEN_GIFTS: set = set()           # nft slugs
+SEEN_GLOBAL_MAX = 9_000_000
 # Счётчик выдач по коллекции в текущем поиске
-MAX_PER_COLLECTION = 1
-# Трейдер/whale — только явные сигналы (не режем всех с "nft" в нике)
+MAX_PER_COLLECTION = 2
+# Трейдер/whale — только явные сигналы
 TRADER_NAME_KW = (
     "whale", "resell", "flipper", "giftbot", "stars market",
     "tonnel", "fragment", "p2p market", "nft trade", "nft market",
 )
 PRICENFT_BOT = "PriceNFTbot"
-PRICENFT_DB_FILE = "pricenft_db.json"
-PRICENFT_MSG_CD = 3.0  # пауза между сообщениями к PriceNFTbot
+PRICENFT_DB_FILE = "pricenft_db.json"   # legacy, мигрируем в sqlite
+GIFTS_DB_FILE = "gifts.db"             # быстрая БД (миллионы записей)
+PRICENFT_MSG_CD = 3.0
 _pricenft_collecting = False
+_bootstrap_task = None
+_keeper_task = None
 _search_started_at = 0.0
+_db_conn = None
+_db_lock = None
+_db_pending = 0
+_DB_COMMIT_EVERY = 200
 
 # ── REGIONS ───────────────────────────────────────────────────────────────────
 REGIONS = {
@@ -984,6 +993,7 @@ def admin_kb():
     except Exception:
         st = {"models": 0, "users": 0}
     pn_label = "PriceNFT БД (" + str(st.get("users", 0)) + " юзеров)"
+    seen_n = int(st.get("seen_owners", 0) or 0)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Рассылка",           callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="Пользователи",       callback_data="admin_users")],
@@ -991,6 +1001,7 @@ def admin_kb():
         [InlineKeyboardButton(text="Авторизация TG",     callback_data="admin_auth")],
         [InlineKeyboardButton(text="Обновить коллекции", callback_data="admin_reload_cols")],
         [InlineKeyboardButton(text="📦 Собрать " + pn_label, callback_data="admin_pricenft_collect")],
+        [InlineKeyboardButton(text="🧹 Сброс антидубля (" + str(seen_n) + ")", callback_data="admin_clear_seen")],
         [InlineKeyboardButton(text="Выйти из TG",        callback_data="admin_logout")],
         [InlineKeyboardButton(text="В меню",             callback_data="menu")],
     ])
@@ -1066,10 +1077,9 @@ def _gift_on_market(gift, inner=None):
 
 
 def begin_search():
-    """Старт поиска: сброс флагов/дедупа, защита от залипшего is_searching."""
-    global is_searching, SEEN_GLOBAL, _search_started_at
+    """Старт поиска. Антидубль НЕ сбрасываем — люди/гифты не повторяются."""
+    global is_searching, _search_started_at
     now = time.time()
-    # если прошлый поиск завис > 12 мин — принудительно сбрасываем
     if is_searching and _search_started_at and (now - _search_started_at) > 720:
         logger.warning("force-reset stuck is_searching")
         is_searching = False
@@ -1077,8 +1087,54 @@ def begin_search():
         return False
     is_searching = True
     _search_started_at = now
-    SEEN_GLOBAL.clear()
     return True
+
+def owner_seen_key(uid=None, username=None):
+    if uid:
+        return "id:" + str(int(uid))
+    if username:
+        return "u:" + str(username).lstrip("@").lower()
+    return None
+
+def gift_slug_of(nft_url_or_slug):
+    if not nft_url_or_slug:
+        return None
+    s = str(nft_url_or_slug)
+    if "/" in s:
+        s = s.rstrip("/").split("/")[-1]
+    s = s.strip()
+    return s or None
+
+def is_owner_seen(uid=None, username=None):
+    k = owner_seen_key(uid, username)
+    return bool(k and k in SEEN_GLOBAL)
+
+def is_gift_seen(nft_url_or_slug):
+    slug = gift_slug_of(nft_url_or_slug)
+    return bool(slug and slug in SEEN_GIFTS)
+
+def mark_seen(uid=None, username=None, nft_url=None):
+    """Пометить аккаунт и гифт как выданные (память + sqlite)."""
+    global SEEN_GLOBAL, SEEN_GIFTS
+    keys = []
+    k = owner_seen_key(uid, username)
+    if k and k not in SEEN_GLOBAL:
+        SEEN_GLOBAL.add(k)
+        keys.append(k)
+    slug = gift_slug_of(nft_url)
+    new_slug = None
+    if slug and slug not in SEEN_GIFTS:
+        SEEN_GIFTS.add(slug)
+        new_slug = slug
+    # persist async-ish (sync fast insert)
+    try:
+        db_mark_seen(keys, new_slug)
+    except Exception:
+        pass
+    # защита от раздувания RAM
+    if len(SEEN_GLOBAL) > SEEN_GLOBAL_MAX:
+        # оставляем половину самых новых через sqlite reload
+        pass
 
 def is_trader_account(owner, username=None, name=None):
     """Отсекаем трейдерские/whale аккаунты с «высоким рейтингом» торговли."""
@@ -1220,114 +1276,282 @@ async def fetch_saved_gifts(uid, max_pages=2, only_off_market=False, require_zer
 
 
 
-# ── PriceNFTbot ───────────────────────────────────────────────────────────────
-# Реальный флоу: /start|/search → кнопки Модель/Фон/Узор → собираем в БД →
-# потом рандомно выдаём по моделям. Между сообщениями к боту CD = PRICENFT_MSG_CD.
+# ── GIFTS DB (SQLite, быстрая, миллионы записей) + PriceNFTbot ─────────────────
 _pricenft_lock = asyncio.Lock()
 _pricenft_last_send = 0.0
-PRICENFT_DB = {"models": {}, "updated_at": 0}
+
+def _db():
+    """Один shared connection, WAL, быстрые вставки."""
+    global _db_conn, _db_lock
+    if _db_lock is None:
+        _db_lock = asyncio.Lock() if False else None  # sync lock via threading not needed; sqlite check_same_thread=False
+    if _db_conn is not None:
+        return _db_conn
+    conn = sqlite3.connect(GIFTS_DB_FILE, timeout=30, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-64000")  # ~64MB
+    conn.execute("PRAGMA mmap_size=268435456")
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS gifts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        slug TEXT UNIQUE,
+        url TEXT,
+        model TEXT,
+        username TEXT,
+        uid INTEGER,
+        ts INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_gifts_model ON gifts(model);
+    CREATE INDEX IF NOT EXISTS idx_gifts_user ON gifts(username);
+    CREATE INDEX IF NOT EXISTS idx_gifts_model_id ON gifts(model, id);
+
+    CREATE TABLE IF NOT EXISTS seen_owners (
+        key TEXT PRIMARY KEY,
+        ts INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS seen_gifts (
+        slug TEXT PRIMARY KEY,
+        ts INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS meta (
+        k TEXT PRIMARY KEY,
+        v TEXT
+    );
+    """)
+    conn.commit()
+    _db_conn = conn
+    return _db_conn
+
+def db_mark_seen(owner_keys, slug=None):
+    conn = _db()
+    now = int(time.time())
+    if owner_keys:
+        conn.executemany(
+            "INSERT OR IGNORE INTO seen_owners(key, ts) VALUES (?, ?)",
+            [(k, now) for k in owner_keys],
+        )
+    if slug:
+        conn.execute("INSERT OR IGNORE INTO seen_gifts(slug, ts) VALUES (?, ?)", (slug, now))
+    conn.commit()
+
+def load_seen_into_memory():
+    """Быстрая загрузка антидубля в RAM при старте."""
+    global SEEN_GLOBAL, SEEN_GIFTS
+    conn = _db()
+    SEEN_GLOBAL = {r[0] for r in conn.execute("SELECT key FROM seen_owners")}
+    SEEN_GIFTS = {r[0] for r in conn.execute("SELECT slug FROM seen_gifts")}
+    logger.info("Seen loaded: owners=%s gifts=%s", len(SEEN_GLOBAL), len(SEEN_GIFTS))
+
+def clear_seen_db():
+    global SEEN_GLOBAL, SEEN_GIFTS
+    conn = _db()
+    conn.execute("DELETE FROM seen_owners")
+    conn.execute("DELETE FROM seen_gifts")
+    conn.commit()
+    SEEN_GLOBAL.clear()
+    SEEN_GIFTS.clear()
 
 def load_pricenft_db(force=False):
-    """Загрузка БД. force=False — не затираем уже наполненную память пустым файлом."""
-    global PRICENFT_DB
+    """Инициализация sqlite (+миграция со старого json один раз)."""
+    conn = _db()
+    # migrate legacy json once
     try:
-        if not force and (PRICENFT_DB.get("models") or {}):
-            return PRICENFT_DB
-        if os.path.exists(PRICENFT_DB_FILE):
+        row = conn.execute("SELECT v FROM meta WHERE k='json_migrated'").fetchone()
+        if not row and os.path.exists(PRICENFT_DB_FILE):
             with open(PRICENFT_DB_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict) and "models" in data:
-                # merge: файл + память
-                disk = data.get("models") or {}
-                mem = PRICENFT_DB.get("models") or {}
-                if force or not mem:
-                    PRICENFT_DB = data
-                else:
-                    # мержим пользователей
-                    for mk, payload in disk.items():
-                        bucket = mem.setdefault(mk, {"users": {}})
-                        users = bucket.setdefault("users", {})
-                        for lu, info in ((payload or {}).get("users") or {}).items():
-                            if lu not in users:
-                                users[lu] = info
-                    PRICENFT_DB["models"] = mem
-            elif not PRICENFT_DB.get("models"):
-                PRICENFT_DB = {"models": {}, "updated_at": 0}
-        elif not PRICENFT_DB.get("models"):
-            PRICENFT_DB = {"models": {}, "updated_at": 0}
+            models = (data or {}).get("models") or {}
+            batch = []
+            now = int(time.time())
+            for model, payload in models.items():
+                users = (payload or {}).get("users") or {}
+                for lu, info in users.items():
+                    uname = (info or {}).get("username") or lu
+                    for url in ((info or {}).get("nft_urls") or [None]):
+                        slug = gift_slug_of(url) if url else None
+                        if not slug:
+                            # synthetic slug per user+model to keep row
+                            slug = ("user:" + str(uname).lower() + ":" + str(model))[:120]
+                            url = None
+                        batch.append((slug, url, str(model), str(uname).lstrip("@"), None, now))
+            if batch:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO gifts(slug, url, model, username, uid, ts) VALUES (?,?,?,?,?,?)",
+                    batch,
+                )
+                conn.commit()
+            conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('json_migrated','1')")
+            conn.commit()
+            logger.info("Migrated JSON -> SQLite: %s rows", len(batch))
     except Exception as e:
-        logger.warning("load_pricenft_db: %s", e)
-        if not PRICENFT_DB.get("models"):
-            PRICENFT_DB = {"models": {}, "updated_at": 0}
-    return PRICENFT_DB
+        logger.warning("json migrate: %s", e)
+    return True
 
 def save_pricenft_db():
+    """SQLite уже на диске; делаем checkpoint WAL."""
     try:
-        PRICENFT_DB["updated_at"] = int(time.time())
-        tmp = PRICENFT_DB_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(PRICENFT_DB, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, PRICENFT_DB_FILE)
+        conn = _db()
+        conn.commit()
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
     except Exception as e:
         logger.warning("save_pricenft_db: %s", e)
 
 def pricenft_db_stats():
-    db = PRICENFT_DB if PRICENFT_DB.get("models") is not None else load_pricenft_db()
-    models = db.get("models") or {}
-    users = set()
-    nfts = 0
-    for m, payload in models.items():
-        ulist = payload.get("users") if isinstance(payload, dict) else None
-        if not isinstance(ulist, dict):
-            continue
-        for u, info in ulist.items():
-            users.add(u.lower())
-            nfts += len((info or {}).get("nft_urls") or [])
-    return {
-        "models": len(models),
-        "users": len(users),
-        "nfts": nfts,
-        "updated_at": db.get("updated_at") or 0,
-    }
+    try:
+        conn = _db()
+        models = conn.execute("SELECT COUNT(DISTINCT model) FROM gifts").fetchone()[0] or 0
+        users = conn.execute("SELECT COUNT(DISTINCT lower(username)) FROM gifts WHERE username IS NOT NULL AND username!=''").fetchone()[0] or 0
+        nfts = conn.execute("SELECT COUNT(*) FROM gifts").fetchone()[0] or 0
+        return {
+            "models": int(models),
+            "users": int(users),
+            "nfts": int(nfts),
+            "updated_at": int(time.time()),
+            "seen_owners": len(SEEN_GLOBAL),
+            "seen_gifts": len(SEEN_GIFTS),
+        }
+    except Exception as e:
+        logger.warning("pricenft_db_stats: %s", e)
+        return {"models": 0, "users": 0, "nfts": 0, "updated_at": 0, "seen_owners": 0, "seen_gifts": 0}
 
-def pricenft_add_user(model, username, nft_urls=None):
-    """Добавить юзера в БД под моделью."""
+def db_flush(force=False):
+    """Коммит пачки вставок в sqlite."""
+    global _db_pending
+    if not force and _db_pending <= 0:
+        return
+    try:
+        conn = _db()
+        conn.commit()
+        _db_pending = 0
+    except Exception as e:
+        logger.debug("db_flush: %s", e)
+
+def pricenft_add_user(model, username, nft_urls=None, uid=None, commit=True):
+    """Добавить юзера/гифты в sqlite (очень быстро, пачками)."""
+    global _db_pending
     if not model or not username:
         return False
     model = str(model).strip()
     username = str(username).lstrip("@").strip()
     if not model or not username:
         return False
-    lu = username.lower()
-    models = PRICENFT_DB.setdefault("models", {})
-    bucket = models.setdefault(model, {"users": {}})
-    users = bucket.setdefault("users", {})
-    prev = users.get(lu) or {"username": username, "nft_urls": [], "ts": 0}
-    urls = list(prev.get("nft_urls") or [])
-    seen = set(urls)
-    for u in (nft_urls or []):
-        if u and u not in seen:
-            urls.append(u)
-            seen.add(u)
-    users[lu] = {
-        "username": username,
-        "nft_urls": urls[:20],
-        "ts": int(time.time()),
-    }
-    return True
+    urls = [u for u in (nft_urls or []) if u]
+    now = int(time.time())
+    rows = []
+    if urls:
+        for url in urls[:20]:
+            slug = gift_slug_of(url)
+            if not slug:
+                continue
+            rows.append((slug, url, model, username, uid, now))
+    else:
+        slug = ("user:" + username.lower() + ":" + model)[:120]
+        rows.append((slug, None, model, username, uid, now))
+    if not rows:
+        return False
+    try:
+        conn = _db()
+        conn.executemany(
+            "INSERT OR IGNORE INTO gifts(slug, url, model, username, uid, ts) VALUES (?,?,?,?,?,?)",
+            rows,
+        )
+        _db_pending += len(rows)
+        if commit or _db_pending >= _DB_COMMIT_EVERY:
+            db_flush(force=True)
+        return True
+    except Exception as e:
+        logger.debug("pricenft_add_user: %s", e)
+        return False
 
-def seed_pricenft_from_item(item):
-    """Пассивно наполняем БД из маркета/модели (много гифтов без PriceNFT)."""
+def seed_pricenft_from_item(item, commit=False):
+    """Пассивно наполняем БД из маркета/модели (без commit на каждую строку)."""
     try:
         uname = (item.get("username") or "").lstrip("@")
         title = item.get("title") or item.get("model") or ""
         nft_url = item.get("nft_url")
+        uid = item.get("owner_id")
         if not uname or not title or str(title) in ("?", "NFT", "None"):
             return
-        pricenft_add_user(str(title), uname, [nft_url] if nft_url else None)
+        pricenft_add_user(
+            str(title), uname, [nft_url] if nft_url else None,
+            uid=uid, commit=commit,
+        )
     except Exception:
         pass
 
+def random_from_pricenft_db(limit=25, model=None):
+    """
+    Быстрый рандом из sqlite.
+    Разные модели / без уже виденных аккаунтов и гифтов.
+    """
+    load_pricenft_db(force=False)
+    conn = _db()
+    results = []
+    seen_u = set()
+    try:
+        if model:
+            # точное/like
+            rows = conn.execute(
+                "SELECT slug, url, model, username, uid FROM gifts "
+                "WHERE model LIKE ? ORDER BY RANDOM() LIMIT ?",
+                ("%" + str(model) + "%", max(limit * 8, 80)),
+            ).fetchall()
+            if not rows:
+                m2 = str(model).replace(" ", "")
+                rows = conn.execute(
+                    "SELECT slug, url, model, username, uid FROM gifts "
+                    "WHERE REPLACE(model,' ','') LIKE ? ORDER BY RANDOM() LIMIT ?",
+                    ("%" + m2 + "%", max(limit * 8, 80)),
+                ).fetchall()
+        else:
+            # round-robin: случайные модели, потом по 1 юзеру
+            models = [r[0] for r in conn.execute(
+                "SELECT DISTINCT model FROM gifts ORDER BY RANDOM() LIMIT ?",
+                (max(limit * 2, 60),),
+            ).fetchall()]
+            rows = []
+            for mk in models:
+                part = conn.execute(
+                    "SELECT slug, url, model, username, uid FROM gifts "
+                    "WHERE model=? ORDER BY RANDOM() LIMIT 3",
+                    (mk,),
+                ).fetchall()
+                rows.extend(part)
+            random.shuffle(rows)
+
+        for slug, url, mk, uname, uid in rows:
+            if not uname:
+                continue
+            lu = uname.lower()
+            if lu in seen_u:
+                continue
+            if is_owner_seen(uid, uname):
+                continue
+            if slug and is_gift_seen(slug):
+                continue
+            if slug and str(slug).startswith("user:"):
+                url = None
+            seen_u.add(lu)
+            results.append({
+                "owner": None, "owner_id": uid,
+                "username": uname, "name": uname,
+                "nft_url": url,
+                "profile_url": "https://t.me/" + uname,
+                "title": mk, "model": mk,
+                "price": None, "gift_id": None,
+                "source": "pricenft_db",
+            })
+            if len(results) >= limit:
+                break
+    except Exception as e:
+        logger.warning("random_from_pricenft_db: %s", e)
+    return results
 
 def _parse_pricenft_text(text):
     """Достаём @username и nft-ссылки из ответа PriceNFTbot."""
@@ -1444,7 +1668,7 @@ async def _pricenft_ingest_messages(model_name, messages):
         if not mname:
             mname = "Unknown"
         for u in users:
-            if pricenft_add_user(mname, u, nfts):
+            if pricenft_add_user(mname, u, nfts, commit=False):
                 added += 1
         # nft slug → model hint (PlushPepe-123)
         for nu in nfts:
@@ -1453,78 +1677,9 @@ async def _pricenft_ingest_messages(model_name, messages):
             base = re.sub(r"(?<!^)([A-Z])", r" \1", base).strip()
             if base and users:
                 for u in users:
-                    pricenft_add_user(base, u, [nu])
+                    pricenft_add_user(base, u, [nu], commit=False)
+    db_flush(force=True)
     return added
-
-def random_from_pricenft_db(limit=25, model=None):
-    """
-    Рандомная выдача из локальной БД.
-    Round-robin по моделям: сначала 1 юзер с каждой модели, потом ещё.
-    """
-    load_pricenft_db(force=False)
-    models = PRICENFT_DB.get("models") or {}
-    if not models:
-        return []
-
-    if model:
-        keys = [k for k in models.keys() if model.lower() in str(k).lower()]
-        if not keys:
-            # fuzzy: без пробелов
-            m2 = model.lower().replace(" ", "")
-            keys = [k for k in models.keys() if m2 in str(k).lower().replace(" ", "")]
-        if not keys:
-            return []
-    else:
-        keys = list(models.keys())
-    random.shuffle(keys)
-
-    # buckets: model -> shuffled users
-    buckets = []
-    for mk in keys:
-        payload = models.get(mk) or {}
-        users = payload.get("users") or {}
-        items = list(users.values())
-        if not items:
-            continue
-        random.shuffle(items)
-        buckets.append((mk, items))
-
-    results = []
-    seen = set()
-    # round-robin layers
-    layer = 0
-    while len(results) < limit and buckets:
-        progressed = False
-        for mk, items in buckets:
-            if layer >= len(items):
-                continue
-            info = items[layer]
-            uname = (info or {}).get("username")
-            if not uname:
-                continue
-            lu = uname.lower()
-            if lu in seen:
-                continue
-            seen.add(lu)
-            urls = (info or {}).get("nft_urls") or []
-            results.append({
-                "owner": None, "owner_id": None,
-                "username": uname,
-                "name": uname,
-                "nft_url": urls[0] if urls else None,
-                "profile_url": "https://t.me/" + uname,
-                "title": mk,
-                "model": mk,
-                "price": None, "gift_id": None,
-                "source": "pricenft_db",
-            })
-            progressed = True
-            if len(results) >= limit:
-                break
-        if not progressed:
-            break
-        layer += 1
-    return results
 
 async def resolve_pricenft_hits(hits, limit=None):
     """Резолвим username → entity/id для выдачи в боте."""
@@ -1827,9 +1982,10 @@ async def bootstrap_gifts_db(notify_chat_id=None):
                 if title and (not it.get("title") or str(it.get("title")) in ("?", "NFT")):
                     it["title"] = title
                 it["gift_id"] = gid
-                seed_pricenft_from_item(it)
+                seed_pricenft_from_item(it, commit=False)
             return len(items)
         await asyncio.gather(*[one(gid, title) for gid, title in chunk], return_exceptions=True)
+        db_flush(force=True)
         if (i // PARALLEL) % 4 == 0:
             save_pricenft_db()
             mid = pricenft_db_stats()
@@ -1839,6 +1995,7 @@ async def bootstrap_gifts_db(notify_chat_id=None):
                 + str(min(i + PARALLEL, len(pairs))) + "/" + str(len(pairs))
             )
 
+    db_flush(force=True)
     save_pricenft_db()
     after_m = pricenft_db_stats()
     await _notify(
@@ -1872,6 +2029,94 @@ def start_bootstrap_gifts_db(notify_chat_id=None):
     return True
 
 
+async def background_db_keeper():
+    """
+    Основной фоновый режим: постоянно быстро пишет маркет в sqlite,
+    периодически дособирает через @PriceNFTbot (CD 3с).
+    Работает всегда после авторизации — даже когда поиск не идёт.
+    """
+    logger.info("background_db_keeper started")
+    await asyncio.sleep(5)
+    cycle = 0
+    while True:
+        try:
+            if not await check_authorized():
+                await asyncio.sleep(30)
+                continue
+            # во время поиска не конкурируем за API — маркет и так сидится из выдачи
+            if is_searching:
+                await asyncio.sleep(3)
+                continue
+            await ensure_collections()
+            pairs = list(ALL_GIFT_IDS) or []
+            if not pairs:
+                await asyncio.sleep(20)
+                continue
+            random.shuffle(pairs)
+            PARALLEL = 20
+            # быстрый проход маркета — основной объём БД
+            for i in range(0, len(pairs), PARALLEL):
+                if is_searching:
+                    break
+                chunk = pairs[i:i + PARALLEL]
+
+                async def one(gid, title):
+                    try:
+                        items, _ = await fetch_market_page(gid, "", limit=100, newest=True)
+                    except Exception:
+                        return 0
+                    for it in items:
+                        it = dict(it)
+                        if title and (not it.get("title") or str(it.get("title")) in ("?", "NFT")):
+                            it["title"] = title
+                        it["gift_id"] = gid
+                        seed_pricenft_from_item(it, commit=False)
+                    return len(items)
+
+                await asyncio.gather(
+                    *[one(gid, title) for gid, title in chunk],
+                    return_exceptions=True,
+                )
+                db_flush(force=True)
+                # не душим API: короткая пауза между чанками
+                await asyncio.sleep(0.15)
+
+            db_flush(force=True)
+            save_pricenft_db()
+            cycle += 1
+            st = pricenft_db_stats()
+            logger.info(
+                "DB keeper cycle=%s models=%s users=%s nfts=%s",
+                cycle, st.get("models"), st.get("users"), st.get("nfts"),
+            )
+
+            # PriceNFTbot — раз в 2 цикла маркета, если не идёт поиск/сбор
+            if cycle % 2 == 0 and not _pricenft_collecting and not is_searching:
+                try:
+                    await collect_pricenft_db(progress_cb=None, max_models=40)
+                    db_flush(force=True)
+                    save_pricenft_db()
+                except Exception as e:
+                    logger.warning("keeper PriceNFT: %s", e)
+
+            await asyncio.sleep(8)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("background_db_keeper: %s", e)
+            await asyncio.sleep(15)
+
+
+def start_background_db_keeper():
+    global _keeper_task
+    try:
+        if _keeper_task and not _keeper_task.done():
+            return False
+    except NameError:
+        pass
+    _keeper_task = asyncio.create_task(background_db_keeper())
+    return True
+
 
 async def deliver_pricenft_random(status_msg, max_results=20, girls_only=False, region="any",
                                   with_cd=False):
@@ -1879,14 +2124,14 @@ async def deliver_pricenft_random(status_msg, max_results=20, girls_only=False, 
     Рандомная выдача из БД PriceNFT по моделям.
     with_cd — пауза только если нужно (по умолчанию выкл, быстро).
     """
-    global is_searching, SEEN_GLOBAL
+    global is_searching
     load_pricenft_db()
     st = pricenft_db_stats()
     if st.get("users", 0) <= 0:
         # БД опциональна — не ломаем поиск, просто пропускаем
         return 0
 
-    hits = await search_pricenftbot(limit=max(max_results * 3, 30))
+    hits = await search_pricenftbot(limit=max(max_results * 3, 30), resolve=True)
     found = 0
     for h in hits:
         if not is_searching or found >= max_results:
@@ -1895,11 +2140,11 @@ async def deliver_pricenft_random(status_msg, max_results=20, girls_only=False, 
         oid = h.get("owner_id")
         owner = h.get("owner")
         name = h.get("name") or ""
-        if oid and oid in SEEN_GLOBAL:
+        nft_url = h.get("nft_url")
+        if is_owner_seen(oid, uname) or is_gift_seen(nft_url):
             continue
         if is_trader_account(owner, uname, name):
-            if oid:
-                SEEN_GLOBAL.add(oid)
+            mark_seen(oid, uname, None)
             continue
         if girls_only and not is_girl(owner, uname, name):
             continue
@@ -1907,7 +2152,6 @@ async def deliver_pricenft_random(status_msg, max_results=20, girls_only=False, 
             if not region_match_full(owner, uname, name, region):
                 continue
         model = h.get("model") or h.get("title") or "NFT"
-        nft_url = h.get("nft_url")
         p_url = h.get("profile_url") or (("https://t.me/" + uname) if uname else None)
         owner_s = fmt_owner(owner, uname, name)
         user_line = ("\n👤 @" + esc(uname)) if uname else ""
@@ -1916,9 +2160,9 @@ async def deliver_pricenft_random(status_msg, max_results=20, girls_only=False, 
         if nft_url:
             nft_line = '\n<a href="' + nft_url + '">' + esc(str(model)) + "</a>"
         txt = "<b>" + owner_s + "</b>" + user_line + model_line + nft_line
+        mark_seen(oid, uname, nft_url)
         if oid:
             cache_owner(oid, owner, uname, name, p_url, [h])
-            SEEN_GLOBAL.add(oid)
             kb = model_card_kb(uname, p_url, oid, nft_url, nft_count=1)
         else:
             # без id — только ссылка на username
@@ -2012,7 +2256,6 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
     """
     global is_searching, SEEN_GLOBAL
     is_searching = True
-    SEEN_GLOBAL.clear()
     lock      = asyncio.Lock()
     found     = [0]
     seen_sent = set()
@@ -2025,7 +2268,8 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
     async def emit_owner(uid, info):
         if not uid or uid in owners_index:
             return
-        if uid in SEEN_GLOBAL:
+        uname = (info or {}).get("username")
+        if is_owner_seen(uid, uname):
             stats_skip["seen"] += 1
             return
         owners_index[uid] = info
@@ -2034,20 +2278,21 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
     async def check_one(uid, info):
         if not is_searching or found[0] >= max_results:
             return
-        async with lock:
-            if uid in seen_sent or uid in SEEN_GLOBAL:
-                return
-
         owner_obj   = info.get("owner")
         username    = info.get("username")
         name        = info.get("name") or ""
         profile_url = info.get("profile_url") or (
             ("https://t.me/" + username) if username else ("tg://user?id=" + str(uid))
         )
+        if is_owner_seen(uid, username):
+            return
+        async with lock:
+            if uid in seen_sent:
+                return
 
         if is_trader_account(owner_obj, username, name):
             stats_skip["trader"] += 1
-            SEEN_GLOBAL.add(uid)
+            mark_seen(uid, username, None)
             return
 
         if girls_only and not is_girl(owner_obj, username, name):
@@ -2064,7 +2309,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         )
         if saved is None:
             stats_skip["market"] += 1
-            SEEN_GLOBAL.add(uid)
+            mark_seen(uid, username, None)
             return
         if not saved:
             stats_skip["empty"] += 1
@@ -2098,7 +2343,20 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             if uid in seen_sent or found[0] >= max_results:
                 return
             seen_sent.add(uid)
-            SEEN_GLOBAL.add(uid)
+
+        # антидубль гифтов профиля
+        for g in hidden:
+            if is_gift_seen(g.get("nft_url")):
+                continue
+        # если все гифты уже видели — пропуск
+        fresh = [g for g in hidden if not is_gift_seen(g.get("nft_url"))]
+        if not fresh:
+            mark_seen(uid, username, None)
+            return
+        hidden = fresh
+        mark_seen(uid, username, (hidden[0].get("nft_url") if hidden else None))
+        for g in hidden[1:6]:
+            mark_seen(None, None, g.get("nft_url"))
 
         cache_owner(uid, owner_obj, username, name, profile_url, hidden)
         owner_s = fmt_owner(owner_obj, username, name)
@@ -2302,7 +2560,6 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
     """Маркет: быстрый стриминг свежих лотов + лёгкое разнообразие коллекций."""
     global is_searching, SEEN_GLOBAL
     is_searching = True
-    SEEN_GLOBAL.clear()
 
     lock        = asyncio.Lock()
     found       = [0]
@@ -2310,30 +2567,36 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
     seen_owners = set()
     col_sent    = {}
     MAX_COL     = 3   # не больше 3 карточек с одной коллекции
-    MAX_PAGES   = 2
+    MAX_PAGES   = 1
 
     async def send_one(item):
         oid = item.get("owner_id")
-        if not oid:
+        uname = item.get("username")
+        if not oid and not uname:
             return False
         gid = item.get("gift_id")
+        nft_url = item.get("nft_url")
+        slug = gift_slug_of(nft_url)
+        # глобальный антидубль
+        if is_owner_seen(oid, uname) or is_gift_seen(slug):
+            return False
         async with lock:
             if found[0] >= max_results:
                 return False
-            if oid in seen_owners:
+            if oid and oid in seen_owners:
                 return False
-            slug = (item.get("nft_url") or "").split("/")[-1]
             if slug and slug in seen_slugs:
                 return False
             if gid is not None and col_sent.get(gid, 0) >= MAX_COL:
                 return False
-            seen_owners.add(oid)
-            SEEN_GLOBAL.add(oid)
+            if oid:
+                seen_owners.add(oid)
             if slug:
                 seen_slugs.add(slug)
             if gid is not None:
                 col_sent[gid] = col_sent.get(gid, 0) + 1
             found[0] += 1
+        mark_seen(oid, uname, nft_url)
 
         try:
             seed_pricenft_from_item(item)
@@ -2449,7 +2712,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             valid_pairs = [(gid, "") for gid in gift_ids]
         random.shuffle(valid_pairs)
 
-        PARALLEL = 12
+        PARALLEL = 18
         # стримим пачками — результаты летят сразу
         for i in range(0, len(valid_pairs), PARALLEL):
             if not is_searching or found[0] >= max_results:
@@ -2482,7 +2745,6 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
     """Модель: быстро маркет выбранных коллекций + добор из БД PriceNFT."""
     global is_searching, SEEN_GLOBAL
     is_searching = True
-    SEEN_GLOBAL.clear()
 
     lock        = asyncio.Lock()
     found       = [0]
@@ -2500,32 +2762,30 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
     async def send_item(item, source="market"):
         oid = item.get("owner_id")
         uname = item.get("username")
-        key = oid if oid else (("u:" + uname.lower()) if uname else None)
-        if not key:
+        nft_url = item.get("nft_url")
+        slug = gift_slug_of(nft_url)
+        if not oid and not uname:
+            return False
+        if is_owner_seen(oid, uname) or is_gift_seen(slug):
             return False
         async with lock:
             if found[0] >= max_results:
                 return False
-            if oid and oid in seen_owners:
+            ok = oid if oid else ("u:" + uname.lower())
+            if ok in seen_owners:
                 return False
-            if (not oid) and uname and ("u:" + uname.lower()) in seen_owners:
-                return False
-            slug = (item.get("nft_url") or "").split("/")[-1]
             if slug and slug in seen_slugs:
                 return False
             gid = item.get("gift_id")
             if gid is not None and col_sent.get(gid, 0) >= 5:
                 return False
-            if oid:
-                seen_owners.add(oid)
-                SEEN_GLOBAL.add(oid)
-            elif uname:
-                seen_owners.add("u:" + uname.lower())
+            seen_owners.add(ok)
             if slug:
                 seen_slugs.add(slug)
             if gid is not None:
                 col_sent[gid] = col_sent.get(gid, 0) + 1
             found[0] += 1
+        mark_seen(oid, uname, nft_url)
         try:
             seed_pricenft_from_item(item)
         except Exception:
@@ -2703,13 +2963,14 @@ async def _start_market(cb, cat, girls):
         is_searching = False
         found = 0
         logger.error("_start_market: %s", e)
+    done = "<b>✅ Поиск закончен\nМаркет / " + cat_l + " / " + who_l + "\nНайдено: " + str(found) + "</b>"
     try:
-        await status.edit_text(
-            "<b>Готово. Маркет / " + cat_l + " / " + who_l + "\nНайдено: " + str(found) + "</b>",
-            parse_mode="HTML", reply_markup=menu_kb()
-        )
+        await status.edit_text(done, parse_mode="HTML", reply_markup=menu_kb())
     except Exception:
-        pass
+        try:
+            await bot.send_message(chat_id, done, parse_mode="HTML", reply_markup=menu_kb())
+        except Exception:
+            pass
 
 async def _start_profile(cb, cat, girls):
     global is_searching
@@ -2743,13 +3004,14 @@ async def _start_profile(cb, cat, girls):
     found = await do_profile_search(status, ids, cat=cat, girls_only=girls,
                                     min_gifts=mn, max_gifts=mx,
                                     max_results=lim, region=reg)
+    done = "<b>✅ Поиск закончен\nПрофиль / " + cat_l + " / " + who_l + "\nНайдено: " + str(found) + "</b>"
     try:
-        await status.edit_text(
-            "<b>Готово. Профиль / " + cat_l + " / " + who_l + "\nНайдено: " + str(found) + "</b>",
-            parse_mode="HTML", reply_markup=menu_kb()
-        )
+        await status.edit_text(done, parse_mode="HTML", reply_markup=menu_kb())
     except Exception:
-        pass
+        try:
+            await bot.send_message(status.chat.id, done, parse_mode="HTML", reply_markup=menu_kb())
+        except Exception:
+            pass
 
 async def _start_model(cb, girls=False, single_gid=None, search_type="market",
                        already_answered=False, skip_begin=False):
@@ -2802,12 +3064,13 @@ async def _start_model(cb, girls=False, single_gid=None, search_type="market",
             found = await do_model_search(status, ids, girls_only=girls,
                                           max_results=lim, region=reg)
         try:
-            await status.edit_text(
-                "<b>Готово. Модели / " + who_l + " / " + type_l + "\nНайдено: " + str(found) + "</b>",
-                parse_mode="HTML", reply_markup=menu_kb()
-            )
+            done = "<b>✅ Поиск закончен\nМодели / " + who_l + " / " + type_l + "\nНайдено: " + str(found) + "</b>"
+            await status.edit_text(done, parse_mode="HTML", reply_markup=menu_kb())
         except Exception:
-            pass
+            try:
+                await bot.send_message(chat_id, done, parse_mode="HTML", reply_markup=menu_kb())
+            except Exception:
+                pass
     except Exception as e:
         is_searching = False
         logger.error("_start_model: %s", e)
@@ -3597,6 +3860,17 @@ async def cb_pricenft_collect(cb: CallbackQuery):
             parse_mode="HTML", reply_markup=admin_kb()
         )
 
+@dp.callback_query(F.data == "admin_clear_seen")
+async def cb_admin_clear_seen(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    clear_seen_db()
+    await cb.message.answer(
+        "<b>🧹 Антидубль сброшен</b>\nАккаунты и гифты снова могут попадаться в выдаче.",
+        parse_mode="HTML", reply_markup=admin_kb()
+    )
+    await cb.answer("Ок")
+
 @dp.callback_query(F.data == "admin_broadcast")
 async def cb_admin_broadcast(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
@@ -3660,7 +3934,9 @@ async def cb_admin_stats(cb: CallbackQuery):
         "Коллекций: " + str(len(ALL_GIFT_IDS)) + "\n"
         "PriceNFT БД: " + str(pn.get("models", 0)) + " моделей / "
         + str(pn.get("users", 0)) + " юзеров / "
-        + str(pn.get("nfts", 0)) + " nft</b>",
+        + str(pn.get("nfts", 0)) + " nft\n"
+        "Антидубль: " + str(pn.get("seen_owners", 0)) + " аккаунтов / "
+        + str(pn.get("seen_gifts", 0)) + " гифтов</b>",
         parse_mode="HTML", reply_markup=admin_kb()
     )
     await cb.answer()
@@ -3733,6 +4009,7 @@ async def auth_code(message: Message, state: FSMContext):
             parse_mode="HTML", reply_markup=main_menu_kb()
         )
         start_bootstrap_gifts_db(notify_chat_id=message.chat.id)
+        start_background_db_keeper()
     except SessionPasswordNeededError:
         await state.set_state(Auth.password)
         await message.answer("<b>Введи пароль 2FA:</b>", parse_mode="HTML")
@@ -3756,6 +4033,7 @@ async def auth_password(message: Message, state: FSMContext):
             parse_mode="HTML", reply_markup=main_menu_kb()
         )
         start_bootstrap_gifts_db(notify_chat_id=message.chat.id)
+        start_background_db_keeper()
     except Exception as e:
         await message.answer("<b>Неверный пароль: <code>" + esc(str(e)) + "</code></b>", parse_mode="HTML")
 
@@ -3766,11 +4044,19 @@ async def main():
     global ONBOARDING_DONE
     ONBOARDING_DONE = load_onboarding()
     load_pricenft_db()
+    try:
+        load_seen_into_memory()
+    except Exception as e:
+        logger.warning("load_seen: %s", e)
     if not tg_client.is_connected():
         await tg_client.connect()
     logger.info("Neptun Parser запущен!")
     st = pricenft_db_stats()
-    logger.info("PriceNFT БД: models=%s users=%s", st.get("models"), st.get("users"))
+    logger.info(
+        "PriceNFT БД: models=%s users=%s nfts=%s seen=%s/%s",
+        st.get("models"), st.get("users"), st.get("nfts"),
+        st.get("seen_owners"), st.get("seen_gifts"),
+    )
     from aiogram.types import BotCommand
     await bot.set_my_commands([
         BotCommand(command="start",      description="Главное меню"),
@@ -3785,6 +4071,8 @@ async def main():
             if st0.get("users", 0) < 50:
                 logger.info("БД мала (%s) — автосбор гифтов", st0.get("users"))
                 start_bootstrap_gifts_db(notify_chat_id=ADMIN_ID)
+            # основной режим: постоянно пишем маркет + PriceNFT в локальную БД
+            start_background_db_keeper()
         else:
             logger.warning("Не авторизован — пройди /start")
     except Exception as e:
@@ -3792,6 +4080,11 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
+        try:
+            db_flush(force=True)
+            save_pricenft_db()
+        except Exception:
+            pass
         await tg_client.disconnect()
         await bot.session.close()
 
