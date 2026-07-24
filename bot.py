@@ -4437,7 +4437,6 @@ async def cb_mdlwho(cb: CallbackQuery):
     if not ALL_GIFT_IDS:
         await cb.answer("Коллекции не загружены", show_alert=True)
         return
-    lbl = who_label(who) + ("-модели" if who != "weird" else "")
     if who == "weird":
         lbl = "🤡 Позор"
     elif who == "girls":
