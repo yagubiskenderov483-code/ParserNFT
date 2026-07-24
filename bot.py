@@ -8,6 +8,7 @@ import time
 import datetime
 import re
 import random
+import threading
 from telethon import TelegramClient
 from telethon.tl.functions.payments import (
     GetResaleStarGiftsRequest, GetStarGiftsRequest, GetSavedStarGiftsRequest
@@ -1595,7 +1596,7 @@ def _db():
     """Один shared connection, WAL, быстрые вставки."""
     global _db_conn, _db_lock
     if _db_lock is None:
-        _db_lock = asyncio.Lock() if False else None  # sync lock via threading not needed; sqlite check_same_thread=False
+        _db_lock = threading.RLock()
     if _db_conn is not None:
         return _db_conn
     conn = sqlite3.connect(GIFTS_DB_FILE, timeout=30, check_same_thread=False)
@@ -1639,14 +1640,15 @@ def _db():
 def db_mark_seen(owner_keys, slug=None):
     conn = _db()
     now = int(time.time())
-    if owner_keys:
-        conn.executemany(
-            "INSERT OR IGNORE INTO seen_owners(key, ts) VALUES (?, ?)",
-            [(k, now) for k in owner_keys],
-        )
-    if slug:
-        conn.execute("INSERT OR IGNORE INTO seen_gifts(slug, ts) VALUES (?, ?)", (slug, now))
-    conn.commit()
+    with _db_lock:
+        if owner_keys:
+            conn.executemany(
+                "INSERT OR IGNORE INTO seen_owners(key, ts) VALUES (?, ?)",
+                [(k, now) for k in owner_keys],
+            )
+        if slug:
+            conn.execute("INSERT OR IGNORE INTO seen_gifts(slug, ts) VALUES (?, ?)", (slug, now))
+        conn.commit()
 
 def load_seen_into_memory():
     """Быстрая загрузка антидубля в RAM при старте."""
@@ -1659,9 +1661,10 @@ def load_seen_into_memory():
 def clear_seen_db():
     global SEEN_GLOBAL, SEEN_GIFTS
     conn = _db()
-    conn.execute("DELETE FROM seen_owners")
-    conn.execute("DELETE FROM seen_gifts")
-    conn.commit()
+    with _db_lock:
+        conn.execute("DELETE FROM seen_owners")
+        conn.execute("DELETE FROM seen_gifts")
+        conn.commit()
     SEEN_GLOBAL.clear()
     SEEN_GIFTS.clear()
 
@@ -1738,8 +1741,9 @@ def db_flush(force=False):
         return
     try:
         conn = _db()
-        conn.commit()
-        _db_pending = 0
+        with _db_lock:
+            conn.commit()
+            _db_pending = 0
     except Exception as e:
         logger.debug("db_flush: %s", e)
 
@@ -1768,13 +1772,14 @@ def pricenft_add_user(model, username, nft_urls=None, uid=None, commit=True):
         return False
     try:
         conn = _db()
-        conn.executemany(
-            "INSERT OR IGNORE INTO gifts(slug, url, model, username, uid, ts) VALUES (?,?,?,?,?,?)",
-            rows,
-        )
-        _db_pending += len(rows)
-        if commit or _db_pending >= _DB_COMMIT_EVERY:
-            db_flush(force=True)
+        with _db_lock:
+            conn.executemany(
+                "INSERT OR IGNORE INTO gifts(slug, url, model, username, uid, ts) VALUES (?,?,?,?,?,?)",
+                rows,
+            )
+            _db_pending += len(rows)
+            if commit or _db_pending >= _DB_COMMIT_EVERY:
+                db_flush(force=True)
         return True
     except Exception as e:
         logger.debug("pricenft_add_user: %s", e)
@@ -1817,11 +1822,22 @@ def item_matches_collections(item, allowed_gids=None, allowed_titles=None):
     base = re.sub(r"-\d+$", "", slug)
     nb = _norm_col_name(base)
 
-    # при наличии slug — он главный источник истины
+    gid = item.get("gift_id")
+    gid_ok = False
+    if gid is not None and allowed_gids:
+        try:
+            gid_ok = int(gid) in allowed_gids
+        except Exception:
+            gid_ok = False
+
+    # маркет API по gift_id — доверяем коллекции даже если title/slug кривые (Gift #…)
+    if src == "market" and gid_ok:
+        return True
+
+    # при наличии slug — главный источник истины (кроме profile)
     if slug and norms:
         if nb and nb in norms:
             return True
-        # slug явно другой — мимо (кроме profile: там title надёжнее API title)
         if nb and src not in ("profile",):
             return False
 
@@ -1834,13 +1850,8 @@ def item_matches_collections(item, allowed_gids=None, allowed_titles=None):
     if nt and norms and nt in norms:
         return True
 
-    gid = item.get("gift_id")
-    if gid is not None and allowed_gids:
-        try:
-            if int(gid) in allowed_gids:
-                return True
-        except Exception:
-            return False
+    if gid_ok:
+        return True
     return False
 
 def random_from_pricenft_db(limit=25, model=None, exact=False):
@@ -3058,6 +3069,9 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                     uid = tmp.get("owner_id") or uid
                     peer = uid or username
                     ok_keys = owner_seen_keys(uid, username) or ok_keys
+                    if is_owner_seen(uid, username):
+                        stats_skip["seen"] += 1
+                        return
                 except Exception:
                     async with weird_lock:
                         weird_checks[0] = max(0, weird_checks[0] - 1)
@@ -3135,10 +3149,6 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                 disable_web_page_preview=True,
             )
             async with lock:
-                if found[0] >= max_results:
-                    for k in ok_keys:
-                        seen_sent.discard(k)
-                    return
                 found[0] += 1
             mark_seen(uid, username, first_nft_url)
             stats["found"] += 1
@@ -3301,6 +3311,8 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                                     name = tmp.get("name") or name
                                     uid = tmp.get("owner_id") or uid
                                     peer = uid or username
+                                    if is_owner_seen(uid, username):
+                                        continue
                                 except Exception:
                                     async with weird_lock:
                                         weird_checks[0] = max(0, weird_checks[0] - 1)
@@ -3353,10 +3365,6 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                                 disable_web_page_preview=True,
                             )
                             async with lock:
-                                if found[0] >= max_results:
-                                    for k in ok_keys:
-                                        seen_sent.discard(k)
-                                    continue
                                 found[0] += 1
                             mark_seen(uid, username, first_url)
                             stats["found"] += 1
@@ -3515,13 +3523,8 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 parse_mode="HTML", reply_markup=kb,
                 disable_web_page_preview=True,
             )
+            # карточка уже ушла — всегда считаем и mark_seen (даже при редком overshoot)
             async with lock:
-                if found[0] >= max_results:
-                    for k in ok_keys:
-                        seen_owners.discard(k)
-                    if slug:
-                        seen_slugs.discard(slug)
-                    return False
                 found[0] += 1
                 if gid is not None:
                     col_counts[gid] = col_counts.get(gid, 0) + 1
@@ -3838,12 +3841,6 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 disable_web_page_preview=True,
             )
             async with lock:
-                if found[0] >= max_results:
-                    for k in ok_keys:
-                        seen_owners.discard(k)
-                    if slug:
-                        seen_slugs.discard(slug)
-                    return False
                 found[0] += 1
                 if gid is not None:
                     col_counts[gid] = col_counts.get(gid, 0) + 1
@@ -4123,6 +4120,8 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
         name = info.get("name") or name
         uid = info.get("owner_id") or uid
         peer = uid or username
+        if (not ignore_global[0]) and is_owner_seen(uid, username):
+            return
         if region and region != "any":
             if not region_match_full(owner_obj, username, name, region):
                 return
@@ -4170,10 +4169,6 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                 disable_web_page_preview=True,
             )
             async with lock:
-                if found[0] >= max_results:
-                    for k in ok_keys:
-                        seen_owners.discard(k)
-                    return
                 found[0] += 1
             mark_seen(uid, username, nft_url)
             stats["found"] += 1
@@ -4935,31 +4930,44 @@ async def cb_stats(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("shownft_"))
 async def cb_show_nft(cb: CallbackQuery):
-    uid    = int(cb.data[8:])
+    try:
+        uid = int(cb.data[8:])
+    except Exception:
+        await cb.answer("Ошибка", show_alert=True)
+        return
+    if not uid:
+        await cb.answer("Нет профиля", show_alert=True)
+        return
     cached = NFT_CACHE.get(uid)
     if not cached:
         await cb.answer("Загружаю NFT...")
         saved = await fetch_saved_gifts(uid)
-        if not saved:
-            await cb.answer("NFT не найдены или профиль закрыт", show_alert=True)
-            return
-        nfts  = [g for g in saved if g.get("nft_url")]
+        nfts = [g for g in (saved or []) if g.get("nft_url")] if saved else []
         if not nfts:
-            await cb.answer("NFT не найдены или профиль закрыт", show_alert=True)
+            # уже ответили "Загружаю" — шлём обычным сообщением, второй answer нельзя
+            try:
+                await cb.message.answer("<b>NFT не найдены или профиль закрыт</b>", parse_mode="HTML")
+            except Exception:
+                pass
             return
-        NFT_CACHE[uid] = {"owner": None, "username": None, "name": None,
-                          "profile_url": "tg://user?id=" + str(uid), "items": nfts}
+        NFT_CACHE[uid] = {
+            "owner": None, "username": None, "name": None,
+            "profile_url": "tg://user?id=" + str(uid), "items": nfts,
+        }
         cached = NFT_CACHE[uid]
     else:
         await cb.answer()
-    items    = cached.get("items", [])
+    items = cached.get("items", [])
     username = cached.get("username")
-    p_url    = cached.get("profile_url")
-    owner_s  = fmt_owner(cached.get("owner"), username, cached.get("name"))
+    p_url = cached.get("profile_url")
+    owner_s = fmt_owner(cached.get("owner"), username, cached.get("name"))
     if not items:
-        await cb.answer("Список пуст", show_alert=True)
+        try:
+            await cb.message.answer("<b>Список пуст</b>", parse_mode="HTML")
+        except Exception:
+            pass
         return
-    kb  = nft_list_kb(items, username, p_url)
+    kb = nft_list_kb(items, username, p_url)
     txt = "<b>NFT " + owner_s + "\nВсего: " + str(len(items)) + "</b>"
     await cb.message.answer(txt, parse_mode="HTML", reply_markup=kb)
 
