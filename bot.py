@@ -1277,11 +1277,13 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             stats_skip["market"] += 1
             return
 
+        # Для профиля: минимум обязателен; максимум НЕ отсекает (иначе 0 выдачи)
+        if len(hidden) < min_gifts:
+            stats_skip["range"] += 1
+            return
+
         async with lock:
             if uid in seen_sent or found[0] >= max_results:
-                return
-            if not gifts_in_range(len(hidden), min_gifts, max_gifts):
-                stats_skip["range"] += 1
                 return
             seen_sent.add(uid)
             SEEN_GLOBAL.add(uid)
@@ -1804,9 +1806,9 @@ async def _start_profile(cb, cat, girls):
     reg_l  = REGIONS.get(reg, {}).get("label", "Все страны")
     txt = (
         "<b>Профиль / " + cat_l + " / " + who_l + "\n"
-        "Режим: только НЕ на рынке\n"
+        "Режим: скрытые NFT (не на рынке)\n"
         "Регион: " + reg_l + "\n"
-        "Скрытых гифтов: от " + str(mn) + " до " + mx_s + "\n"
+        "Мин. скрытых: " + str(mn) + "\n"
         "Лимит: " + str(lim) + "</b>"
     )
     status = await cb.message.answer(txt, parse_mode="HTML", reply_markup=stop_kb())
