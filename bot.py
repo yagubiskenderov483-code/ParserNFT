@@ -13,6 +13,7 @@ from telethon.tl.functions.payments import (
     GetResaleStarGiftsRequest, GetStarGiftsRequest, GetSavedStarGiftsRequest
 )
 from telethon.tl.functions.messages import GetHistoryRequest, SearchRequest, GetInlineBotResultsRequest
+from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import InputPeerEmpty, MessageService, InputPeerSelf
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from aiogram import Bot, Dispatcher, F
@@ -511,34 +512,25 @@ def is_girl(owner, username=None, name=None, strict=False):
 
 
 # ── WEIRD / CRINGE (шрифты, эмодзи, «позор») ──────────────────────────────────
-_EMOJI_CHUNK_RE = re.compile(
-    "["
-    "\U0001F300-\U0001FAFF"
-    "\U00002700-\U000027BF"
-    "\U00002600-\U000026FF"
-    "\U0001F1E0-\U0001F1FF"
-    "\U0001F900-\U0001F9FF"
-    "]+",
-    flags=re.UNICODE,
-)
 _FANCY_FONT_RE = re.compile(
     "["
     "\U0001D400-\U0001D7FF"  # mathematical alphanumeric
     "\uFF01-\uFF5E"          # fullwidth
     "\u2460-\u24FF"          # circled
     "\U0001F100-\U0001F1FF"  # enclosed alphanumerics
-    "\u2100-\u214F"          # letterlike symbols
+    "\u2100-\u214F"          # letterlike
     "\u249C-\u24E9"
     "\u3251-\u32FF"
+    "\uA770-\uA7FF"
+    "\u1D00-\u1D7F"          # phonetic / small caps
     "]+",
 )
 _COMBINING_RE = re.compile(r"[\u0300-\u036F\u1AB0-\u1AFF\u1DC0-\u1DFF\u20D0-\u20FF\uFE20-\uFE2F]")
-_AESTHETIC_RE = re.compile(r"[·•♡♥☆★✦✧｡※†‡〜~_|/\\]{2,}")
+_AESTHETIC_RE = re.compile(r"[·•♡♥☆★✦✧｡※†‡〜~_|/\\❤❥❦❧✱✳︎✴︎✵]{1,}")
 
 def _emoji_count(s):
     if not s:
         return 0
-    # считаем отдельные эмодзи-символы, не «чанки»
     n = 0
     for ch in s:
         o = ord(ch)
@@ -548,16 +540,44 @@ def _emoji_count(s):
             or 0x1F1E0 <= o <= 0x1F1FF
             or 0x1F900 <= o <= 0x1F9FF
             or 0x2300 <= o <= 0x23FF
+            or 0x2700 <= o <= 0x27BF
+            or o in (0x2764, 0x2665, 0x2661, 0x2728, 0x2B50)
         ):
             n += 1
     return n
 
+def _weird_symbol_count(s):
+    """Считаем «левые» символы в нике (не буквы/цифры/обычная пунктуация)."""
+    if not s:
+        return 0
+    n = 0
+    for ch in s:
+        if ch.isspace():
+            continue
+        o = ord(ch)
+        # обычные лат/кирилл/цифры
+        if (
+            0x30 <= o <= 0x39
+            or 0x41 <= o <= 0x5A
+            or 0x61 <= o <= 0x7A
+            or 0x400 <= o <= 0x4FF
+            or 0x500 <= o <= 0x52F
+        ):
+            continue
+        if ch in "._-'@":
+            continue
+        n += 1
+    return n
+
 def is_weird_cringe(owner, username=None, name=None):
     """
-    Отдельная категория «позор»: странные шрифты в нике,
-    куча эмодзи в имени/био, zalgo, эстетик-спам.
+    «Позор»: странные шрифты / эмодзи / zalgo / эстетик в нике и био.
+    На маркете био часто нет — детект по имени должен срабатывать сам.
     """
     bio = (getattr(owner, "bio", "") or "") if owner else ""
+    # иногда about лежит отдельно
+    if not bio and owner is not None:
+        bio = (getattr(owner, "about", "") or "") if owner else ""
     uname = (getattr(owner, "username", "") or "") if owner else (username or "")
     fname = (getattr(owner, "first_name", "") or "") if owner else ""
     lname = (getattr(owner, "last_name", "") or "") if owner else ""
@@ -565,47 +585,68 @@ def is_weird_cringe(owner, username=None, name=None):
         parts = str(name).strip().split()
         fname = parts[0] if parts else str(name)
         lname = parts[1] if len(parts) > 1 else ""
+    # если owner есть, но name богаче (owner_name с маркета) — берём name
     display = (str(fname) + " " + str(lname)).strip()
+    if name and len(str(name)) > len(display):
+        display = str(name).strip()
     blob = (display + " " + str(uname) + " " + str(bio)).strip()
     if not blob:
         return False
 
     score = 0
-    fancy = len(_FANCY_FONT_RE.findall(display + " " + str(uname)))
-    if fancy >= 3:
+    fancy_chars = _FANCY_FONT_RE.findall(display + " " + str(uname) + " " + str(bio))
+    fancy = sum(len(x) for x in fancy_chars)
+    if fancy >= 2:
         score += 4
     elif fancy >= 1:
-        score += 2
+        score += 3
 
     zalgo = len(_COMBINING_RE.findall(display + bio))
-    if zalgo >= 5:
+    if zalgo >= 3:
         score += 3
-    elif zalgo >= 2:
-        score += 1
+    elif zalgo >= 1:
+        score += 2
 
     em_name = _emoji_count(display)
     em_bio = _emoji_count(bio)
-    if em_name >= 4:
-        score += 3
-    elif em_name >= 2:
+    em_user = _emoji_count(str(uname))
+    if em_name >= 1:
         score += 2
-    if em_bio >= 10:
-        score += 3
-    elif em_bio >= 5:
+    if em_name >= 3:
+        score += 2
+    if em_user >= 1:
+        score += 1
+    if em_bio >= 4:
+        score += 2
+    if em_bio >= 8:
+        score += 2
+
+    sym = _weird_symbol_count(display)
+    if sym >= 2:
+        score += 2
+    if sym >= 4:
         score += 2
 
     if _AESTHETIC_RE.search(display):
         score += 1
-    # много «левых» символов подряд в нике
-    if re.search(r"[^\w\sа-яёa-z0-9]{3,}", display, flags=re.IGNORECASE):
+    if re.search(r"[^\w\sа-яёa-z0-9]{2,}", display, flags=re.IGNORECASE):
         score += 1
 
     low = blob.lower()
-    anime_kw = ("uwu", "owo", "nyaa", "kawaii", "senpai", "chan", "kun", "sama", "neko", "waifu")
-    if any(k in low for k in anime_kw) and (em_name + fancy + em_bio) >= 2:
-        score += 1
+    anime_kw = (
+        "uwu", "owo", "nyaa", "nya", "kawaii", "senpai", "chan", "kun", "sama",
+        "neko", "waifu", "husbando", "baka", "sugoi", "onii", "imouto", "qt",
+        "xqc", "egirl", "e-girl",
+    )
+    if any(k in low for k in anime_kw):
+        score += 2
 
-    return score >= 3
+    # ник из одних символов / очень короткий с эмодзи
+    letters = re.sub(r"[^a-zа-яё]+", "", display.lower(), flags=re.IGNORECASE)
+    if em_name and len(letters) <= 2:
+        score += 2
+
+    return score >= 2
 
 def who_label(who):
     if who == "girls":
@@ -620,6 +661,51 @@ def who_pass(owner, username, name, who):
     if who in ("weird", "cringe", "pozor"):
         return is_weird_cringe(owner, username, name)
     return True
+
+async def enrich_owner_for_weird(item):
+    """
+    Подтягиваем имя+био владельца (на маркете био обычно нет).
+    Возвращает True если после обогащения аккаунт «позор».
+    """
+    if is_weird_cringe(item.get("owner"), item.get("username"), item.get("name")):
+        return True
+    peer = item.get("owner_id") or item.get("username")
+    if not peer:
+        return False
+    try:
+        ent = await tg_client.get_entity(peer)
+    except FloodWaitError as e:
+        await asyncio.sleep(min(int(getattr(e, "seconds", 1) or 1), 3))
+        return is_weird_cringe(item.get("owner"), item.get("username"), item.get("name"))
+    except Exception:
+        return False
+    bio = ""
+    try:
+        full = await tg_client(GetFullUserRequest(ent))
+        bio = (getattr(getattr(full, "full_user", None), "about", None) or "") or ""
+    except FloodWaitError as e:
+        await asyncio.sleep(min(int(getattr(e, "seconds", 1) or 1), 2))
+    except Exception:
+        bio = ""
+
+    class _Ow:
+        pass
+    ow = _Ow()
+    ow.first_name = getattr(ent, "first_name", "") or ""
+    ow.last_name = getattr(ent, "last_name", "") or ""
+    ow.username = getattr(ent, "username", None) or item.get("username")
+    ow.bio = bio
+    ow.about = bio
+    name = (ow.first_name + " " + ow.last_name).strip() or (item.get("name") or "")
+    item["owner"] = ow
+    item["name"] = name
+    if ow.username:
+        item["username"] = ow.username
+    try:
+        item["owner_id"] = int(ent.id)
+    except Exception:
+        pass
+    return is_weird_cringe(ow, ow.username, name)
 
 
 # ── MODEL DETECTION ───────────────────────────────────────────────────────────
@@ -1177,50 +1263,21 @@ def input_cancel_kb():
 
 
 # ── COLLECTIONS ───────────────────────────────────────────────────────────────
-def _clean_collection_title(raw, gid=None):
-    """Нормальный title коллекции; отсекаем мусор вроде Gift #123 / пустых."""
+def _gift_display_title(gift, gid=None):
+    """Человекочитаемое имя коллекции; Gift # — в конец списка."""
+    raw = getattr(gift, "title", None) if gift is not None else None
     title = str(raw or "").strip()
-    if not title or title in ("?", "None", "nan", "null"):
-        return None
-    if title.startswith("Gift #") or title.startswith("gift #"):
-        return None
-    # только цифры / id — не название
-    if re.fullmatch(r"#?\d+", title):
-        return None
-    # слишком короткое / битое
-    if len(re.sub(r"\s+", "", title)) < 2:
-        return None
-    return title
-
-def _is_nft_collection_gift(gift):
-    """
-    Только коллекционные NFT-подарки с нормальным названием.
-    Отсекаем обычные Star Gifts вида Gift #123 и пустые title.
-    """
-    if gift is None:
-        return False
-    title = _clean_collection_title(getattr(gift, "title", None), getattr(gift, "id", None))
-    if not title:
-        return False
-    # явные признаки коллекционности / ресейла / апгрейда
-    if getattr(gift, "limited", False):
-        return True
-    if getattr(gift, "sold_out", False):
-        return True
-    if getattr(gift, "availability_total", None):
-        return True
-    if getattr(gift, "availability_resale", None):
-        return True
-    if getattr(gift, "upgrade_stars", None):
-        return True
-    if getattr(gift, "resell_min_stars", None) or getattr(gift, "resale_min_stars", None):
-        return True
-    # нормальное буквенное имя коллекции (не мусор)
-    if re.search(r"[A-Za-zА-Яа-яЁё]{3,}", title):
-        return True
-    return False
+    if title and title not in ("?", "None", "nan", "null"):
+        if not (title.startswith("Gift #") or title.startswith("gift #") or re.fullmatch(r"#?\d+", title)):
+            return title, False  # нормальное имя
+    # fallback — не теряем коллекцию из счётчика (~149)
+    return ("Gift #" + str(gid if gid is not None else getattr(gift, "id", "?"))), True
 
 async def load_collections():
+    """
+    Грузим ВСЕ gift_id из GetStarGifts (~149 коллекций).
+    Сортировка: сначала нормальные названия, Gift #… в конце.
+    """
     global ALL_GIFT_IDS, NFT_COLLECTIONS
     try:
         result = await tg_client(GetStarGiftsRequest(hash=0))
@@ -1231,16 +1288,13 @@ async def load_collections():
             gid = getattr(gift, "id", None)
             if gid is None or gid in seen:
                 continue
-            if not _is_nft_collection_gift(gift):
-                continue
-            title = _clean_collection_title(getattr(gift, "title", None), gid)
-            if not title:
-                continue
+            title, is_fallback = _gift_display_title(gift, gid)
             seen.add(gid)
-            ALL_GIFT_IDS.append((gid, title))
+            ALL_GIFT_IDS.append((gid, title, is_fallback))
             NFT_COLLECTIONS[title] = gid
-        # алфавит — чтобы в начале не торчали «левые» Gift #...
-        ALL_GIFT_IDS.sort(key=lambda x: str(x[1]).lower())
+        # (gid, title) наружу; fallback в конец, внутри — алфавит
+        ALL_GIFT_IDS.sort(key=lambda x: (1 if x[2] else 0, str(x[1]).lower()))
+        ALL_GIFT_IDS = [(gid, title) for gid, title, _ in ALL_GIFT_IDS]
         logger.info("Коллекций загружено: %d", len(ALL_GIFT_IDS))
     except Exception as e:
         logger.error("load_collections: %s", e)
@@ -2882,6 +2936,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
     global is_searching
     is_searching = True
     who = who or ("girls" if girls_only else "all")
+    weird_mode = who in ("weird", "cringe", "pozor")
     lock      = asyncio.Lock()
     found     = [0]
     seen_sent = set()
@@ -2889,6 +2944,8 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
     check_q = asyncio.Queue()
     feeder_done = asyncio.Event()
     stats_skip = {"market": 0, "empty": 0, "girl": 0, "range": 0, "trader": 0, "seen": 0}
+    weird_checks = [0]
+    WEIRD_CHECK_LIMIT = 180
 
     async def emit_cand(key, info):
         if not key or key in checked:
@@ -2925,7 +2982,27 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         if is_trader_account(owner_obj, username, name):
             stats_skip["trader"] += 1
             return
-        if not who_pass(owner_obj, username, name, who):
+        if weird_mode:
+            if is_weird_cringe(owner_obj, username, name):
+                pass
+            elif weird_checks[0] < WEIRD_CHECK_LIMIT:
+                weird_checks[0] += 1
+                tmp = {"owner": owner_obj, "owner_id": uid, "username": username, "name": name}
+                try:
+                    if not await enrich_owner_for_weird(tmp):
+                        stats_skip["girl"] += 1
+                        return
+                    owner_obj = tmp.get("owner") or owner_obj
+                    username = tmp.get("username") or username
+                    name = tmp.get("name") or name
+                    uid = tmp.get("owner_id") or uid
+                except Exception:
+                    stats_skip["girl"] += 1
+                    return
+            else:
+                stats_skip["girl"] += 1
+                return
+        elif not who_pass(owner_obj, username, name, who):
             stats_skip["girl"] += 1
             return
         if region and region != "any":
@@ -3248,6 +3325,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
     global is_searching
     is_searching = True
     who = who or ("girls" if girls_only else "all")
+    weird_mode = who in ("weird", "cringe", "pozor")
     try:
         max_results = max(1, min(int(max_results or 1), 200))
     except Exception:
@@ -3258,10 +3336,15 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
     seen_owners = set()
     seen_slugs = set()
     col_counts = {}
+    weird_checks = [0]
+    WEIRD_CHECK_LIMIT = 180
 
     n_cols_hint = max(1, len(gift_ids or []))
     # при многих коллекциях — максимум 1–2 с одной, иначе April забивает выдачу
-    if n_cols_hint <= 2:
+    # для «позора» людей мало — лимит на коллекцию не режем
+    if weird_mode:
+        hard_cap = max_results
+    elif n_cols_hint <= 2:
         hard_cap = max_results
     elif n_cols_hint <= 8:
         hard_cap = max(2, (max_results + 3) // 4)
@@ -3340,12 +3423,27 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         price = item.get("price")
         if not price_in_cat(price, cat):
             return False
-        if not who_pass(item.get("owner"), item.get("username"), item.get("name"), who):
+        # «позор» проверяем позже с обогащением био — тут только девушки/все
+        if (not weird_mode) and (not who_pass(item.get("owner"), item.get("username"), item.get("name"), who)):
             return False
         if region and region != "any":
             if not region_match_full(item.get("owner"), item.get("username"), item.get("name"), region):
                 return False
         return True
+
+    async def accept_who(item):
+        if not weird_mode:
+            return who_pass(item.get("owner"), item.get("username"), item.get("name"), who)
+        # быстрый путь по нику
+        if is_weird_cringe(item.get("owner"), item.get("username"), item.get("name")):
+            return True
+        if weird_checks[0] >= WEIRD_CHECK_LIMIT:
+            return False
+        weird_checks[0] += 1
+        try:
+            return await enrich_owner_for_weird(item)
+        except Exception:
+            return False
 
     async def fetch_bucket(gid, title=""):
         out = []
@@ -3400,6 +3498,10 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         for item in diversify(pool):
             if not is_searching or found[0] >= max_results:
                 break
+            if weird_mode:
+                ok = await accept_who(item)
+                if not ok:
+                    continue
             await try_send(item, use_global_seen=use_global_seen, enforce_cap=enforce_cap)
 
     try:
@@ -3417,7 +3519,9 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
 
         # пересчёт hard_cap по реальным коллекциям
         n_cols = max(1, len(valid_pairs))
-        if n_cols <= 2:
+        if weird_mode:
+            hard_cap = max_results
+        elif n_cols <= 2:
             hard_cap = max_results
         elif n_cols <= 8:
             hard_cap = max(2, (max_results + 3) // 4)
@@ -3503,6 +3607,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
     global is_searching
     is_searching = True
     who = who or ("girls" if girls_only else "all")
+    weird_mode = who in ("weird", "cringe", "pozor")
     try:
         max_results = max(1, min(int(max_results or 1), 200))
     except Exception:
@@ -3513,6 +3618,8 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
     seen_owners = set()
     seen_slugs = set()
     col_counts = {}
+    weird_checks = [0]
+    WEIRD_CHECK_LIMIT = 180
 
     title_by_gid = {gid: title for gid, title in ALL_GIFT_IDS}
     for gid in gift_ids:
@@ -3527,7 +3634,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
     label = allowed_titles[0] if single and allowed_titles else (
         str(len(allowed_gids)) + " коллекций"
     )
-    if single:
+    if weird_mode or single:
         hard_cap = max_results
     elif len(allowed_gids) <= 8:
         hard_cap = max(2, (max_results + 3) // 4)
@@ -3651,7 +3758,8 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 it["source"] = "market"
                 if title:
                     it["title"] = title
-                if not who_pass(it.get("owner"), it.get("username"), it.get("name"), who):
+                # позор — фильтруем после обогащения; девушек/всех — сразу
+                if (not weird_mode) and (not who_pass(it.get("owner"), it.get("username"), it.get("name"), who)):
                     continue
                 if region and region != "any":
                     if not region_match_full(it.get("owner"), it.get("username"), it.get("name"), region):
@@ -3663,6 +3771,19 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 break
             offset = nxt
         return out
+
+    async def accept_who(item):
+        if not weird_mode:
+            return who_pass(item.get("owner"), item.get("username"), item.get("name"), who)
+        if is_weird_cringe(item.get("owner"), item.get("username"), item.get("name")):
+            return True
+        if weird_checks[0] >= WEIRD_CHECK_LIMIT:
+            return False
+        weird_checks[0] += 1
+        try:
+            return await enrich_owner_for_weird(item)
+        except Exception:
+            return False
 
     try:
         if not allowed_gids:
@@ -3694,7 +3815,9 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 for it in batch:
                     if not is_searching or found[0] >= max_results:
                         break
-                    await try_send(it, use_global_seen=True, enforce_cap=(not single))
+                    if weird_mode and not await accept_who(it):
+                        continue
+                    await try_send(it, use_global_seen=True, enforce_cap=(not single and not weird_mode))
             try:
                 await status_msg.edit_text(
                     "<b>Модель " + esc(str(label)) + ":</b> "
@@ -3708,7 +3831,9 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             for it in diversify(pool):
                 if not is_searching or found[0] >= max_results:
                     break
-                await try_send(it, use_global_seen=True, enforce_cap=(not single))
+                if weird_mode and not await accept_who(it):
+                    continue
+                await try_send(it, use_global_seen=True, enforce_cap=(not single and not weird_mode))
 
         # добор из БД — только exact + slug match (НЕ подставляем gift_id)
         if is_searching and found[0] < max_results and allowed_titles:
@@ -3732,9 +3857,12 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             for h in hits:
                 if not is_searching or found[0] >= max_results:
                     break
-                if not who_pass(None, h.get("username"), h.get("name"), who):
+                if weird_mode:
+                    if not await accept_who(h):
+                        continue
+                elif not who_pass(None, h.get("username"), h.get("name"), who):
                     continue
-                await try_send(h, use_global_seen=True, enforce_cap=(not single))
+                await try_send(h, use_global_seen=True, enforce_cap=(not single and not weird_mode))
 
         # если пусто из-за seen — мягкий повтор без global seen
         if is_searching and found[0] == 0:
@@ -3747,7 +3875,9 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             for it in diversify(soft):
                 if not is_searching or found[0] >= max_results:
                     break
-                await try_send(it, use_global_seen=False, enforce_cap=(not single))
+                if weird_mode and not await accept_who(it):
+                    continue
+                await try_send(it, use_global_seen=False, enforce_cap=(not single and not weird_mode))
 
         db_flush(force=True)
     except Exception as e:
@@ -3767,6 +3897,7 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
     global is_searching
     is_searching = True
     who = who or ("girls" if girls_only else "all")
+    weird_mode = who in ("weird", "cringe", "pozor")
     try:
         max_results = max(1, min(int(max_results or 1), 200))
     except Exception:
@@ -3805,7 +3936,24 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             return
         if is_owner_seen(uid, username):
             return
-        if not who_pass(owner_obj, username, name, who):
+        if weird_mode:
+            tmp = {
+                "owner": owner_obj, "owner_id": uid,
+                "username": username, "name": name,
+            }
+            if is_weird_cringe(owner_obj, username, name):
+                pass
+            else:
+                try:
+                    if not await enrich_owner_for_weird(tmp):
+                        return
+                    owner_obj = tmp.get("owner") or owner_obj
+                    username = tmp.get("username") or username
+                    name = tmp.get("name") or name
+                    uid = tmp.get("owner_id") or uid
+                except Exception:
+                    return
+        elif not who_pass(owner_obj, username, name, who):
             return
         if region and region != "any":
             if not region_match_full(owner_obj, username, name, region):
