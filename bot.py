@@ -2466,14 +2466,14 @@ async def background_db_keeper():
                 continue
             random.shuffle(pairs)
             PARALLEL = 22
-            # быстрый проход маркета — основной объём БД до 100к
+            # быстрый проход маркета — основной объём БД до 600к
             st0 = pricenft_db_stats()
             if int(st0.get("users", 0) or 0) < DB_TARGET_USERS:
                 # глубокий fill раз в несколько циклов
                 if cycle % 3 == 0:
                     try:
                         await fill_db_from_market_fast(
-                            progress_cb=None, parallel=22, target_users=DB_TARGET_USERS
+                            progress_cb=None, parallel=28, target_users=DB_TARGET_USERS
                         )
                     except Exception as e:
                         logger.warning("keeper fill: %s", e)
@@ -4392,9 +4392,9 @@ async def cb_pricenft_collect(cb: CallbackQuery):
         _pricenft_collecting = True
         _pricenft_stop = False
         try:
-            # сначала быстро набираем с маркета к 100к
-            await prog("Старт: маркет→БД до " + str(DB_TARGET_USERS) + " юзеров...")
-            mres = await fill_db_from_market_fast(progress_cb=prog, target_users=DB_TARGET_USERS)
+            # сначала быстро набираем с маркета к 600к
+            await prog("🚀 Активный сбор до " + str(DB_TARGET_USERS) + " юзеров...")
+            mres = await fill_db_from_market_fast(progress_cb=prog, parallel=28, target_users=DB_TARGET_USERS)
             if _pricenft_stop:
                 try:
                     await status.edit_text(
