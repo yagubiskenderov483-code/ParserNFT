@@ -68,6 +68,9 @@ TRADER_NAME_KW = (
     "giftbot", "stars market", "tonnel", "fragment", "p2p", "прода", "купл",
 )
 PRICENFT_BOT = "PriceNFTbot"
+PRICENFT_DB_FILE = "pricenft_db.json"
+PRICENFT_MSG_CD = 3.0  # пауза между сообщениями к PriceNFTbot
+_pricenft_collecting = False
 
 # ── REGIONS ───────────────────────────────────────────────────────────────────
 REGIONS = {
@@ -974,12 +977,19 @@ def confirm_kb():
     ])
 
 def admin_kb():
+    st = {}
+    try:
+        st = pricenft_db_stats()
+    except Exception:
+        st = {"models": 0, "users": 0}
+    pn_label = "PriceNFT БД (" + str(st.get("users", 0)) + " юзеров)"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Рассылка",           callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="Пользователи",       callback_data="admin_users")],
         [InlineKeyboardButton(text="Статистика",         callback_data="admin_stats")],
         [InlineKeyboardButton(text="Авторизация TG",     callback_data="admin_auth")],
         [InlineKeyboardButton(text="Обновить коллекции", callback_data="admin_reload_cols")],
+        [InlineKeyboardButton(text="📦 Собрать " + pn_label, callback_data="admin_pricenft_collect")],
         [InlineKeyboardButton(text="Выйти из TG",        callback_data="admin_logout")],
         [InlineKeyboardButton(text="В меню",             callback_data="menu")],
     ])
@@ -1194,7 +1204,83 @@ async def fetch_saved_gifts(uid, max_pages=2, only_off_market=False, require_zer
 
 
 # ── PriceNFTbot ───────────────────────────────────────────────────────────────
+# Реальный флоу: /start|/search → кнопки Модель/Фон/Узор → собираем в БД →
+# потом рандомно выдаём по моделям. Между сообщениями к боту CD = PRICENFT_MSG_CD.
 _pricenft_lock = asyncio.Lock()
+_pricenft_last_send = 0.0
+PRICENFT_DB = {"models": {}, "updated_at": 0}
+
+def load_pricenft_db():
+    global PRICENFT_DB
+    try:
+        if os.path.exists(PRICENFT_DB_FILE):
+            with open(PRICENFT_DB_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "models" in data:
+                PRICENFT_DB = data
+            else:
+                PRICENFT_DB = {"models": {}, "updated_at": 0}
+        else:
+            PRICENFT_DB = {"models": {}, "updated_at": 0}
+    except Exception as e:
+        logger.warning("load_pricenft_db: %s", e)
+        PRICENFT_DB = {"models": {}, "updated_at": 0}
+    return PRICENFT_DB
+
+def save_pricenft_db():
+    try:
+        PRICENFT_DB["updated_at"] = int(time.time())
+        tmp = PRICENFT_DB_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(PRICENFT_DB, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, PRICENFT_DB_FILE)
+    except Exception as e:
+        logger.warning("save_pricenft_db: %s", e)
+
+def pricenft_db_stats():
+    db = PRICENFT_DB if PRICENFT_DB.get("models") is not None else load_pricenft_db()
+    models = db.get("models") or {}
+    users = set()
+    nfts = 0
+    for m, payload in models.items():
+        ulist = payload.get("users") if isinstance(payload, dict) else None
+        if not isinstance(ulist, dict):
+            continue
+        for u, info in ulist.items():
+            users.add(u.lower())
+            nfts += len((info or {}).get("nft_urls") or [])
+    return {
+        "models": len(models),
+        "users": len(users),
+        "nfts": nfts,
+        "updated_at": db.get("updated_at") or 0,
+    }
+
+def pricenft_add_user(model, username, nft_urls=None):
+    """Добавить юзера в БД под моделью."""
+    if not model or not username:
+        return False
+    model = str(model).strip()
+    username = str(username).lstrip("@").strip()
+    if not model or not username:
+        return False
+    lu = username.lower()
+    models = PRICENFT_DB.setdefault("models", {})
+    bucket = models.setdefault(model, {"users": {}})
+    users = bucket.setdefault("users", {})
+    prev = users.get(lu) or {"username": username, "nft_urls": [], "ts": 0}
+    urls = list(prev.get("nft_urls") or [])
+    seen = set(urls)
+    for u in (nft_urls or []):
+        if u and u not in seen:
+            urls.append(u)
+            seen.add(u)
+    users[lu] = {
+        "username": username,
+        "nft_urls": urls[:20],
+        "ts": int(time.time()),
+    }
+    return True
 
 def _parse_pricenft_text(text):
     """Достаём @username и nft-ссылки из ответа PriceNFTbot."""
@@ -1203,12 +1289,11 @@ def _parse_pricenft_text(text):
     nfts = []
     for m in re.finditer(r"@([A-Za-z][A-Za-z0-9_]{3,})", text):
         u = m.group(1)
-        if u.lower() in ("pricenftbot", "gift_alerts", "tonnel_network_bot", "username"):
+        if u.lower() in ("pricenftbot", "gift_alerts", "tonnel_network_bot", "username", "telegram"):
             continue
         users.append(u)
     for m in re.finditer(r"(?:https?://)?t\.me/nft/([A-Za-z0-9_\-]+)", text, re.I):
         nfts.append("https://t.me/nft/" + m.group(1))
-    # уникальные с порядком
     seen_u, out_u = set(), []
     for u in users:
         lu = u.lower()
@@ -1222,113 +1307,482 @@ def _parse_pricenft_text(text):
             out_n.append(n)
     return out_u, out_n
 
-async def search_pricenftbot(query, limit=25):
+async def _pricenft_wait_cd():
+    """CD 3 сек перед каждым сообщением к PriceNFTbot."""
+    global _pricenft_last_send
+    now = time.time()
+    wait = PRICENFT_MSG_CD - (now - _pricenft_last_send)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _pricenft_last_send = time.time()
+
+def _btn_texts_from_msg(msg):
+    """Все подписи кнопок (reply + inline) из сообщения."""
+    texts = []
+    # reply keyboard в peer может быть не в msg — смотрим markup сообщения
+    markup = getattr(msg, "reply_markup", None)
+    if not markup:
+        return texts
+    rows = getattr(markup, "rows", None) or []
+    for row in rows:
+        for btn in (getattr(row, "buttons", None) or []):
+            t = getattr(btn, "text", None)
+            if t:
+                texts.append(str(t))
+    return texts
+
+def _find_btn_text(texts, keywords):
+    for t in texts:
+        low = t.lower()
+        if any(k in low for k in keywords):
+            return t
+    return None
+
+async def _pricenft_send(text):
+    await _pricenft_wait_cd()
+    return await tg_client.send_message(PRICENFT_BOT, text)
+
+async def _pricenft_latest(limit=6):
+    return await tg_client.get_messages(PRICENFT_BOT, limit=limit)
+
+async def _pricenft_click_or_send(msg, text):
+    """Кликаем inline/reply кнопку, иначе шлём текст."""
+    if msg is not None:
+        try:
+            # Telethon Message.click по тексту
+            await _pricenft_wait_cd()
+            await msg.click(text=text)
+            return True
+        except Exception:
+            try:
+                # по индексу среди кнопок
+                texts = _btn_texts_from_msg(msg)
+                if text in texts:
+                    await _pricenft_wait_cd()
+                    await msg.click(texts.index(text))
+                    return True
+            except Exception:
+                pass
+    await _pricenft_send(text)
+    return True
+
+async def _pricenft_ingest_messages(model_name, messages):
+    """Парсим ответы бота и кладём юзеров в БД под model_name."""
+    added = 0
+    for msg in messages or []:
+        if getattr(msg, "out", False):
+            continue
+        blob = getattr(msg, "message", "") or ""
+        for ent in (getattr(msg, "entities", None) or []):
+            url = getattr(ent, "url", None)
+            if url:
+                blob += "\n" + url
+            # text mention / url mention
+            user_id = getattr(ent, "user_id", None)
+            if user_id and hasattr(ent, "offset") and hasattr(ent, "length"):
+                try:
+                    mention = blob[ent.offset:ent.offset + ent.length]
+                    if mention.startswith("@"):
+                        blob += "\n" + mention
+                except Exception:
+                    pass
+        users, nfts = _parse_pricenft_text(blob)
+        # если модель не задана — пробуем вытащить из заголовка/текста
+        mname = model_name
+        if not mname:
+            # часто первая строка — название модели
+            first = (blob.strip().splitlines() or [""])[0].strip()
+            if first and len(first) < 60 and not first.startswith("@"):
+                mname = first
+        if not mname:
+            mname = "Unknown"
+        for u in users:
+            if pricenft_add_user(mname, u, nfts):
+                added += 1
+        # nft slug → model hint (PlushPepe-123)
+        for nu in nfts:
+            slug = nu.rsplit("/", 1)[-1]
+            base = re.sub(r"-\d+$", "", slug)
+            base = re.sub(r"(?<!^)([A-Z])", r" \1", base).strip()
+            if base and users:
+                for u in users:
+                    pricenft_add_user(base, u, [nu])
+    return added
+
+def random_from_pricenft_db(limit=25, model=None):
     """
-    Ищем через @PriceNFTbot (inline + сообщение /search).
-    Возвращает список dict: username, name, nft_url, profile_url, owner_id, owner
+    Рандомная выдача из локальной БД.
+    Главное — модель: берём случайные модели, из каждой — случайных юзеров.
     """
+    load_pricenft_db()
+    models = PRICENFT_DB.get("models") or {}
+    if not models:
+        return []
+
+    if model:
+        keys = [k for k in models.keys() if model.lower() in k.lower()]
+        if not keys:
+            return []
+    else:
+        keys = list(models.keys())
+    random.shuffle(keys)
+
     results = []
-    seen_users = set()
-    q = (query or "").strip()
-    if not q:
-        return results
-
-    async with _pricenft_lock:
-        try:
-            bot_ent = await tg_client.get_input_entity(PRICENFT_BOT)
-        except Exception as e:
-            logger.warning("PriceNFTbot entity: %s", e)
-            return results
-
-        # 1) Inline-поиск
-        try:
-            inline = await tg_client(GetInlineBotResultsRequest(
-                bot=bot_ent,
-                peer=InputPeerSelf(),
-                query=q,
-                offset="",
-            ))
-            for r in (getattr(inline, "results", None) or [])[:limit]:
-                title = getattr(r, "title", "") or ""
-                desc = getattr(r, "description", "") or ""
-                msg = getattr(r, "send_message", None)
-                msg_text = getattr(msg, "message", "") if msg else ""
-                blob = "\n".join([title, desc, msg_text])
-                users, nfts = _parse_pricenft_text(blob)
-                for u in users:
-                    lu = u.lower()
-                    if lu in seen_users:
-                        continue
-                    seen_users.add(lu)
-                    owner = None
-                    oid = None
-                    try:
-                        owner = await tg_client.get_entity(u)
-                        oid = int(owner.id)
-                    except Exception:
-                        pass
-                    fn = (getattr(owner, "first_name", "") or "") if owner else ""
-                    ln = (getattr(owner, "last_name", "") or "") if owner else ""
-                    results.append({
-                        "owner": owner, "owner_id": oid,
-                        "username": u, "name": (fn + " " + ln).strip() or u,
-                        "nft_url": nfts[0] if nfts else None,
-                        "profile_url": "https://t.me/" + u,
-                        "title": title or q, "price": None, "gift_id": None,
-                        "source": "pricenft",
-                    })
-                    if len(results) >= limit:
-                        return results
-        except Exception as e:
-            logger.debug("PriceNFTbot inline: %s", e)
-
-        # 2) Обычное сообщение боту
-        try:
-            await tg_client.send_message(PRICENFT_BOT, q)
-            await asyncio.sleep(1.6)
-            hist = await tg_client(GetHistoryRequest(
-                peer=await tg_client.get_input_entity(PRICENFT_BOT),
-                offset_id=0, offset_date=None, add_offset=0,
-                limit=8, max_id=0, min_id=0, hash=0,
-            ))
-            for msg in (getattr(hist, "messages", None) or []):
-                if getattr(msg, "out", False):
-                    continue
-                blob = getattr(msg, "message", "") or ""
-                # кнопки/entities
-                for ent in (getattr(msg, "entities", None) or []):
-                    url = getattr(ent, "url", None)
-                    if url:
-                        blob += "\n" + url
-                users, nfts = _parse_pricenft_text(blob)
-                for u in users:
-                    lu = u.lower()
-                    if lu in seen_users:
-                        continue
-                    seen_users.add(lu)
-                    owner = None
-                    oid = None
-                    try:
-                        owner = await tg_client.get_entity(u)
-                        oid = int(owner.id)
-                    except Exception:
-                        pass
-                    fn = (getattr(owner, "first_name", "") or "") if owner else ""
-                    ln = (getattr(owner, "last_name", "") or "") if owner else ""
-                    results.append({
-                        "owner": owner, "owner_id": oid,
-                        "username": u, "name": (fn + " " + ln).strip() or u,
-                        "nft_url": nfts[0] if nfts else None,
-                        "profile_url": "https://t.me/" + u,
-                        "title": q, "price": None, "gift_id": None,
-                        "source": "pricenft",
-                    })
-                    if len(results) >= limit:
-                        return results
-        except Exception as e:
-            logger.warning("PriceNFTbot msg: %s", e)
-
+    seen = set()
+    # частями по моделям
+    for mk in keys:
+        payload = models.get(mk) or {}
+        users = payload.get("users") or {}
+        items = list(users.values())
+        random.shuffle(items)
+        # из одной модели берём немного, чтобы разнообразие
+        take = min(3, len(items))
+        for info in items[:take]:
+            uname = (info or {}).get("username")
+            if not uname:
+                continue
+            lu = uname.lower()
+            if lu in seen:
+                continue
+            seen.add(lu)
+            urls = (info or {}).get("nft_urls") or []
+            results.append({
+                "owner": None, "owner_id": None,
+                "username": uname,
+                "name": uname,
+                "nft_url": urls[0] if urls else None,
+                "profile_url": "https://t.me/" + uname,
+                "title": mk,
+                "model": mk,
+                "price": None, "gift_id": None,
+                "source": "pricenft_db",
+            })
+            if len(results) >= limit:
+                return results
     return results
+
+async def resolve_pricenft_hits(hits, limit=None):
+    """Резолвим username → entity/id для выдачи в боте."""
+    out = []
+    for h in hits:
+        if limit and len(out) >= limit:
+            break
+        uname = h.get("username")
+        if not uname:
+            continue
+        owner = h.get("owner")
+        oid = h.get("owner_id")
+        if owner is None or oid is None:
+            try:
+                owner = await tg_client.get_entity(uname)
+                oid = int(owner.id)
+            except Exception:
+                # без entity тоже можно показать @username
+                oid = None
+        fn = (getattr(owner, "first_name", "") or "") if owner else ""
+        ln = (getattr(owner, "last_name", "") or "") if owner else ""
+        name = (fn + " " + ln).strip() or uname
+        out.append({
+            **h,
+            "owner": owner,
+            "owner_id": oid,
+            "name": name,
+            "profile_url": "https://t.me/" + uname,
+        })
+    return out
+
+async def search_pricenftbot(query=None, limit=25):
+    """
+    Выдача из локальной БД (рандом по моделям).
+    Если БД пустая — один лёгкий collect-pass не делаем здесь (только admin collect).
+    """
+    model = None
+    q = (query or "").strip()
+    if q and q.lower() not in ("nft", "gift", "owner", "ton", "stars", "market", "girl", "model"):
+        model = q
+    hits = random_from_pricenft_db(limit=limit, model=model)
+    return await resolve_pricenft_hits(hits, limit=limit)
+
+async def collect_pricenft_db(progress_cb=None, max_models=40):
+    """
+    Сборщик: /start → /search → кнопки Модель/Фон/Узор →
+    кликаем модели, парсим юзернеймы, пишем в pricenft_db.json.
+    Между каждым сообщением/кликом — CD 3 сек.
+    """
+    global _pricenft_collecting
+    if _pricenft_collecting:
+        return {"ok": False, "error": "already_running"}
+    _pricenft_collecting = True
+    load_pricenft_db()
+    stats = {"models_clicked": 0, "added": 0, "errors": 0}
+
+    async def prog(text):
+        if progress_cb:
+            try:
+                await progress_cb(text)
+            except Exception:
+                pass
+
+    try:
+        if not await check_authorized():
+            return {"ok": False, "error": "not_authorized"}
+
+        async with _pricenft_lock:
+            await prog("PriceNFTbot: /start ...")
+            await _pricenft_send("/start")
+            await asyncio.sleep(PRICENFT_MSG_CD)
+            msgs = await _pricenft_latest(5)
+            last = next((m for m in msgs if not getattr(m, "out", False)), None)
+            btns = _btn_texts_from_msg(last) if last else []
+
+            # /search — основной вход в модель/фон/узор
+            await prog("PriceNFTbot: /search ...")
+            await _pricenft_send("/search")
+            await asyncio.sleep(PRICENFT_MSG_CD)
+            msgs = await _pricenft_latest(5)
+            last = next((m for m in msgs if not getattr(m, "out", False)), None)
+            btns = _btn_texts_from_msg(last) if last else []
+            logger.info("PriceNFT buttons after /search: %s", btns)
+
+            # Категории: Модель (главное), Фон, Узор
+            cat_map = [
+                ("model", ("модель", "model", "models")),
+                ("bg", ("фон", "background", "backdrop", "фончик")),
+                ("pattern", ("узор", "pattern", "symbol", "символ", "паттерн")),
+            ]
+
+            async def open_category(keys):
+                nonlocal last, btns
+                msgs = await _pricenft_latest(4)
+                last = next((m for m in msgs if not getattr(m, "out", False)), None)
+                btns = _btn_texts_from_msg(last) if last else []
+                target = _find_btn_text(btns, keys)
+                if target:
+                    await _pricenft_click_or_send(last, target)
+                    await asyncio.sleep(PRICENFT_MSG_CD)
+                    return True
+                # fallback: шлём первую подходящую фразу
+                for k in keys:
+                    await _pricenft_send(k.capitalize() if k.isalpha() else k)
+                    await asyncio.sleep(PRICENFT_MSG_CD)
+                    break
+                return True
+
+            # Сначала Модель — главное
+            await prog("PriceNFTbot: открываю Модель...")
+            await open_category(cat_map[0][1])
+
+            # Собираем список кнопок-моделей (пагинация «Далее/Ещё»)
+            model_names = []
+            seen_btn = set()
+            for page in range(25):
+                msgs = await _pricenft_latest(3)
+                last = next((m for m in msgs if not getattr(m, "out", False)), None)
+                btns = _btn_texts_from_msg(last) if last else []
+                nav_keys = ("далее", "next", "ещё", "еще", "more", "назад", "back",
+                            "меню", "menu", "отмена", "cancel", "поиск", "search",
+                            "модель", "model", "фон", "узор", "pattern", "background")
+                page_models = []
+                for t in btns:
+                    low = t.lower().strip()
+                    if any(k in low for k in nav_keys):
+                        continue
+                    if low in seen_btn:
+                        continue
+                    if len(t) < 2 or len(t) > 64:
+                        continue
+                    seen_btn.add(low)
+                    page_models.append(t)
+                model_names.extend(page_models)
+
+                if len(model_names) >= max_models:
+                    break
+                nxt = _find_btn_text(btns, ("далее", "next", "ещё", "еще", "more", "→", "»"))
+                if not nxt:
+                    break
+                await prog("PriceNFTbot: страница моделей " + str(page + 2) + "...")
+                await _pricenft_click_or_send(last, nxt)
+                await asyncio.sleep(PRICENFT_MSG_CD)
+
+            # Если кнопок-моделей нет — используем названия коллекций Telegram
+            if not model_names:
+                await ensure_collections()
+                model_names = [t for _, t in ALL_GIFT_IDS[:max_models]]
+                await prog("Кнопок не нашли — шлём названия коллекций (" + str(len(model_names)) + ")")
+
+            model_names = model_names[:max_models]
+            await prog("Моделей к сбору: " + str(len(model_names)))
+
+            for i, mname in enumerate(model_names):
+                if not _pricenft_collecting:
+                    break
+                await prog(
+                    "Модель " + str(i + 1) + "/" + str(len(model_names)) + ": "
+                    + mname + "\nВ БД юзеров: " + str(pricenft_db_stats()["users"])
+                )
+                try:
+                    # открываем категорию модель снова (на случай если ушли в детали)
+                    # клик по конкретной модели
+                    msgs = await _pricenft_latest(3)
+                    last = next((m for m in msgs if not getattr(m, "out", False)), None)
+                    btns = _btn_texts_from_msg(last) if last else []
+                    if mname in btns:
+                        await _pricenft_click_or_send(last, mname)
+                    else:
+                        # текстовый поиск модели
+                        await _pricenft_send(mname)
+                    await asyncio.sleep(PRICENFT_MSG_CD)
+                    # ждём выдачу юзернеймов (иногда несколькими сообщениями)
+                    await asyncio.sleep(1.2)
+                    msgs = await _pricenft_latest(10)
+                    added = await _pricenft_ingest_messages(mname, msgs)
+                    stats["added"] += added
+                    stats["models_clicked"] += 1
+                    # назад, если есть
+                    msgs = await _pricenft_latest(2)
+                    last = next((m for m in msgs if not getattr(m, "out", False)), None)
+                    btns = _btn_texts_from_msg(last) if last else []
+                    back = _find_btn_text(btns, ("назад", "back", "←"))
+                    if back:
+                        await _pricenft_click_or_send(last, back)
+                        await asyncio.sleep(PRICENFT_MSG_CD)
+                except Exception as e:
+                    stats["errors"] += 1
+                    logger.warning("collect model %s: %s", mname, e)
+                if (i + 1) % 5 == 0:
+                    save_pricenft_db()
+
+            # Фон и Узор — дополнительный сбор (короче)
+            for cat_key, keys in cat_map[1:]:
+                try:
+                    await prog("PriceNFTbot: категория " + cat_key + "...")
+                    await _pricenft_send("/search")
+                    await asyncio.sleep(PRICENFT_MSG_CD)
+                    await open_category(keys)
+                    msgs = await _pricenft_latest(4)
+                    last = next((m for m in msgs if not getattr(m, "out", False)), None)
+                    btns = _btn_texts_from_msg(last) if last else []
+                    options = []
+                    for t in btns:
+                        low = t.lower()
+                        if any(k in low for k in ("назад", "back", "далее", "next", "меню", "menu", "поиск")):
+                            continue
+                        options.append(t)
+                    for t in options[:12]:
+                        await prog(cat_key + ": " + t)
+                        await _pricenft_click_or_send(last, t)
+                        await asyncio.sleep(PRICENFT_MSG_CD)
+                        await asyncio.sleep(1.0)
+                        msgs = await _pricenft_latest(8)
+                        stats["added"] += await _pricenft_ingest_messages(t, msgs)
+                        # back
+                        msgs = await _pricenft_latest(2)
+                        last2 = next((m for m in msgs if not getattr(m, "out", False)), None)
+                        btns2 = _btn_texts_from_msg(last2) if last2 else []
+                        back = _find_btn_text(btns2, ("назад", "back", "←"))
+                        if back:
+                            await _pricenft_click_or_send(last2, back)
+                            await asyncio.sleep(PRICENFT_MSG_CD)
+                        msgs = await _pricenft_latest(3)
+                        last = next((m for m in msgs if not getattr(m, "out", False)), None)
+                except Exception as e:
+                    stats["errors"] += 1
+                    logger.warning("collect cat %s: %s", cat_key, e)
+
+            save_pricenft_db()
+            st = pricenft_db_stats()
+            await prog(
+                "✅ Сбор готов\n"
+                "Моделей в БД: " + str(st["models"]) + "\n"
+                "Юзеров: " + str(st["users"]) + "\n"
+                "NFT-ссылок: " + str(st["nfts"]) + "\n"
+                "Кликов: " + str(stats["models_clicked"]) + " | +записей: " + str(stats["added"])
+            )
+            return {"ok": True, **stats, **st}
+    except Exception as e:
+        logger.error("collect_pricenft_db: %s", e)
+        save_pricenft_db()
+        return {"ok": False, "error": str(e), **stats}
+    finally:
+        _pricenft_collecting = False
+
+
+
+async def deliver_pricenft_random(status_msg, max_results=20, girls_only=False, region="any",
+                                  with_cd=True):
+    """
+    Рандомная выдача из БД PriceNFT по моделям (частями).
+    with_cd=True — пауза PRICENFT_MSG_CD между сообщениями пользователю.
+    """
+    global is_searching, SEEN_GLOBAL
+    load_pricenft_db()
+    st = pricenft_db_stats()
+    if st.get("users", 0) <= 0:
+        try:
+            await status_msg.edit_text(
+                "<b>БД PriceNFT пустая.</b>\nАдмин → «Собрать PriceNFT БД»",
+                parse_mode="HTML", reply_markup=menu_kb()
+            )
+        except Exception:
+            pass
+        return 0
+
+    hits = await search_pricenftbot(limit=max(max_results * 3, 30))
+    found = 0
+    for h in hits:
+        if not is_searching or found >= max_results:
+            break
+        uname = h.get("username")
+        oid = h.get("owner_id")
+        owner = h.get("owner")
+        name = h.get("name") or ""
+        if oid and oid in SEEN_GLOBAL:
+            continue
+        if is_trader_account(owner, uname, name):
+            if oid:
+                SEEN_GLOBAL.add(oid)
+            continue
+        if girls_only and not is_girl(owner, uname, name):
+            continue
+        if region and region != "any":
+            if not region_match_full(owner, uname, name, region):
+                continue
+        model = h.get("model") or h.get("title") or "NFT"
+        nft_url = h.get("nft_url")
+        p_url = h.get("profile_url") or (("https://t.me/" + uname) if uname else None)
+        owner_s = fmt_owner(owner, uname, name)
+        user_line = ("\n👤 @" + esc(uname)) if uname else ""
+        model_line = "\n🎨 Модель: <b>" + esc(str(model)) + "</b>"
+        nft_line = ""
+        if nft_url:
+            nft_line = '\n<a href="' + nft_url + '">' + esc(str(model)) + "</a>"
+        txt = "<b>" + owner_s + "</b>" + user_line + model_line + nft_line
+        if oid:
+            cache_owner(oid, owner, uname, name, p_url, [h])
+            SEEN_GLOBAL.add(oid)
+            kb = model_card_kb(uname, p_url, oid, nft_url, nft_count=1)
+        else:
+            # без id — только ссылка на username
+            btns = []
+            if uname:
+                btns.append([InlineKeyboardButton(text="@" + uname, url="https://t.me/" + uname)])
+                msg = urllib.parse.quote("Привет хочу купить твой NFT")
+                btns.append([InlineKeyboardButton(text="Написать", url="https://t.me/" + uname + "?text=" + msg)])
+            kb = InlineKeyboardMarkup(inline_keyboard=btns) if btns else None
+        try:
+            await status_msg.bot.send_message(
+                chat_id=status_msg.chat.id, text=txt,
+                parse_mode="HTML", reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            found += 1
+            stats["found"] += 1
+        except Exception as e:
+            logger.warning("pricenft deliver: %s", e)
+            continue
+        if with_cd and found < max_results and is_searching:
+            await asyncio.sleep(PRICENFT_MSG_CD)
+    return found
 
 
 # ── PROFILE SEARCH ────────────────────────────────────────────────────────────
@@ -1533,44 +1987,42 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         )
         workers = [asyncio.create_task(worker()) for _ in range(12)]
 
-        # 1) @PriceNFTbot — usernames владельцев
+        # 1) Локальная БД PriceNFTbot — рандом по моделям
         if is_searching and found[0] < max_results:
             try:
+                st = pricenft_db_stats()
                 await status_msg.edit_text(
-                    "<b>Профиль:</b> @PriceNFTbot...",
+                    "<b>Профиль:</b> БД PriceNFT (" + str(st.get("users", 0))
+                    + " юзеров / " + str(st.get("models", 0)) + " моделей)...",
                     parse_mode="HTML", reply_markup=stop_kb()
                 )
             except Exception:
                 pass
-            queries = ["nft", "gift", "owner", "ton", "stars"]
-            if girls_only:
-                queries = ["girl", "model"] + queries
-            for q in queries:
+            try:
+                hits = await search_pricenftbot(limit=max(40, max_results * 2))
+            except Exception as e:
+                logger.debug("pricenft profile: %s", e)
+                hits = []
+            for h in hits:
                 if not is_searching or found[0] >= max_results:
                     break
-                try:
-                    hits = await search_pricenftbot(q, limit=20)
-                except Exception as e:
-                    logger.debug("pricenft profile: %s", e)
-                    hits = []
-                for h in hits:
-                    oid = h.get("owner_id")
-                    uname = h.get("username")
-                    if not oid and uname:
-                        try:
-                            ent = await tg_client.get_entity(uname)
-                            oid = int(ent.id)
-                            h["owner"] = ent
-                            h["owner_id"] = oid
-                        except Exception:
-                            continue
-                    if oid:
-                        await emit_owner(oid, {
-                            "owner": h.get("owner"),
-                            "username": uname,
-                            "name": h.get("name") or "",
-                            "profile_url": h.get("profile_url"),
-                        })
+                oid = h.get("owner_id")
+                uname = h.get("username")
+                if not oid and uname:
+                    try:
+                        ent = await tg_client.get_entity(uname)
+                        oid = int(ent.id)
+                        h["owner"] = ent
+                        h["owner_id"] = oid
+                    except Exception:
+                        continue
+                if oid:
+                    await emit_owner(oid, {
+                        "owner": h.get("owner"),
+                        "username": uname,
+                        "name": h.get("name") or "",
+                        "profile_url": h.get("profile_url"),
+                    })
 
         # 2) Участники чатов — основной источник (у них чаще 0 на маркете)
         if is_searching and found[0] < max_results:
@@ -1807,9 +2259,9 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             parse_mode="HTML", reply_markup=stop_kb()
         )
 
-        # Доп. кандидаты из @PriceNFTbot (показываем username в боте)
+        # Доп. кандидаты из локальной БД PriceNFTbot (рандом по моделям)
         try:
-            pn_hits = await search_pricenftbot("market", limit=15)
+            pn_hits = await search_pricenftbot(limit=20)
             for h in pn_hits:
                 oid = h.get("owner_id")
                 if not oid or oid in SEEN_GLOBAL:
@@ -1819,13 +2271,17 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                     continue
                 if girls_only and not is_girl(h.get("owner"), h.get("username"), h.get("name")):
                     continue
-                # один лот-заглушка с юзернеймом, если есть nft_url
-                if not h.get("nft_url"):
+                if not h.get("nft_url") and not h.get("username"):
                     continue
+                # если нет nft_url — всё равно покажем username с модели
+                item = dict(h)
+                if not item.get("nft_url"):
+                    item["nft_url"] = None
+                    item["title"] = item.get("model") or item.get("title") or "NFT"
                 owner_map[oid] = {
                     "owner": h.get("owner"), "username": h.get("username"),
                     "name": h.get("name") or "", "profile_url": h.get("profile_url"),
-                    "items": [h],
+                    "items": [item],
                 }
             await flush_ready()
         except Exception as e:
@@ -1973,17 +2429,26 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
 
     try:
         await status_msg.edit_text(
-            "<b>Ищу по модели (свежие лоты)...</b>",
+            "<b>Ищу по модели (БД PriceNFT + маркет)...</b>",
             parse_mode="HTML", reply_markup=stop_kb()
         )
-        valid_ids = list(gift_ids) if gift_ids else [gid for gid, _ in ALL_GIFT_IDS]
-        random.shuffle(valid_ids)
-        PARALLEL = 10
-        for i in range(0, len(valid_ids), PARALLEL):
-            if not is_searching or found[0] >= max_results:
-                break
-            batch = valid_ids[i:i+PARALLEL]
-            await asyncio.gather(*[scan_col(gid) for gid in batch])
+        # 1) Главное — рандом из БД PriceNFT по моделям (CD 3с между сообщениями)
+        db_found = await deliver_pricenft_random(
+            status_msg, max_results=max_results,
+            girls_only=girls_only, region=region, with_cd=True,
+        )
+        found[0] += db_found
+
+        # 2) Добираем с маркета если нужно
+        if is_searching and found[0] < max_results:
+            valid_ids = list(gift_ids) if gift_ids else [gid for gid, _ in ALL_GIFT_IDS]
+            random.shuffle(valid_ids)
+            PARALLEL = 10
+            for i in range(0, len(valid_ids), PARALLEL):
+                if not is_searching or found[0] >= max_results:
+                    break
+                batch = valid_ids[i:i+PARALLEL]
+                await asyncio.gather(*[scan_col(gid) for gid in batch])
     except Exception as e:
         logger.error("do_model_search: %s", e)
     finally:
@@ -2404,9 +2869,10 @@ async def cmd_neptunteam(message: Message, state: FSMContext):
         "Фильтрует по цене относительно флора коллекции.\n\n"
         "По профилю\n"
         "Ищет аккаунты с NFT в профиле и строго 0 лотов на маркете.\n"
-        "Источники: NFT-чаты + @PriceNFTbot (не текущие продавцы).\n\n"
+        "Источники: БД PriceNFT (рандом по моделям) + NFT-чаты.\n\n"
         "По модели\n"
-        "Показывает NFT у владельцев-моделей и блогеров.\n"
+        "Сначала рандом из БД @PriceNFTbot по моделям (CD 3с),\n"
+        "потом добор свежих лотов с маркета.\n"
         "Кнопка «Написать» включает ссылку на NFT.\n\n"
         "НАСТРОЙКИ\n\n"
         "Мин. гифтов: " + str(mn) + "\n"
@@ -2898,6 +3364,45 @@ async def cb_reload_cols(cb: CallbackQuery):
     await cb.message.answer("<b>Коллекции обновлены: " + str(len(ALL_GIFT_IDS)) + " шт.</b>",
                             parse_mode="HTML", reply_markup=admin_kb())
 
+@dp.callback_query(F.data == "admin_pricenft_collect")
+async def cb_pricenft_collect(cb: CallbackQuery):
+    """Сбор из @PriceNFTbot: /start → модель/фон/узор → в локальную БД (CD 3с)."""
+    if not is_admin(cb.from_user.id):
+        return
+    global _pricenft_collecting
+    if _pricenft_collecting:
+        await cb.answer("Сбор уже идёт", show_alert=True)
+        return
+    if not await check_authorized():
+        await cb.answer("Сначала авторизуй Telethon", show_alert=True)
+        return
+    await cb.answer("Стартую сбор...")
+    status = await cb.message.answer(
+        "<b>📦 Сбор PriceNFTbot...</b>\n/start → /search → Модель/Фон/Узор\nCD 3 сек между сообщениями",
+        parse_mode="HTML"
+    )
+
+    async def prog(text):
+        try:
+            await status.edit_text("<b>📦 PriceNFT</b>\n" + esc(text), parse_mode="HTML")
+        except Exception:
+            pass
+
+    result = await collect_pricenft_db(progress_cb=prog, max_models=40)
+    if result.get("ok"):
+        await status.edit_text(
+            "<b>✅ PriceNFT БД обновлена</b>\n"
+            "Моделей: " + str(result.get("models", 0)) + "\n"
+            "Юзеров: " + str(result.get("users", 0)) + "\n"
+            "NFT: " + str(result.get("nfts", 0)),
+            parse_mode="HTML", reply_markup=admin_kb()
+        )
+    else:
+        await status.edit_text(
+            "<b>❌ Сбор не удался:</b> " + esc(str(result.get("error", "?"))),
+            parse_mode="HTML", reply_markup=admin_kb()
+        )
+
 @dp.callback_query(F.data == "admin_broadcast")
 async def cb_admin_broadcast(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
@@ -2952,12 +3457,16 @@ async def cb_admin_stats(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return
     u = load_users()
+    pn = pricenft_db_stats()
     await cb.message.answer(
         "<b>Статистика\n\n"
         "Пользователей: " + str(len(u)) + "\n"
         "Поисков: " + str(stats["checks"]) + "\n"
         "Найдено: " + str(stats["found"]) + "\n"
-        "Коллекций: " + str(len(ALL_GIFT_IDS)) + "</b>",
+        "Коллекций: " + str(len(ALL_GIFT_IDS)) + "\n"
+        "PriceNFT БД: " + str(pn.get("models", 0)) + " моделей / "
+        + str(pn.get("users", 0)) + " юзеров / "
+        + str(pn.get("nfts", 0)) + " nft</b>",
         parse_mode="HTML", reply_markup=admin_kb()
     )
     await cb.answer()
@@ -3056,9 +3565,12 @@ async def auth_password(message: Message, state: FSMContext):
 async def main():
     global ONBOARDING_DONE
     ONBOARDING_DONE = load_onboarding()
+    load_pricenft_db()
     if not tg_client.is_connected():
         await tg_client.connect()
     logger.info("Neptun Parser запущен!")
+    st = pricenft_db_stats()
+    logger.info("PriceNFT БД: models=%s users=%s", st.get("models"), st.get("users"))
     from aiogram.types import BotCommand
     await bot.set_my_commands([
         BotCommand(command="start",      description="Главное меню"),
