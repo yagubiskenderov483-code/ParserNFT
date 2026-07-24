@@ -217,18 +217,27 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
         if region_key == "ua":
             if ua_chars >= 1 or ua_words or (has_cyr and "ua" in combined):
                 return True
+            # явные другие CIS — режем; неизвестных не трогаем (маркет часто без маркеров)
+            if by_words or kz_words or uz_words or ru_words:
+                return False
             return True
         if region_key == "by":
             if by_words or (has_cyr and any(k in combined for k in ["by_", "_by", "бел"])):
                 return True
+            if ua_chars >= 1 or ua_words or kz_words or uz_words or ru_words:
+                return False
             return True
         if region_key == "kz":
             if kz_words or any(k in combined for k in ["kz_", "_kz"]):
                 return True
+            if ua_chars >= 1 or ua_words or by_words or uz_words or ru_words:
+                return False
             return True
         if region_key == "uz":
             if uz_words or any(k in combined for k in ["uz_", "_uz"]):
                 return True
+            if ua_chars >= 1 or ua_words or by_words or kz_words or ru_words:
+                return False
             return True
         # Россия: режем явные ua/by/kz/uz; неизвестных пропускаем
         if ua_chars >= 2 or ua_words or by_words or kz_words or uz_words:
@@ -251,6 +260,8 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
             "de_", "_de", "österreich","austria","wien","vienna","schweiz","zurich",
         ]):
             return True
+        if has_fr or has_es or has_tr or (has_cyr and not has_lat):
+            return False
         return True
     if region_key == "fr":
         if has_fr or any(k in combined for k in [
@@ -258,6 +269,8 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
             "bordeaux","strasbourg","nantes","toulouse","nice","lille","monaco",
         ]):
             return True
+        if has_de or has_es or has_tr or (has_cyr and not has_lat):
+            return False
         return True
     if region_key == "es":
         if has_es or any(k in combined for k in [
@@ -266,6 +279,8 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
             "es_", "chile","peru","perú","venezuela","miami latina",
         ]):
             return True
+        if has_de or has_fr or has_tr or (has_cyr and not has_lat):
+            return False
         return True
     if region_key == "it":
         if any(k in combined for k in [
@@ -273,6 +288,8 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
             "napoli","naples","torino","florence","firenze","it_", "_it",
         ]):
             return True
+        if has_de or has_fr or has_es or has_tr or (has_cyr and not has_lat):
+            return False
         return True
     if region_key == "pl":
         if any(k in combined for k in [
@@ -280,6 +297,8 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
             "wroclaw","gdansk","poznan","pl_", "_pl", "łódź","lodz",
         ]) or any(c in "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ" for c in full_raw):
             return True
+        if has_de or has_fr or has_es or has_tr or (has_cyr and not has_lat):
+            return False
         return True
     if region_key == "tr":
         if has_tr or any(k in combined for k in [
@@ -287,6 +306,8 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
             "antalya","bursa","adana","gaziantep","tr_", "_tr",
         ]):
             return True
+        if has_de or has_fr or has_es or (has_cyr and not has_lat):
+            return False
         return True
     if region_key == "ae":
         ar = sum(1 for c in full_raw if '\u0600' <= c <= '\u06ff')
@@ -295,6 +316,8 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
             "ajman","fujairah","ras al","dxb","ae_",
         ]):
             return True
+        if has_de or has_fr or has_es or has_tr or (has_cyr and not has_lat):
+            return False
         return True
     if region_key == "cn":
         zh = sum(1 for c in full_raw if '\u4e00' <= c <= '\u9fff')
@@ -302,6 +325,8 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
             "china","chinese","beijing","shanghai","guangzhou","shenzhen","cn_",
         ]):
             return True
+        if has_de or has_fr or has_es or has_tr or (has_cyr and not has_lat):
+            return False
         return True
     if region_key == "jp":
         hi = sum(1 for c in full_raw if '\u3040' <= c <= '\u309f')
@@ -310,6 +335,8 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
             "japan","tokyo","osaka","japanese","kyoto","yokohama","nagoya","sapporo","jp_",
         ]):
             return True
+        if has_de or has_fr or has_es or has_tr or (has_cyr and not has_lat):
+            return False
         return True
     if region_key == "in":
         dev = sum(1 for c in full_raw if '\u0900' <= c <= '\u097f')
@@ -318,6 +345,8 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
             "bangladesh","chennai","kolkata","hyderabad","pune","ahmedabad","in_",
         ]):
             return True
+        if has_de or has_fr or has_es or has_tr or (has_cyr and not has_lat):
+            return False
         return True
     if region_key == "uk":
         if has_de or has_fr or has_es or has_tr:
@@ -964,11 +993,19 @@ def price_in_cat(price, cat):
     return mn <= price <= mx
 
 def price_ok(price, floor, boost):
+    """Буст от флора: 100% = до x2, 200% = до x3 (как в UI). Без флора — не режем."""
     if not price or not floor:
         return True
-    # Очень широкое окно: буст режет только явный перекуп относительно флора
+    try:
+        price = float(price)
+        floor = float(floor)
+        boost = int(boost or 0)
+    except Exception:
+        return True
+    if price <= 0 or floor <= 0:
+        return True
     lo = floor * 0.3
-    hi = floor * (1.0 + max(boost, 50) / 100.0) * 3.0
+    hi = floor * (1.0 + max(boost, 0) / 100.0)
     return lo <= price <= hi
 
 def cache_owner(uid, owner, username, name, profile_url, items):
@@ -1367,6 +1404,9 @@ def _gift_on_market(gift, inner=None):
     return False
 
 
+# chat_id → token, который юзер остановил кнопкой (чтобы UI не перетёр «остановлен»)
+STOPPED_SEARCH_TOKENS = {}
+
 def begin_search(chat_id):
     """Старт поиска для чата. Возвращает token или None если уже идёт."""
     global _search_seq
@@ -1381,6 +1421,7 @@ def begin_search(chat_id):
         ACTIVE_SEARCHES.pop(chat_id, None)
     if chat_id in ACTIVE_SEARCHES:
         return None
+    STOPPED_SEARCH_TOKENS.pop(chat_id, None)
     _search_seq += 1
     token = _search_seq
     ACTIVE_SEARCHES[chat_id] = {"token": token, "started": now}
@@ -1445,7 +1486,19 @@ def cancel_chat_search(chat_id):
         chat_id = int(chat_id)
     except Exception:
         return False
-    return ACTIVE_SEARCHES.pop(chat_id, None) is not None
+    cur = ACTIVE_SEARCHES.pop(chat_id, None)
+    if cur:
+        STOPPED_SEARCH_TOKENS[chat_id] = cur.get("token")
+        return True
+    return False
+
+def was_search_stopped(chat_id, token):
+    """True если этот токен остановили кнопкой Стоп (не путать с нормальным завершением)."""
+    try:
+        chat_id = int(chat_id)
+    except Exception:
+        return False
+    return STOPPED_SEARCH_TOKENS.pop(chat_id, None) == token
 
 def chat_is_searching(chat_id):
     try:
@@ -1957,7 +2010,15 @@ def seed_pricenft_from_item(item, commit=False):
         title = item.get("title") or item.get("model") or ""
         nft_url = item.get("nft_url")
         uid = item.get("owner_id")
-        if not uname or not title or str(title) in ("?", "NFT", "None"):
+        # Gift #5177… ломает матчинг коллекций — берём имя из slug
+        t = str(title or "").strip()
+        if (not t) or t.startswith("Gift #") or t.startswith("gift #") or t in ("?", "NFT", "None"):
+            slug = gift_slug_of(nft_url) or ""
+            base = re.sub(r"-\d+$", "", slug)
+            if not base or base.lower().startswith("gift") or base.startswith("user:"):
+                return
+            title = base
+        if not uname or not title:
             return
         pricenft_add_user(
             str(title), uname, [nft_url] if nft_url else None,
@@ -3617,9 +3678,10 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                             continue
                         if is_trader_account(owner_obj, username, name):
                             continue
+                        # soft: скрытые NFT можно брать даже если в профиле есть лоты на маркете
                         saved = await fetch_saved_gifts(
                             peer, max_pages=1, only_off_market=True,
-                            require_zero_on_market=use_global_seen,
+                            require_zero_on_market=False,
                         )
                         if saved is None or not saved:
                             continue
@@ -3751,15 +3813,51 @@ def _make_nft_lines(items):
 
 
 # ── SEARCH CORE: MARKET ───────────────────────────────────────────────────────
+def _rank_pairs_for_cat(pairs, cat):
+    """
+    mid/hard/…: сначала коллекции с кэшированным флором в категории,
+    потом неизвестные; явно «мимо» флора — в хвост (редко дойдём).
+    cheap не трогаем — там sort_by_price.
+    """
+    pairs = list(pairs or [])
+    if not pairs or not cat or cat == "cheap" or not _cat_bounds(cat):
+        return pairs
+    in_band, unknown, out = [], [], []
+    for gid, title in pairs:
+        fl = PRICE_FLOOR_CACHE.get(gid)
+        if fl is None:
+            unknown.append((gid, title))
+        elif floor_in_cat(fl, cat):
+            in_band.append((gid, title))
+        else:
+            out.append((gid, title))
+    random.shuffle(in_band)
+    random.shuffle(unknown)
+    random.shuffle(out)
+    ranked = in_band + unknown + out
+    return ranked if ranked else pairs
+
+def _clean_col_title(title, nft_url=None):
+    """Не затираем нормальный title фолбэком Gift #…; из slug берём имя коллекции."""
+    t = str(title or "").strip()
+    if t and not t.startswith("Gift #") and not t.startswith("gift #") and t not in ("?", "None", "nan"):
+        return t
+    slug = gift_slug_of(nft_url) or ""
+    base = re.sub(r"-\d+$", "", slug)
+    if base and not base.lower().startswith("gift"):
+        return base
+    return t or "?"
+
 async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                            boost=100, min_gifts=1, max_gifts=0,
                            max_results=30, region="any", who=None,
                            chat_id=None, search_token=None):
     """
-    Быстрый маркет (~10с):
-      - cheap/mid → сортировка по цене (иначе newest почти без дешёвых)
-      - 1 страница, ограниченный пул коллекций
-      - сразу шлём до max_results, потом soft без anti-dupe
+    Быстрый маркет (~10с primary + soft добор):
+      - cheap → sort_by_price
+      - mid/hard/… → newest по коллекциям с флором в категории (кэш)
+      - буст от флора (только PRICE_FLOOR_CACHE, без FloodWait)
+      - soft-добор без anti-dupe и без жёсткого 10с бюджета
     """
     chat_id = chat_id or (status_msg.chat.id if getattr(status_msg, "chat", None) else None)
     if search_token is not None and chat_id is not None:
@@ -3772,9 +3870,13 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         max_results = max(1, min(int(max_results or 1), 200))
     except Exception:
         max_results = 30
+    try:
+        boost = int(boost if boost is not None else 100)
+    except Exception:
+        boost = 100
 
     t0 = time.time()
-    TIME_BUDGET = 10.0  # целевое время выдачи
+    TIME_BUDGET = 10.0  # целевое время первой выдачи
 
     def time_left():
         return (time.time() - t0) < TIME_BUDGET and still()
@@ -3787,8 +3889,8 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
     weird_checks = [0]
     weird_lock = asyncio.Lock()
 
-    # cheap/mid: берём самые дешёвые лоты; иначе свежие
-    by_price = cat == "cheap"  # mid/hard нельзя: sort_by_price даёт только дёшево
+    # только cheap: mid/hard на sort_by_price = страница из лотов <2000
+    by_price = cat == "cheap"
 
     async def try_send(item, use_global_seen=True):
         oid = item.get("owner_id")
@@ -3856,7 +3958,13 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             return False
 
     def pass_filters(item):
-        if not price_in_cat(item.get("price"), cat):
+        price = item.get("price")
+        if not price_in_cat(price, cat):
+            return False
+        # буст от флора — только из кэша (без get_floor на горячем пути)
+        gid = item.get("gift_id")
+        floor = PRICE_FLOOR_CACHE.get(gid) if gid is not None else None
+        if floor is not None and not price_ok(price, floor, boost):
             return False
         if (not weird_mode) and (not who_pass(item.get("owner"), item.get("username"), item.get("name"), who)):
             return False
@@ -3886,9 +3994,12 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 weird_checks[0] = max(0, weird_checks[0] - 1)
             return False
 
-    async def fetch_bucket(gid, title=""):
+    async def fetch_bucket(gid, title="", budgeted=True):
         out = []
-        if not time_left():
+        if budgeted:
+            if not time_left():
+                return out
+        elif not still():
             return out
         try:
             items, _ = await fetch_market_page(gid, "", limit=100, newest=(not by_price))
@@ -3898,8 +4009,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             item = dict(item)
             item["gift_id"] = gid
             item["source"] = "market"
-            if title:
-                item["title"] = title
+            item["title"] = _clean_col_title(title or item.get("title"), item.get("nft_url"))
             if not pass_filters(item):
                 continue
             if not item.get("owner_id") and not item.get("username"):
@@ -3926,9 +4036,10 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             keys = nxt
         return ordered
 
-    async def emit_pool(pool, use_global_seen=True):
+    async def emit_pool(pool, use_global_seen=True, budgeted=True):
+        alive = time_left if budgeted else still
         for item in diversify(pool):
-            if not time_left() or found[0] >= max_results:
+            if not alive() or found[0] >= max_results:
                 break
             oid = item.get("owner_id")
             uname = item.get("username")
@@ -3956,16 +4067,16 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             pass
 
     try:
-        mode_s = "дешёвые↑" if by_price else "свежие"
+        mode_s = "дешёвые↑" if by_price else "свежие+флор-кэш"
         await progress("быстрый сбор (" + mode_s + ")...")
         id_set = set(gift_ids)
         valid_pairs = [(gid, title) for gid, title in ALL_GIFT_IDS if gid in id_set] if ALL_GIFT_IDS else [(gid, "") for gid in gift_ids]
         if not valid_pairs:
             valid_pairs = [(gid, "") for gid in gift_ids]
         random.shuffle(valid_pairs)
-        all_pairs = list(valid_pairs)
+        all_pairs = _rank_pairs_for_cat(valid_pairs, cat)
         # не сканируем все 149 в первой волне — хватает выборки под 10с
-        SCAN = 40 if by_price else 28
+        SCAN = 40 if by_price else 32
         valid_pairs = all_pairs[:SCAN]
 
         PARALLEL = 18
@@ -3975,7 +4086,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 break
             chunk = valid_pairs[i:i + PARALLEL]
             parts = await asyncio.gather(
-                *[fetch_bucket(gid, t) for gid, t in chunk],
+                *[fetch_bucket(gid, t, budgeted=True) for gid, t in chunk],
                 return_exceptions=True,
             )
             for part in parts:
@@ -3985,41 +4096,41 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             if all_pool and found[0] < max_results:
                 batch = all_pool
                 all_pool = []
-                await emit_pool(batch, use_global_seen=True)
+                await emit_pool(batch, use_global_seen=True, budgeted=True)
             if found[0] >= max_results:
                 break
             await progress("пул ок")
 
         if all_pool and found[0] < max_results and time_left():
-            await emit_pool(all_pool, use_global_seen=True)
+            await emit_pool(all_pool, use_global_seen=True, budgeted=True)
 
-        # добор без anti-dupe — другие коллекции из полного списка
-        if time_left() and found[0] < max_results:
+        # soft: не завязан на 10с — иначе добор почти никогда не стартует
+        if still() and found[0] < max_results:
             await progress("добор без антидубля...")
             rest = all_pairs[SCAN:] + all_pairs[:SCAN]
             random.shuffle(rest)
             more = []
-            for i in range(0, min(len(rest), 36), PARALLEL):
-                if not time_left() or found[0] >= max_results:
+            for i in range(0, min(len(rest), 48), PARALLEL):
+                if not still() or found[0] >= max_results:
                     break
                 chunk = rest[i:i + PARALLEL]
                 parts = await asyncio.gather(
-                    *[fetch_bucket(gid, t) for gid, t in chunk],
+                    *[fetch_bucket(gid, t, budgeted=False) for gid, t in chunk],
                     return_exceptions=True,
                 )
                 for part in parts:
                     if isinstance(part, list):
                         more.extend(part)
                 if more:
-                    await emit_pool(more, use_global_seen=False)
+                    await emit_pool(more, use_global_seen=False, budgeted=False)
                     more = []
-            if more and found[0] < max_results:
-                await emit_pool(more, use_global_seen=False)
+            if more and found[0] < max_results and still():
+                await emit_pool(more, use_global_seen=False, budgeted=False)
 
         db_flush(force=True)
         logger.info(
-            "market_search cat=%s found=%s/%s dt=%.1fs by_price=%s",
-            cat, found[0], max_results, time.time() - t0, by_price,
+            "market_search cat=%s found=%s/%s dt=%.1fs by_price=%s boost=%s",
+            cat, found[0], max_results, time.time() - t0, by_price, boost,
         )
     except Exception as e:
         logger.error("do_market_search: %s", e)
@@ -4322,11 +4433,12 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
         if still() and found[0] < max_results and leftover:
             await emit_pool(leftover, use_global_seen=False, enforce_cap=False)
             leftover.clear()
-        if time_left() and found[0] < max_results:
+        # soft без 10с бюджета
+        if still() and found[0] < max_results:
             await progress("добор без антидубля...")
             soft = []
-            for g in gids[:16]:
-                if not time_left() or found[0] >= max_results:
+            for g in gids[:24]:
+                if not still() or found[0] >= max_results:
                     break
                 soft.extend(await fetch_col(g))
             await emit_pool(soft, use_global_seen=False, enforce_cap=False)
@@ -4499,12 +4611,12 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
 
         await emit_hits(use_global_seen=True)
 
-        # 2) без anti-dupe — перечитываем БД с ignore_seen
-        if time_left() and found[0] < max_results:
+        # 2) soft БД: не режем по 10с бюджету (иначе добор почти не стартует)
+        if still() and found[0] < max_results:
             await progress("добор БД...")
             hits = []
             for t in titles_q:
-                if not time_left():
+                if not still() or found[0] >= max_results:
                     break
                 part = random_from_pricenft_db(
                     limit=max(max_results * 8, 160), model=t, exact=True, ignore_seen=True
@@ -4519,17 +4631,37 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                         continue
                     hits.append(h)
             random.shuffle(hits)
-            await emit_hits(use_global_seen=False)
+            # emit без time_left: временно ослабляем бюджет через still-only цикл
+            for h in hits:
+                if not still() or found[0] >= max_results:
+                    break
+                uname = (h.get("username") or "").lstrip("@") or None
+                uid = h.get("owner_id") or h.get("uid")
+                name = h.get("name") or uname or ""
+                nft_url = h.get("nft_url")
+                if who == "girls":
+                    low = ((name or "") + " " + (uname or "")).lower()
+                    if re.search(r"(?<![a-zа-яё])(boy|male|парень|мужик|he/him)(?![a-zа-яё])", low):
+                        continue
+                elif weird_mode:
+                    pass  # БД без enrich — не режем weird на soft
+                elif not who_pass(None, uname, name, who):
+                    continue
+                if region and region != "any":
+                    if not region_match_full(None, uname, name, region):
+                        continue
+                show = allowed_titles[0] if single and allowed_titles else (h.get("title") or h.get("model") or "?")
+                await try_send(uid, uname, name, h.get("owner"), nft_url, show, h.get("profile_url"))
 
-        # 3) если всё ещё мало — точечная проверка профилей (дорого, мало)
-        if time_left() and found[0] < max_results:
+        # 3) точечная проверка профилей (дорого) — тоже без жёсткого 10с
+        if still() and found[0] < max_results:
             await progress("проверка профилей...")
             need = max_results - found[0]
             cands = [h for h in hits if h.get("username")][: need * 8]
             sem = asyncio.Semaphore(10)
 
             async def one(h):
-                if not time_left() or found[0] >= max_results:
+                if not still() or found[0] >= max_results:
                     return
                 uname = (h.get("username") or "").lstrip("@") or None
                 uid = h.get("owner_id") or h.get("uid")
@@ -4546,7 +4678,13 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                 if not matched:
                     return
                 name = h.get("name") or uname or ""
-                if not who_pass(None, uname, name, who):
+                if who == "girls":
+                    low = ((name or "") + " " + (uname or "")).lower()
+                    if re.search(r"(?<![a-zа-яё])(boy|male|парень|мужик|he/him)(?![a-zа-яё])", low):
+                        return
+                elif weird_mode:
+                    pass
+                elif not who_pass(None, uname, name, who):
                     return
                 if region and region != "any":
                     if not region_match_full(None, uname, name, region):
@@ -4591,9 +4729,10 @@ async def _start_market(cb, cat, who="all"):
         who_l = who_label(who)
         reg_l = REGIONS.get(reg, {}).get("label", "Все страны")
         bst = get_boost(uid)
+        mode_l = "дешёвые↑" if cat == "cheap" else "свежие+флор"
         txt = (
             "<b>Маркет / " + cat_l + " / " + who_l + "\n"
-            "Режим: свежие лоты · буст флора: " + str(bst) + "%\n"
+            "Режим: " + mode_l + " · буст флора: " + str(bst) + "%\n"
             "Регион: " + reg_l + "\n"
             "Карточек за поиск: " + str(lim) + " (макс)</b>"
         )
@@ -4603,7 +4742,7 @@ async def _start_market(cb, cat, who="all"):
                 do_market_search(status, ids, cat=cat, who=who,
                                  boost=boost, max_results=lim, region=reg,
                                  chat_id=chat_id, search_token=token),
-                timeout=20
+                timeout=45
             )
         except asyncio.TimeoutError:
             end_search(chat_id, token)
@@ -4612,6 +4751,8 @@ async def _start_market(cb, cat, who="all"):
             end_search(chat_id, token)
             found = 0
             logger.error("_start_market: %s", e)
+        if was_search_stopped(chat_id, token):
+            return
         done = "<b>✅ Поиск закончен\nМаркет / " + cat_l + " / " + who_l + "\nНайдено: " + str(found) + "</b>"
         try:
             await status.edit_text(done, parse_mode="HTML", reply_markup=menu_kb())
@@ -4678,6 +4819,8 @@ async def _start_profile(cb, cat, who="all"):
             found = 0
             logger.error("_start_profile: %s", e)
         if found == -1:
+            return
+        if was_search_stopped(chat_id, token):
             return
         done = "<b>✅ Поиск закончен\nПрофиль / " + cat_l + " / " + who_l + "\nНайдено: " + str(found) + "</b>"
         try:
@@ -4758,6 +4901,8 @@ async def _start_model(cb, who="all", single_gid=None, search_type="market",
                 status, ids, who=who, max_results=lim, region=reg,
                 chat_id=chat_id, search_token=token,
             )
+        if was_search_stopped(chat_id, token):
+            return
         try:
             done = "<b>✅ Поиск закончен\nМодели / " + who_l + " / " + type_l + "\nНайдено: " + str(found) + "</b>"
             await status.edit_text(done, parse_mode="HTML", reply_markup=menu_kb())
