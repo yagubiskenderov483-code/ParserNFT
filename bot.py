@@ -358,6 +358,8 @@ GIRL_NAMES_SET = {
     "daria","darya","viktoria","viktoriya","valeriya","natalya","nataliya",
     "zhanna","regina","amina","mila","rita","liza","sonia","tonya","lesya",
     "kamilla","camilla","evelina","milena","yasmin","lara","lada","mila",
+    "dashka","mashka","katusha","yulya","uliya","nastenka","polinka","alenka",
+    "karinka","alinа".replace("а","a") if False else "alina",
 }
 BOY_NAMES_SET = {
     "александр","алексей","андрей","антон","артем","борис","вадим","василий",
@@ -373,19 +375,21 @@ BOY_NAMES_SET = {
     "egor","maksim","vlad","danil","daniil","petya","serezha","kostya",
 }
 GIRL_SIGNALS = [
-    "girl","lady","woman","she/her","she her","female","♀","公主",
-    "👩","👸","💃","🌸","💖","💕","💗","👄","💄","🌺","🦋","🌷","🌹","💅","🦄","💫","✨","🍑","👑",
-    "девушка","она","женщина","мама","дочь","принцесса","королева","богиня",
+    "girl","lady","woman","she/her","she her","♀","公主",
+    "👩","👸","💃","🌸","💖","💕","💗","👄","💄","🌺","🦋","🌷","🌹","💅","🦄","💫","✨","🍑","👑","🎀",
+    "девушка","женщина","принцесса","королева","богиня",
     "красотка","кошечка","зайка","лапочка","милашка","красавица","малышка",
-    "onlyfans","model","модель","content","nsfw","18+","tits","boobs",
-    "wife","girlfriend","miss ","mrs","lady_",
+    "onlyfans","модель","wife","girlfriend","miss_","mrs_","lady_",
 ]
 BOY_SIGNALS = [
-    "king","boss","bro","dude","male","guy","lord","sultan","парень","мужик",
-    "мужчина","он ","сын ","брат ","папа","отец","муж ","дядя","he/him","he him",
+    "king","boss","dude","he/him","he him","♂",
+    "парень","мужик","мужчина","папа","отец","дядя",
 ]
+# Короткие boy-сигналы — только как отдельные токены (не подстроки: male⊂female)
+BOY_SIGNAL_WORDS = {"bro", "guy", "male", "man", "boy", "он", "сын", "брат", "муж"}
 
 def is_girl(owner, username=None, name=None):
+    """Мягкий детект девушки по имени/username/эмодзи (маркет часто без bio)."""
     bio_raw   = (getattr(owner, "bio",        "") or "") if owner else ""
     uname_raw = (getattr(owner, "username",   "") or "") if owner else (username or "")
     fname_raw = (getattr(owner, "first_name", "") or "") if owner else ""
@@ -395,80 +399,87 @@ def is_girl(owner, username=None, name=None):
         fname_raw = parts[0] if parts else ""
         lname_raw = parts[1] if len(parts) > 1 else ""
 
+    def _clean(s):
+        s = (s or "").lower().strip()
+        s = re.sub(r"[0-9_./\\|+\-]+", " ", s)
+        s = re.sub(r"[^\w\sа-яёіїєґa-z]", " ", s, flags=re.IGNORECASE)
+        return re.sub(r"\s+", " ", s).strip()
+
     bio   = bio_raw.lower()
     uname = uname_raw.lower()
-    fname = fname_raw.lower().strip()
-    lname = lname_raw.lower().strip()
-    full  = (bio + " " + uname + " " + fname + " " + lname).strip()
-    tokens = _name_tokens(fname, lname, uname, name)
+    fname = _clean(fname_raw)
+    lname = _clean(lname_raw)
+    fname0 = fname.split()[0] if fname else ""
+    tokens = _name_tokens(fname, lname, uname, name, fname0)
+    full   = (bio + " " + uname + " " + fname + " " + lname).strip()
+    full_tokens = set(re.findall(r"[a-zа-яёіїєґ]+", full))
 
-    # Мужское имя точное совпадение — сразу нет
-    for bn in BOY_NAMES_SET:
-        if fname == bn or bn in tokens:
-            # исключение: женя/sasha могут быть женскими — проверяем ниже
-            if bn in ("женя", "саша", "sasha", "жека"):
-                continue
-            return False
-        if len(bn) >= 6 and fname.startswith(bn):
+    # Явный мужской сигнал-слово (не подстрока!)
+    bad = full_tokens & BOY_SIGNAL_WORDS
+    if bad and "female" not in full and "girl" not in full:
+        if fname0 not in GIRL_NAMES_SET and not (tokens & GIRL_NAMES_SET):
             return False
 
-    # Мужские сигналы — сразу нет
     for sig in BOY_SIGNALS:
-        if sig in full:
+        if sig and sig in full:
             return False
 
-    # Мужские окончания имён (рус) — нет, если имя не известно женским
-    MALE_ENDINGS = ("ев","ов","ый","ий","ой","ан","он","ор","ул","ур","им","ир","ён","ец")
-    if fname and len(fname) >= 4 and any(fname.endswith(e) for e in MALE_ENDINGS):
-        is_known_girl = any(fname == gn or (len(gn) >= 4 and fname.startswith(gn)) for gn in GIRL_NAMES_SET)
-        if not is_known_girl and not (tokens & GIRL_NAMES_SET):
+    # Мужское имя — точное совпадение
+    for bn in BOY_NAMES_SET:
+        if len(bn) < 3:
+            continue
+        if fname0 == bn and bn not in ("женя", "саша", "sasha", "жека"):
             return False
+        if bn in tokens and bn not in GIRL_NAMES_SET and bn not in ("женя", "саша", "sasha", "жека"):
+            # alex в tokens при имени alexandra — alexandra тоже в tokens/GIRL
+            if not (tokens & GIRL_NAMES_SET):
+                return False
 
     score = 0
 
-    # Известное женское имя — +3
-    for gn in GIRL_NAMES_SET:
-        if fname == gn or gn in tokens:
-            score += 3
-            break
-        if len(gn) >= 4 and (fname.startswith(gn) or gn.startswith(fname) and len(fname) >= 3):
-            score += 3
-            break
-
-    # Женские окончания имён (рус + лат)
-    GIRL_ENDINGS = ("на","ья","ия","ая","яя","га","за","са","ша","ча","жа","ца","ка","ла","ва","ня","ся")
-    LAT_GIRL_ENDINGS = ("ia","ya","na","ra","la","sa","ta","ka","va","ina","ella","ette","elle","ie","ey")
-    if fname and len(fname) >= 3 and any(fname.endswith(e) for e in GIRL_ENDINGS):
-        score += 2
-    elif fname and len(fname) >= 3 and any(fname.endswith(e) for e in LAT_GIRL_ENDINGS):
-        score += 1
-
-    # Женские сигналы в тексте (каждый +1, max 3)
-    sig_count = 0
-    for sig in GIRL_SIGNALS:
-        if sig in full or sig in bio_raw or sig in uname_raw:
-            sig_count += 1
-    score += min(sig_count, 3)
-
-    # Женские символы в username/bio (каждый +1, max 2)
-    GIRL_CHARS = {"💅","👩","👸","💃","🌸","💖","💕","💗","👄","💄","🌺","🦋","🌷","🌹","🦄","💫","✨","💎","🌟","🍑","👑","♀","🎀"}
-    char_count = sum(1 for ch in GIRL_CHARS if ch in bio_raw or ch in uname_raw or ch in fname_raw)
-    score += min(char_count, 2)
-
-    # username содержит girl-name
-    if score < 2:
+    # Известное женское имя
+    if fname0 in GIRL_NAMES_SET or (tokens & GIRL_NAMES_SET):
+        score += 3
+    else:
         for gn in GIRL_NAMES_SET:
-            if len(gn) >= 4 and gn in uname:
-                score += 2
+            if len(gn) >= 4 and fname0 and (fname0.startswith(gn) or (len(fname0) >= 3 and gn.startswith(fname0))):
+                score += 3
                 break
 
-    # Если вообще нет имени — требуем хотя бы 2 сигнала из bio/username
-    if not fname and score < 2:
-        return False
+    # Женские окончания
+    GIRL_ENDINGS = ("на","ья","ия","ая","яя","га","за","са","ша","ча","жа","ца","ка","ла","ва","ня","ся","та","ра","да")
+    LAT_GIRL_ENDINGS = ("ia","ya","na","ra","la","sa","ta","ka","va","ina","ella","ette","elle","ie","ey","ine","lyn")
+    if fname0 and len(fname0) >= 3:
+        if any(fname0.endswith(e) for e in GIRL_ENDINGS):
+            score += 2
+        elif any(fname0.endswith(e) for e in LAT_GIRL_ENDINGS):
+            score += 2
 
-    # Порог снижен для быстрого и широкого поиска девушек
-    threshold = 2 if fname else 2
-    return score >= threshold
+    # Сигналы / эмодзи
+    for sig in GIRL_SIGNALS:
+        if sig and (sig in full or sig in bio_raw or sig in uname_raw or sig in fname_raw):
+            score += 1
+            break
+    GIRL_CHARS = {"💅","👩","👸","💃","🌸","💖","💕","💗","👄","💄","🌺","🦋","🌷","🌹","🦄","💫","✨","🍑","👑","♀","🎀","❤","😻","💋","🩷","❤️"}
+    if any(ch in bio_raw or ch in uname_raw or ch in fname_raw for ch in GIRL_CHARS):
+        score += 2
+
+    # username
+    if any(x in uname for x in ("girl", "lady", "miss", "princess", "queen", "babe")):
+        score += 2
+    for gn in GIRL_NAMES_SET:
+        if len(gn) >= 4 and gn in uname:
+            score += 2
+            break
+
+    # Порог 1 — маркет без bio
+    if score >= 1 and (fname0 or uname):
+        MALE_ENDINGS = ("ев","ов","ый","ий","ой")
+        if fname0 and len(fname0) >= 4 and any(fname0.endswith(e) for e in MALE_ENDINGS):
+            if fname0 not in GIRL_NAMES_SET and not (tokens & GIRL_NAMES_SET):
+                return False
+        return True
+    return False
 
 
 # ── MODEL DETECTION ───────────────────────────────────────────────────────────
