@@ -57,20 +57,21 @@ DEFAULT_MAX_GIFTS = 5
 DEFAULT_LIMIT     = 30
 DEFAULT_REGION    = "any"
 
-# Глобальная дедупликация владельцев между поисками (не очищаем каждый раз)
+# Дедуп владельцев внутри одного поиска (сбрасываем на старте поиска)
 SEEN_GLOBAL: set = set()
 SEEN_GLOBAL_MAX = 3_000_000
 # Счётчик выдач по коллекции в текущем поиске
-MAX_PER_COLLECTION = 2
-# Трейдер/whale-аккаунты
+MAX_PER_COLLECTION = 8
+# Трейдер/whale — только явные сигналы (не режем всех с "nft" в нике)
 TRADER_NAME_KW = (
-    "nft", "trade", "market", "floor", "whale", "deal", "resell", "flip",
-    "giftbot", "stars market", "tonnel", "fragment", "p2p", "прода", "купл",
+    "whale", "resell", "flipper", "giftbot", "stars market",
+    "tonnel", "fragment", "p2p market", "nft trade", "nft market",
 )
 PRICENFT_BOT = "PriceNFTbot"
 PRICENFT_DB_FILE = "pricenft_db.json"
 PRICENFT_MSG_CD = 3.0  # пауза между сообщениями к PriceNFTbot
 _pricenft_collecting = False
+_search_started_at = 0.0
 
 # ── REGIONS ───────────────────────────────────────────────────────────────────
 REGIONS = {
@@ -1063,6 +1064,22 @@ def _gift_on_market(gift, inner=None):
                         return True
     return False
 
+
+def begin_search():
+    """Старт поиска: сброс флагов/дедупа, защита от залипшего is_searching."""
+    global is_searching, SEEN_GLOBAL, _search_started_at
+    now = time.time()
+    # если прошлый поиск завис > 12 мин — принудительно сбрасываем
+    if is_searching and _search_started_at and (now - _search_started_at) > 720:
+        logger.warning("force-reset stuck is_searching")
+        is_searching = False
+    if is_searching:
+        return False
+    is_searching = True
+    _search_started_at = now
+    SEEN_GLOBAL.clear()
+    return True
+
 def is_trader_account(owner, username=None, name=None):
     """Отсекаем трейдерские/whale аккаунты с «высоким рейтингом» торговли."""
     uname = ((getattr(owner, "username", None) if owner else None) or username or "").lower()
@@ -1491,16 +1508,18 @@ async def resolve_pricenft_hits(hits, limit=None):
         })
     return out
 
-async def search_pricenftbot(query=None, limit=25):
+async def search_pricenftbot(query=None, limit=25, resolve=True):
     """
     Выдача из локальной БД (рандом по моделям).
-    Если БД пустая — один лёгкий collect-pass не делаем здесь (только admin collect).
+    resolve=False — не резолвить entity (быстрее, без FloodWait).
     """
     model = None
     q = (query or "").strip()
     if q and q.lower() not in ("nft", "gift", "owner", "ton", "stars", "market", "girl", "model"):
         model = q
     hits = random_from_pricenft_db(limit=limit, model=model)
+    if not resolve:
+        return hits
     return await resolve_pricenft_hits(hits, limit=limit)
 
 async def collect_pricenft_db(progress_cb=None, max_models=40):
@@ -1718,13 +1737,7 @@ async def deliver_pricenft_random(status_msg, max_results=20, girls_only=False, 
     load_pricenft_db()
     st = pricenft_db_stats()
     if st.get("users", 0) <= 0:
-        try:
-            await status_msg.edit_text(
-                "<b>БД PriceNFT пустая.</b>\nАдмин → «Собрать PriceNFT БД»",
-                parse_mode="HTML", reply_markup=menu_kb()
-            )
-        except Exception:
-            pass
+        # БД опциональна — не ломаем поиск, просто пропускаем
         return 0
 
     hits = await search_pricenftbot(limit=max(max_results * 3, 30))
@@ -1853,9 +1866,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
     """
     global is_searching, SEEN_GLOBAL
     is_searching = True
-    # SEEN_GLOBAL не очищаем — не повторяем одних и тех же владельцев
-    if len(SEEN_GLOBAL) > SEEN_GLOBAL_MAX:
-        SEEN_GLOBAL.clear()
+    SEEN_GLOBAL.clear()
     lock      = asyncio.Lock()
     found     = [0]
     seen_sent = set()
@@ -1987,63 +1998,59 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         )
         workers = [asyncio.create_task(worker()) for _ in range(12)]
 
-        # 1) Локальная БД PriceNFTbot — рандом по моделям
+        # 1) Локальная БД PriceNFTbot (если есть) — быстро, без блокировки
         if is_searching and found[0] < max_results:
             try:
                 st = pricenft_db_stats()
-                await status_msg.edit_text(
-                    "<b>Профиль:</b> БД PriceNFT (" + str(st.get("users", 0))
-                    + " юзеров / " + str(st.get("models", 0)) + " моделей)...",
-                    parse_mode="HTML", reply_markup=stop_kb()
-                )
-            except Exception:
-                pass
-            try:
-                hits = await search_pricenftbot(limit=max(40, max_results * 2))
+                if st.get("users", 0) > 0:
+                    await status_msg.edit_text(
+                        "<b>Профиль:</b> БД PriceNFT (" + str(st.get("users", 0)) + ")...",
+                        parse_mode="HTML", reply_markup=stop_kb()
+                    )
+                    hits = await search_pricenftbot(limit=max(40, max_results * 2))
+                    for h in hits:
+                        if not is_searching or found[0] >= max_results:
+                            break
+                        oid = h.get("owner_id")
+                        uname = h.get("username")
+                        if not oid and uname:
+                            try:
+                                ent = await tg_client.get_entity(uname)
+                                oid = int(ent.id)
+                                h["owner"] = ent
+                            except Exception:
+                                continue
+                        if oid:
+                            await emit_owner(oid, {
+                                "owner": h.get("owner"),
+                                "username": uname,
+                                "name": h.get("name") or "",
+                                "profile_url": h.get("profile_url"),
+                            })
             except Exception as e:
                 logger.debug("pricenft profile: %s", e)
-                hits = []
-            for h in hits:
-                if not is_searching or found[0] >= max_results:
-                    break
-                oid = h.get("owner_id")
-                uname = h.get("username")
-                if not oid and uname:
-                    try:
-                        ent = await tg_client.get_entity(uname)
-                        oid = int(ent.id)
-                        h["owner"] = ent
-                        h["owner_id"] = oid
-                    except Exception:
-                        continue
-                if oid:
-                    await emit_owner(oid, {
-                        "owner": h.get("owner"),
-                        "username": uname,
-                        "name": h.get("name") or "",
-                        "profile_url": h.get("profile_url"),
-                    })
 
-        # 2) Участники чатов — основной источник (у них чаще 0 на маркете)
+        # 2) Участники чатов (с таймаутом на чат)
         if is_searching and found[0] < max_results:
             try:
                 await status_msg.edit_text(
-                    "<b>Профиль:</b> сканирую чаты...\nВ очереди: " + str(len(owners_index))
-                    + "\nНайдено: " + str(found[0]),
+                    "<b>Профиль:</b> сканирую чаты...\nНайдено: " + str(found[0]),
                     parse_mode="HTML", reply_markup=stop_kb()
                 )
             except Exception:
                 pass
-            chat_results = await asyncio.gather(
-                *[get_chat_members_with_gifts(ch, max_users=350) for ch in NFT_SCAN_CHATS],
-                return_exceptions=True,
-            )
-            for res in chat_results:
+            for ch in NFT_SCAN_CHATS:
                 if not is_searching or found[0] >= max_results:
                     break
-                if isinstance(res, Exception):
+                try:
+                    res = await asyncio.wait_for(
+                        get_chat_members_with_gifts(ch, max_users=200), timeout=12
+                    )
+                except Exception:
                     continue
                 for (u_obj, uid) in res:
+                    if not is_searching or found[0] >= max_results:
+                        break
                     fn = (getattr(u_obj, "first_name", "") or "")
                     ln = (getattr(u_obj, "last_name", "") or "")
                     uname = getattr(u_obj, "username", None)
@@ -2053,8 +2060,39 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                     p_url = ("https://t.me/" + uname) if uname else ("tg://user?id=" + str(uid))
                     await emit_owner(uid, {"owner": u_obj, "username": uname, "name": name, "profile_url": p_url})
 
-        # 3) НЕ берём текущих продавцов с маркета как кандидатов —
-        # у них по определению есть лоты → всегда fail при require_zero_on_market.
+        # 3) Владельцы с маркета — большинство отсеется (есть лоты), но кто уже снял — пройдёт
+        if is_searching and found[0] < max_results:
+            try:
+                await status_msg.edit_text(
+                    "<b>Профиль:</b> доп.проверка владельцев...\nНайдено: " + str(found[0]),
+                    parse_mode="HTML", reply_markup=stop_kb()
+                )
+            except Exception:
+                pass
+            shuffled = list(gift_ids)
+            random.shuffle(shuffled)
+            for i in range(0, min(len(shuffled), 40), 8):
+                if not is_searching or found[0] >= max_results:
+                    break
+                batch = shuffled[i:i+8]
+                pages = await asyncio.gather(
+                    *[fetch_market_page(gid, "", limit=50, newest=True) for gid in batch],
+                    return_exceptions=True,
+                )
+                for res in pages:
+                    if isinstance(res, Exception):
+                        continue
+                    items, _ = res
+                    for item in items:
+                        oid = item.get("owner_id")
+                        if not oid:
+                            continue
+                        await emit_owner(oid, {
+                            "owner": item.get("owner"),
+                            "username": item.get("username"),
+                            "name": item.get("name") or "",
+                            "profile_url": item.get("profile_url"),
+                        })
 
         checker_done.set()
         await asyncio.gather(*workers, return_exceptions=True)
@@ -2102,9 +2140,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
     """Маркет: свежие лоты, разнообразие коллекций, без повторных владельцев/трейдеров."""
     global is_searching, SEEN_GLOBAL
     is_searching = True
-    # Не очищаем SEEN_GLOBAL каждый поиск — меньше дублей владельцев
-    if len(SEEN_GLOBAL) > SEEN_GLOBAL_MAX:
-        SEEN_GLOBAL.clear()
+    SEEN_GLOBAL.clear()
 
     lock          = asyncio.Lock()
     found         = [0]
@@ -2259,34 +2295,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             parse_mode="HTML", reply_markup=stop_kb()
         )
 
-        # Доп. кандидаты из локальной БД PriceNFTbot (рандом по моделям)
-        try:
-            pn_hits = await search_pricenftbot(limit=20)
-            for h in pn_hits:
-                oid = h.get("owner_id")
-                if not oid or oid in SEEN_GLOBAL:
-                    continue
-                if is_trader_account(h.get("owner"), h.get("username"), h.get("name")):
-                    SEEN_GLOBAL.add(oid)
-                    continue
-                if girls_only and not is_girl(h.get("owner"), h.get("username"), h.get("name")):
-                    continue
-                if not h.get("nft_url") and not h.get("username"):
-                    continue
-                # если нет nft_url — всё равно покажем username с модели
-                item = dict(h)
-                if not item.get("nft_url"):
-                    item["nft_url"] = None
-                    item["title"] = item.get("model") or item.get("title") or "NFT"
-                owner_map[oid] = {
-                    "owner": h.get("owner"), "username": h.get("username"),
-                    "name": h.get("name") or "", "profile_url": h.get("profile_url"),
-                    "items": [item],
-                }
-            await flush_ready()
-        except Exception as e:
-            logger.debug("pricenft market: %s", e)
-
+        # Сразу маркет — PriceNFT БД опциональна и не блокирует выдачу
         id_set = set(gift_ids)
         valid_pairs = [(gid, title) for gid, title in ALL_GIFT_IDS if gid in id_set] if ALL_GIFT_IDS else [(gid, "") for gid in gift_ids]
         if not valid_pairs:
@@ -2334,8 +2343,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
     """Поиск по модели на маркете — свежие лоты. Фильтр девушек опционален."""
     global is_searching, SEEN_GLOBAL
     is_searching = True
-    if len(SEEN_GLOBAL) > SEEN_GLOBAL_MAX:
-        SEEN_GLOBAL.clear()
+    SEEN_GLOBAL.clear()
 
     lock        = asyncio.Lock()
     found       = [0]
@@ -2429,26 +2437,27 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
 
     try:
         await status_msg.edit_text(
-            "<b>Ищу по модели (БД PriceNFT + маркет)...</b>",
+            "<b>Ищу по модели (маркет)...</b>",
             parse_mode="HTML", reply_markup=stop_kb()
         )
-        # 1) Главное — рандом из БД PriceNFT по моделям (CD 3с между сообщениями)
-        db_found = await deliver_pricenft_random(
-            status_msg, max_results=max_results,
-            girls_only=girls_only, region=region, with_cd=True,
-        )
-        found[0] += db_found
+        # 1) Сначала маркет — всегда даёт выдачу
+        valid_ids = list(gift_ids) if gift_ids else [gid for gid, _ in ALL_GIFT_IDS]
+        random.shuffle(valid_ids)
+        PARALLEL = 10
+        for i in range(0, len(valid_ids), PARALLEL):
+            if not is_searching or found[0] >= max_results:
+                break
+            batch = valid_ids[i:i+PARALLEL]
+            await asyncio.gather(*[scan_col(gid) for gid in batch])
 
-        # 2) Добираем с маркета если нужно
+        # 2) Добор из БД PriceNFT (если собрана), с CD 3с
         if is_searching and found[0] < max_results:
-            valid_ids = list(gift_ids) if gift_ids else [gid for gid, _ in ALL_GIFT_IDS]
-            random.shuffle(valid_ids)
-            PARALLEL = 10
-            for i in range(0, len(valid_ids), PARALLEL):
-                if not is_searching or found[0] >= max_results:
-                    break
-                batch = valid_ids[i:i+PARALLEL]
-                await asyncio.gather(*[scan_col(gid) for gid in batch])
+            left = max_results - found[0]
+            db_found = await deliver_pricenft_random(
+                status_msg, max_results=left,
+                girls_only=girls_only, region=region, with_cd=True,
+            )
+            found[0] += db_found
     except Exception as e:
         logger.error("do_model_search: %s", e)
     finally:
@@ -2471,15 +2480,17 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
 
 async def _start_market(cb, cat, girls):
     global is_searching
-    if is_searching:
-        await cb.answer("Поиск уже идёт!", show_alert=True)
+    if not begin_search():
+        await cb.answer("Поиск уже идёт! Нажми Стоп или /clear", show_alert=True)
         return
+    # begin_search уже поставил is_searching=True; do_market_search тоже ставит — ок
     await cb.answer("Запускаю...")
     stats["checks"] += 1
     uid    = cb.from_user.id
     chat_id = cb.message.chat.id
     ids    = await ensure_collections()
     if not ids:
+        is_searching = False
         await bot.send_message(chat_id, "<b>Коллекции не загружены. Авторизуй Telethon в /admin</b>",
                                parse_mode="HTML", reply_markup=menu_kb())
         return
@@ -2524,14 +2535,15 @@ async def _start_market(cb, cat, girls):
 
 async def _start_profile(cb, cat, girls):
     global is_searching
-    if is_searching:
-        await cb.answer("Поиск уже идёт!", show_alert=True)
+    if not begin_search():
+        await cb.answer("Поиск уже идёт! Нажми Стоп или /clear", show_alert=True)
         return
     await cb.answer("Запускаю...")
     stats["checks"] += 1
     uid    = cb.from_user.id
     ids    = await ensure_collections()
     if not ids:
+        is_searching = False
         await cb.message.answer("<b>Коллекции не загружены.</b>", parse_mode="HTML", reply_markup=menu_kb())
         return
     mn     = get_min_gifts(uid)
@@ -2563,10 +2575,10 @@ async def _start_profile(cb, cat, girls):
 
 async def _start_model(cb, girls=False, single_gid=None, search_type="market", already_answered=False):
     global is_searching
-    if is_searching:
+    if not begin_search():
         if not already_answered:
             try:
-                await cb.answer("Поиск уже идёт!", show_alert=True)
+                await cb.answer("Поиск уже идёт! Нажми Стоп или /clear", show_alert=True)
             except Exception:
                 pass
         return
@@ -2581,6 +2593,7 @@ async def _start_model(cb, girls=False, single_gid=None, search_type="market", a
     try:
         ids = await ensure_collections()
         if not ids:
+            is_searching = False
             await bot.send_message(chat_id, "<b>Коллекции не загружены. Авторизуй Telethon в /admin</b>",
                                    parse_mode="HTML", reply_markup=menu_kb())
             return
