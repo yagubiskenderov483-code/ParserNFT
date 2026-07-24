@@ -2056,10 +2056,11 @@ class _LockedDB:
         with _db_lock:
             return self._c.execute(*a, **k)
 
-def random_from_pricenft_db(limit=25, model=None, exact=False):
+def random_from_pricenft_db(limit=25, model=None, exact=False, ignore_seen=False):
     """
     Быстрый рандом из sqlite.
     exact=True — только точное имя модели (для поиска по конкретной коллекции).
+    ignore_seen=True — не режем global anti-dupe (для soft-добора лимита).
     """
     load_pricenft_db(force=False)
     conn = _LockedDB(_db())
@@ -2116,9 +2117,9 @@ def random_from_pricenft_db(limit=25, model=None, exact=False):
             lu = uname.lower()
             if lu in seen_u:
                 continue
-            if is_owner_seen(uid, uname):
+            if (not ignore_seen) and is_owner_seen(uid, uname):
                 continue
-            if slug and is_gift_seen(slug):
+            if (not ignore_seen) and slug and is_gift_seen(slug):
                 continue
             if slug and str(slug).startswith("user:"):
                 url = None
@@ -3787,7 +3788,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
     weird_lock = asyncio.Lock()
 
     # cheap/mid: берём самые дешёвые лоты; иначе свежие
-    by_price = cat in ("cheap", "mid")
+    by_price = cat == "cheap"  # mid/hard нельзя: sort_by_price даёт только дёшево
 
     async def try_send(item, use_global_seen=True):
         oid = item.get("owner_id")
@@ -3962,9 +3963,10 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         if not valid_pairs:
             valid_pairs = [(gid, "") for gid in gift_ids]
         random.shuffle(valid_pairs)
-        # не сканируем все 149 — хватает выборки под 10с
-        SCAN = 36 if by_price else 28
-        valid_pairs = valid_pairs[:SCAN]
+        all_pairs = list(valid_pairs)
+        # не сканируем все 149 в первой волне — хватает выборки под 10с
+        SCAN = 40 if by_price else 28
+        valid_pairs = all_pairs[:SCAN]
 
         PARALLEL = 18
         all_pool = []
@@ -3991,15 +3993,16 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         if all_pool and found[0] < max_results and time_left():
             await emit_pool(all_pool, use_global_seen=True)
 
-        # добор без anti-dupe — чтобы добить лимит за оставшееся время
+        # добор без anti-dupe — другие коллекции из полного списка
         if time_left() and found[0] < max_results:
             await progress("добор без антидубля...")
-            random.shuffle(valid_pairs)
+            rest = all_pairs[SCAN:] + all_pairs[:SCAN]
+            random.shuffle(rest)
             more = []
-            for i in range(0, min(len(valid_pairs), 24), PARALLEL):
+            for i in range(0, min(len(rest), 36), PARALLEL):
                 if not time_left() or found[0] >= max_results:
                     break
-                chunk = valid_pairs[i:i + PARALLEL]
+                chunk = rest[i:i + PARALLEL]
                 parts = await asyncio.gather(
                     *[fetch_bucket(gid, t) for gid, t in chunk],
                     return_exceptions=True,
@@ -4237,6 +4240,9 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 continue
             if (not weird_mode) and who == "girls" and not who_pass(it.get("owner"), it.get("username"), it.get("name"), who):
                 continue
+            if region and region != "any":
+                if not region_match_full(it.get("owner"), uname, it.get("name"), region):
+                    continue
             await try_send(it, use_global_seen=use_global_seen, enforce_cap=enforce_cap)
 
     async def progress(extra=""):
@@ -4266,22 +4272,29 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             titles_q = allowed_titles if single else random.sample(
                 allowed_titles, min(len(allowed_titles), 40)
             )
-            for t in titles_q:
-                part = random_from_pricenft_db(limit=max(need * 8, 100), model=t, exact=True)
-                for h in part:
-                    h = dict(h)
-                    h["title"] = t
-                    h["model"] = t
-                    h["source"] = "pricenft_db"
-                    if not h.get("nft_url"):
-                        continue
-                    if not item_matches_collections(h, allowed_gids, allowed_titles):
-                        continue
-                    hits.append(h)
-            random.shuffle(hits)
+            def _load_hits(ignore_seen=False):
+                out = []
+                for t in titles_q:
+                    part = random_from_pricenft_db(
+                        limit=max(need * 8, 100), model=t, exact=True, ignore_seen=ignore_seen
+                    )
+                    for h in part:
+                        h = dict(h)
+                        h["title"] = t
+                        h["model"] = t
+                        h["source"] = "pricenft_db"
+                        if not h.get("nft_url"):
+                            continue
+                        if not item_matches_collections(h, allowed_gids, allowed_titles):
+                            continue
+                        out.append(h)
+                random.shuffle(out)
+                return out
+            hits = _load_hits(ignore_seen=False)
             await emit_pool(hits, use_global_seen=True, enforce_cap=False)
             if found[0] < max_results:
-                await emit_pool(hits, use_global_seen=False, enforce_cap=False)
+                hits2 = _load_hits(ignore_seen=True)
+                await emit_pool(hits2, use_global_seen=False, enforce_cap=False)
 
         # 2) маркет — ограниченная выборка коллекций, 1 страница
         gids = list(allowed_gids)
@@ -4472,9 +4485,9 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                         if not is_girl(None, uname, name, strict=False):
                             continue
                     else:
-                        # только явных пацанов режем
+                        # только явных пацанов режем (не "female" через "male")
                         low = ((name or "") + " " + (uname or "")).lower()
-                        if any(x in low for x in ("boy", "male", "парень", "мужик", "he/him")):
+                        if re.search(r"(?<![a-zа-яё])(boy|male|парень|мужик|he/him)(?![a-zа-яё])", low):
                             continue
                 elif not who_pass(None, uname, name, who):
                     continue
@@ -4486,9 +4499,26 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
 
         await emit_hits(use_global_seen=True)
 
-        # 2) без anti-dupe добить лимит
+        # 2) без anti-dupe — перечитываем БД с ignore_seen
         if time_left() and found[0] < max_results:
             await progress("добор БД...")
+            hits = []
+            for t in titles_q:
+                if not time_left():
+                    break
+                part = random_from_pricenft_db(
+                    limit=max(max_results * 8, 160), model=t, exact=True, ignore_seen=True
+                )
+                for h in part:
+                    h = dict(h)
+                    h["title"] = h.get("title") or t
+                    h["model"] = h.get("model") or t
+                    if not h.get("nft_url") or str(h.get("nft_url")).startswith("user:"):
+                        continue
+                    if not gift_ok(h):
+                        continue
+                    hits.append(h)
+            random.shuffle(hits)
             await emit_hits(use_global_seen=False)
 
         # 3) если всё ещё мало — точечная проверка профилей (дорого, мало)
@@ -4505,9 +4535,6 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                 uid = h.get("owner_id") or h.get("uid")
                 if not uname and not uid:
                     return
-                if is_owner_seen(uid, uname) and found[0] > 0:
-                    # всё равно можно в конце, но экономим
-                    pass
                 async with sem:
                     saved = await fetch_saved_gifts(
                         uid or uname, max_pages=1,
@@ -4519,8 +4546,11 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                 if not matched:
                     return
                 name = h.get("name") or uname or ""
-                if who == "girls" and not is_girl(None, uname, name, strict=False):
+                if not who_pass(None, uname, name, who):
                     return
+                if region and region != "any":
+                    if not region_match_full(None, uname, name, region):
+                        return
                 show = allowed_titles[0] if single and allowed_titles else (matched[0].get("title") or "?")
                 await try_send(uid, uname, name, None, matched[0].get("nft_url"), show, h.get("profile_url"))
 
@@ -4737,13 +4767,14 @@ async def _start_model(cb, who="all", single_gid=None, search_type="market",
             except Exception:
                 pass
     except Exception as e:
-        end_search(chat_id, token)
         logger.error("_start_model: %s", e)
         try:
             await bot.send_message(chat_id, "<b>Ошибка: " + esc(str(e)) + "</b>",
                                    parse_mode="HTML", reply_markup=menu_kb())
         except Exception:
             pass
+    finally:
+        end_search(chat_id, token)
 
 
 def ob_min_kb():
