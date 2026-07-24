@@ -3413,7 +3413,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                         weird_checks[0] = max(0, weird_checks[0] - 1)
                     stats_skip["girl"] += 1
                     return
-        elif not who_pass(owner_obj, username, name, who):
+        elif not who_pass(owner_obj, username, name, who, soft=True):
             stats_skip["girl"] += 1
             return
         if region and region != "any":
@@ -3597,7 +3597,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                     ln = (getattr(u_obj, "last_name", "") or "")
                     uname = getattr(u_obj, "username", None)
                     name = (fn + " " + ln).strip()
-                    if (not weird_mode) and (not who_pass(u_obj, uname, name, who)):
+                    if (not weird_mode) and (not who_pass(u_obj, uname, name, who, soft=True)):
                         continue
                     p_url = ("https://t.me/" + uname) if uname else ("tg://user?id=" + str(uid))
                     await emit_cand(uid, {
@@ -3680,7 +3680,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                                     async with weird_lock:
                                         weird_checks[0] = max(0, weird_checks[0] - 1)
                                     continue
-                        elif not who_pass(owner_obj, username, name, who):
+                        elif not who_pass(owner_obj, username, name, who, soft=True):
                             continue
                         if is_trader_account(owner_obj, username, name):
                             continue
