@@ -501,12 +501,12 @@ def is_girl(owner, username=None, name=None, strict=False):
     if not (fname0 or uname):
         return False
 
-    # Жёсткий режим: только явные девушки
+    # Жёсткий режим (редко): только очень явные
     if strict:
         if has_girl_name or has_girl_kw:
             return score >= 3
-        # только окончание/эмодзи без имени — недостаточно
-        return score >= 5
+        return score >= 4
+    # Обычный режим для «только девушки»: имя / окончание / сигналы, без «мутных»
     return score >= 2
 
 
@@ -716,21 +716,27 @@ def floor_in_cat(floor, cat):
     return True
 
 def price_in_cat(price, cat):
-    """Фильтр по цене лота (не по floor коллекции) — иначе маркет пустой."""
+    """
+    Фильтр цены лота в ⭐ по категории.
+    Без цены при выбранной категории — НЕ пропускаем (иначе сыпятся любые лоты).
+    Границы без пересечений.
+    """
     if not cat or cat in ("any", "all", "none"):
         return True
     if price is None:
-        return True
+        return False
     try:
         price = int(price)
     except Exception:
-        return True
+        return False
+    if price <= 0:
+        return False
     CATS = {
-        "cheap":   (0,      2000),
-        "mid":     (2000,   5000),
-        "hard":    (5000,   20000),
-        "ultra":   (20000,  100000),
-        "extreme": (100000, 10**12),
+        "cheap":   (1,      2000),      # до 2000
+        "mid":     (2001,   5000),      # 2001–5000
+        "hard":    (5001,   20000),     # 5001–20000
+        "ultra":   (20001,  100000),    # 20001–100000
+        "extreme": (100001, 10**12),    # от 100001
     }
     c = CATS.get(cat)
     if not c:
@@ -2573,7 +2579,7 @@ async def deliver_pricenft_random(status_msg, max_results=20, girls_only=False, 
         if is_trader_account(owner, uname, name):
             mark_seen(oid, uname, None)
             continue
-        if girls_only and not is_girl(owner, uname, name, strict=True):
+        if girls_only and not is_girl(owner, uname, name):
             continue
         if region and region != "any":
             if not region_match_full(owner, uname, name, region):
@@ -2727,7 +2733,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         if is_trader_account(owner_obj, username, name):
             stats_skip["trader"] += 1
             return
-        if girls_only and not is_girl(owner_obj, username, name, strict=True):
+        if girls_only and not is_girl(owner_obj, username, name):
             stats_skip["girl"] += 1
             return
         if region and region != "any":
@@ -2878,7 +2884,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                     ln = (getattr(u_obj, "last_name", "") or "")
                     uname = getattr(u_obj, "username", None)
                     name = (fn + " " + ln).strip()
-                    if girls_only and not is_girl(u_obj, uname, name, strict=True):
+                    if girls_only and not is_girl(u_obj, uname, name):
                         continue
                     p_url = ("https://t.me/" + uname) if uname else ("tg://user?id=" + str(uid))
                     await emit_cand(uid, {
@@ -2927,7 +2933,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                         peer = uid or username
                         if not peer or is_owner_seen(uid, username):
                             continue
-                        if girls_only and not is_girl(owner_obj, username, name, strict=True):
+                        if girls_only and not is_girl(owner_obj, username, name):
                             continue
                         saved = await fetch_saved_gifts(
                             peer, max_pages=1, only_off_market=True, require_zero_on_market=False
@@ -3040,23 +3046,28 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                            boost=100, min_gifts=1, max_gifts=0,
                            max_results=30, region="any"):
     """
-    Маркет: пул лотов → рандомный цикл по коллекциям.
-    Без повторных владельцев/гифтов, без одинаковых коллекций подряд.
+    Маркет — простая рабочая схема:
+      1) параллельно тянем лоты
+      2) фильтр цены категории / девушки / регион
+      3) антидубль владельцев+гифтов (сначала с global seen)
+      4) разнообразие коллекций (preference, не блокер)
+      5) жёсткий лимит выдачи карточек
+      6) если 0 — второй проход без global seen (только сессия)
     """
     global is_searching
     is_searching = True
     try:
-        max_results = max(1, int(max_results or 1))
+        max_results = max(1, min(int(max_results or 1), 200))
     except Exception:
         max_results = 30
 
-    lock        = asyncio.Lock()
-    found       = [0]
-    seen_slugs  = set()
+    lock = asyncio.Lock()
+    found = [0]
     seen_owners = set()
-    last_gid    = [None]
+    seen_slugs = set()
+    last_gid = [None]
 
-    async def send_one(item):
+    async def try_send(item, use_global_seen=True):
         oid = item.get("owner_id")
         uname = item.get("username")
         if not oid and not uname:
@@ -3064,10 +3075,12 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         nft_url = item.get("nft_url")
         slug = gift_slug_of(nft_url)
         gid = item.get("gift_id")
-        ok_key = oid if oid else ("u:" + str(uname).lower())
-        # всегда антидубль владельцев и гифтов
-        if is_owner_seen(oid, uname) or is_gift_seen(slug):
-            return False
+        ok_key = ("id:" + str(int(oid))) if oid else ("u:" + str(uname).lstrip("@").lower())
+
+        if use_global_seen:
+            if is_owner_seen(oid, uname) or is_gift_seen(slug):
+                return False
+
         async with lock:
             if found[0] >= max_results:
                 return False
@@ -3075,20 +3088,20 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 return False
             if slug and slug in seen_slugs:
                 return False
-            # не подряд одна и та же коллекция (если есть альтернативы)
-            if gid is not None and last_gid[0] is not None and gid == last_gid[0]:
-                return False
             seen_owners.add(ok_key)
             if slug:
                 seen_slugs.add(slug)
             found[0] += 1
+            prev_last = last_gid[0]
             last_gid[0] = gid
+
         mark_seen(oid, uname, nft_url)
         try:
             seed_pricenft_from_item(item, commit=False)
         except Exception:
             pass
-        name  = item.get("name") or ""
+
+        name = item.get("name") or ""
         p_url = item.get("profile_url")
         title = esc(str(item.get("title") or "?"))
         price = item.get("price")
@@ -3115,16 +3128,28 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 seen_owners.discard(ok_key)
                 if slug:
                     seen_slugs.discard(slug)
+                last_gid[0] = prev_last
             return False
+
+    def pass_filters(item):
+        price = item.get("price")
+        if not price_in_cat(price, cat):
+            return False
+        if girls_only and not is_girl(item.get("owner"), item.get("username"), item.get("name")):
+            return False
+        if region and region != "any":
+            if not region_match_full(item.get("owner"), item.get("username"), item.get("name"), region):
+                return False
+        return True
 
     async def fetch_bucket(gid, title=""):
         out = []
         offset = ""
-        for _page in range(2):
+        for _ in range(2):
             if not is_searching:
                 break
             try:
-                items, nxt = await fetch_market_page(gid, offset, limit=70, newest=True)
+                items, nxt = await fetch_market_page(gid, offset, limit=80, newest=True)
             except Exception:
                 break
             if not items:
@@ -3132,31 +3157,56 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             for item in items:
                 item = dict(item)
                 item["gift_id"] = gid
-                if title and (not item.get("title") or str(item.get("title")) in ("?", "NFT")):
+                if title:
                     item["title"] = title
-                price = item.get("price")
-                if not price_in_cat(price, cat):
+                if not pass_filters(item):
                     continue
-                if girls_only and not is_girl(item.get("owner"), item.get("username"), item.get("name"), strict=True):
-                    continue
-                if region and region != "any":
-                    if not region_match_full(item.get("owner"), item.get("username"), item.get("name"), region):
-                        continue
-                oid = item.get("owner_id")
-                uname = item.get("username")
-                slug = gift_slug_of(item.get("nft_url"))
-                if is_owner_seen(oid, uname) or is_gift_seen(slug):
+                if not item.get("owner_id") and not item.get("username"):
                     continue
                 out.append(item)
             if not nxt:
                 break
             offset = nxt
-        random.shuffle(out)
         return out
 
+    def diversify(pool):
+        """Round-robin по коллекциям + shuffle — без жёсткого блока."""
+        by = {}
+        for it in pool:
+            by.setdefault(it.get("gift_id"), []).append(it)
+        for lst in by.values():
+            random.shuffle(lst)
+        keys = list(by.keys())
+        random.shuffle(keys)
+        ordered = []
+        while keys:
+            random.shuffle(keys)
+            nxt = []
+            for k in keys:
+                if by[k]:
+                    ordered.append(by[k].pop())
+                if by[k]:
+                    nxt.append(k)
+            keys = nxt
+        return ordered
+
+    async def emit_pool(pool, use_global_seen=True):
+        for item in diversify(pool):
+            if not is_searching or found[0] >= max_results:
+                break
+            # preference: не та же коллекция подряд, но если остальное пусто — всё равно шлём
+            gid = item.get("gift_id")
+            if gid is not None and last_gid[0] == gid and found[0] + 1 < max_results:
+                # отложим: просто skip в этом проходе если в пуле ещё будут другие
+                # (diversify уже чередует — доп. жёсткий reject не нужен)
+                pass
+            await try_send(item, use_global_seen=use_global_seen)
+
     try:
+        cat_l = CAT_LABELS.get(cat, str(cat or "все"))
         await status_msg.edit_text(
-            "<b>Ищу свежие лоты на маркете...\nЛимит выдачи: " + str(max_results) + "</b>",
+            "<b>Маркет / " + esc(cat_l) + "\n"
+            "Лимит выдачи: " + str(max_results) + "</b>",
             parse_mode="HTML", reply_markup=stop_kb()
         )
         id_set = set(gift_ids)
@@ -3165,96 +3215,84 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             valid_pairs = [(gid, "") for gid in gift_ids]
         random.shuffle(valid_pairs)
 
-        PARALLEL = 18
-        buckets = {}
+        PARALLEL = 16
+        all_pool = []
         for i in range(0, len(valid_pairs), PARALLEL):
             if not is_searching or found[0] >= max_results:
                 break
-            chunk = valid_pairs[i:i+PARALLEL]
+            chunk = valid_pairs[i:i + PARALLEL]
             parts = await asyncio.gather(
                 *[fetch_bucket(gid, t) for gid, t in chunk],
                 return_exceptions=True,
             )
-            for (gid, _t), part in zip(chunk, parts):
-                if isinstance(part, Exception) or not part:
-                    continue
-                buckets.setdefault(gid, [])
-                buckets[gid].extend(part)
-                random.shuffle(buckets[gid])
-
-            # рандомный цикл: по 1 лоту с разных коллекций
-            active = [g for g, lst in buckets.items() if lst]
-            while is_searching and found[0] < max_results and active:
-                random.shuffle(active)
-                progressed = False
-                next_active = []
-                for gid in active:
-                    if not is_searching or found[0] >= max_results:
-                        break
-                    lst = buckets.get(gid) or []
-                    # стараемся не брать ту же коллекцию что только что
-                    if gid == last_gid[0] and len(active) > 1:
-                        next_active.append(gid)
-                        continue
-                    while lst:
-                        item = lst.pop()
-                        oid = item.get("owner_id")
-                        uname = item.get("username")
-                        slug = gift_slug_of(item.get("nft_url"))
-                        if is_owner_seen(oid, uname) or is_gift_seen(slug):
-                            continue
-                        ok_key = oid if oid else (("u:" + uname.lower()) if uname else None)
-                        if ok_key and ok_key in seen_owners:
-                            continue
-                        if slug and slug in seen_slugs:
-                            continue
-                        if await send_one(item):
-                            progressed = True
-                            break
-                    if buckets.get(gid):
-                        next_active.append(gid)
-                active = next_active
-                if not progressed:
-                    # если залипли на last_gid — сбрасываем и пробуем ещё раз
-                    if last_gid[0] is not None and active:
-                        last_gid[0] = None
-                        continue
-                    break
+            for part in parts:
+                if isinstance(part, list):
+                    all_pool.extend(part)
+            # стримим уже набранное
+            if all_pool and found[0] < max_results:
+                batch = all_pool
+                all_pool = []
+                await emit_pool(batch, use_global_seen=True)
             try:
                 await status_msg.edit_text(
-                    "<b>Маркет:</b> " + str(min(found[0], max_results)) + "/" + str(max_results),
+                    "<b>Маркет / " + esc(cat_l) + ":</b> "
+                    + str(found[0]) + "/" + str(max_results),
                     parse_mode="HTML", reply_markup=stop_kb()
                 )
             except Exception:
                 pass
 
+        # если антидубль всё съел — второй проход без global seen
+        if is_searching and found[0] == 0:
+            await status_msg.edit_text(
+                "<b>Маркет:</b> мало новых — повтор без старого антидубля...",
+                parse_mode="HTML", reply_markup=stop_kb()
+            )
+            random.shuffle(valid_pairs)
+            pool2 = []
+            for i in range(0, min(len(valid_pairs), 80), PARALLEL):
+                if not is_searching or found[0] >= max_results:
+                    break
+                chunk = valid_pairs[i:i + PARALLEL]
+                parts = await asyncio.gather(
+                    *[fetch_bucket(gid, t) for gid, t in chunk],
+                    return_exceptions=True,
+                )
+                for part in parts:
+                    if isinstance(part, list):
+                        pool2.extend(part)
+            await emit_pool(pool2, use_global_seen=False)
+
         db_flush(force=True)
-        try:
-            save_pricenft_db()
-        except Exception:
-            pass
     except Exception as e:
         logger.error("do_market_search: %s", e)
     finally:
         is_searching = False
-    return min(found[0], max_results)
+    return min(int(found[0]), max_results)
 
 
 # ── SEARCH CORE: MODEL ────────────────────────────────────────────────────────
 async def do_model_search(status_msg, gift_ids, girls_only=False,
                           max_results=30, region="any"):
-    """Модель: только выбранные коллекции. Жёсткий лимит. Без чужих гифтов."""
+    """
+    По модели/коллекции:
+      - сканим ТОЛЬКО выбранные gift_id с маркета
+      - добор из БД только по exact имени коллекции
+      - девушки: обычный фильтр (не ultra-strict)
+      - жёсткий лимит выдачи
+    """
     global is_searching
     is_searching = True
     try:
-        max_results = max(1, int(max_results or 1))
+        max_results = max(1, min(int(max_results or 1), 200))
     except Exception:
         max_results = 30
 
-    lock        = asyncio.Lock()
-    found       = [0]
-    seen_slugs  = set()
+    lock = asyncio.Lock()
+    found = [0]
     seen_owners = set()
+    seen_slugs = set()
+
     title_by_gid = {gid: title for gid, title in ALL_GIFT_IDS}
     for gid in gift_ids:
         if gid not in title_by_gid:
@@ -3262,23 +3300,35 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 if i == gid:
                     title_by_gid[gid] = t
                     break
-    allowed_gids = set(int(g) for g in gift_ids)
-    allowed_titles = [title_by_gid[g] for g in gift_ids if title_by_gid.get(g)]
+    allowed_gids = set(int(g) for g in (gift_ids or []))
+    allowed_titles = [title_by_gid[g] for g in allowed_gids if title_by_gid.get(g)]
     single = len(allowed_gids) == 1
+    label = allowed_titles[0] if single and allowed_titles else (
+        str(len(allowed_gids)) + " коллекций"
+    )
 
-    async def send_item(item):
+    async def try_send(item, use_global_seen=True):
         oid = item.get("owner_id")
         uname = item.get("username")
-        nft_url = item.get("nft_url")
-        slug = gift_slug_of(nft_url)
         if not oid and not uname:
             return False
-        # строго только выбранная коллекция
-        if not item_matches_collections(item, allowed_gids, allowed_titles):
+        # коллекция: trust gift_id с маркета; иначе title/slug
+        gid = item.get("gift_id")
+        if gid is not None and allowed_gids:
+            try:
+                if int(gid) not in allowed_gids:
+                    return False
+            except Exception:
+                return False
+        elif not item_matches_collections(item, allowed_gids, allowed_titles):
             return False
-        ok_key = oid if oid else ("u:" + str(uname).lower())
-        if is_owner_seen(oid, uname) or is_gift_seen(slug):
-            return False
+
+        nft_url = item.get("nft_url")
+        slug = gift_slug_of(nft_url)
+        ok_key = ("id:" + str(int(oid))) if oid else ("u:" + str(uname).lstrip("@").lower())
+        if use_global_seen:
+            if is_owner_seen(oid, uname) or is_gift_seen(slug):
+                return False
         async with lock:
             if found[0] >= max_results:
                 return False
@@ -3290,6 +3340,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             if slug:
                 seen_slugs.add(slug)
             found[0] += 1
+
         mark_seen(oid, uname, nft_url)
         try:
             seed_pricenft_from_item(item, commit=False)
@@ -3297,7 +3348,6 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             pass
         name = item.get("name") or ""
         p_url = item.get("profile_url") or (("https://t.me/" + uname) if uname else None)
-        # показываем имя выбранной коллекции
         show_title = allowed_titles[0] if single and allowed_titles else (item.get("title") or item.get("model") or "?")
         title = esc(str(show_title))
         price = item.get("price")
@@ -3335,7 +3385,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                     seen_slugs.discard(slug)
             return False
 
-    async def scan_col(gid):
+    async def scan_col(gid, use_global_seen=True):
         title = title_by_gid.get(gid) or ""
         offset = ""
         for _ in range(3):
@@ -3352,84 +3402,81 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 if not is_searching or found[0] >= max_results:
                     return
                 it = dict(it)
-                it["gift_id"] = gid
+                it["gift_id"] = int(gid)
                 if title:
                     it["title"] = title
-                if girls_only and not is_girl(it.get("owner"), it.get("username"), it.get("name"), strict=True):
+                if girls_only and not is_girl(it.get("owner"), it.get("username"), it.get("name")):
                     continue
                 if region and region != "any":
                     if not region_match_full(it.get("owner"), it.get("username"), it.get("name"), region):
                         continue
-                await send_item(it)
+                await try_send(it, use_global_seen=use_global_seen)
             if not nxt:
                 return
             offset = nxt
 
     try:
-        label = allowed_titles[0] if single and allowed_titles else (
-            title_by_gid.get(gift_ids[0], "модели") if len(gift_ids) == 1 else (str(len(gift_ids)) + " коллекций")
-        )
-        await status_msg.edit_text(
-            "<b>Ищу по модели: " + esc(str(label))
-            + "\nТолько эта коллекция"
-            + "\nЛимит выдачи: " + str(max_results) + "</b>",
-            parse_mode="HTML", reply_markup=stop_kb()
-        )
-
-        gids = list(gift_ids) if gift_ids else []
-        if not gids:
+        if not allowed_gids:
             await status_msg.edit_text("<b>Коллекция не выбрана</b>", parse_mode="HTML", reply_markup=menu_kb())
             return 0
+        await status_msg.edit_text(
+            "<b>Модель: " + esc(str(label)) + "\n"
+            "Лимит выдачи: " + str(max_results) + "</b>",
+            parse_mode="HTML", reply_markup=stop_kb()
+        )
+        gids = list(allowed_gids)
         random.shuffle(gids)
-        PARALLEL = 8 if single else 14
+        PARALLEL = 6 if single else 12
         for i in range(0, len(gids), PARALLEL):
             if not is_searching or found[0] >= max_results:
                 break
             await asyncio.gather(
-                *[scan_col(g) for g in gids[i:i+PARALLEL]],
+                *[scan_col(g, use_global_seen=True) for g in gids[i:i+PARALLEL]],
                 return_exceptions=True,
             )
             try:
                 await status_msg.edit_text(
                     "<b>Модель " + esc(str(label)) + ":</b> "
-                    + str(min(found[0], max_results)) + "/" + str(max_results),
+                    + str(found[0]) + "/" + str(max_results),
                     parse_mode="HTML", reply_markup=stop_kb()
                 )
             except Exception:
                 pass
 
-        # добор из БД — ТОЛЬКО exact модель
+        # добор из БД только exact по имени коллекции
         if is_searching and found[0] < max_results and allowed_titles:
             need = max_results - found[0]
             hits = []
             for t in allowed_titles:
-                hits.extend(random_from_pricenft_db(limit=max(need * 5, 50), model=t, exact=True))
+                part = random_from_pricenft_db(limit=max(need * 6, 60), model=t, exact=True)
+                for h in part:
+                    h = dict(h)
+                    if single:
+                        h["gift_id"] = next(iter(allowed_gids))
+                    h["title"] = t
+                    h["model"] = t
+                    hits.append(h)
             random.shuffle(hits)
             for h in hits:
                 if not is_searching or found[0] >= max_results:
                     break
-                # привязываем к gid если один
-                if single:
-                    h = dict(h)
-                    h["gift_id"] = next(iter(allowed_gids))
-                    h["title"] = allowed_titles[0]
-                    h["model"] = allowed_titles[0]
-                if not item_matches_collections(h, allowed_gids, allowed_titles):
+                if girls_only and not is_girl(None, h.get("username"), h.get("name")):
                     continue
-                if girls_only and not is_girl(None, h.get("username"), h.get("name"), strict=True):
-                    continue
-                await send_item(h)
+                await try_send(h, use_global_seen=True)
+
+        # если пусто из-за seen — мягкий повтор
+        if is_searching and found[0] == 0:
+            for g in gids[:max(1, PARALLEL)]:
+                if not is_searching or found[0] >= max_results:
+                    break
+                await scan_col(g, use_global_seen=False)
 
         db_flush(force=True)
-        try:
-            save_pricenft_db()
-        except Exception:
-            pass
     except Exception as e:
         logger.error("do_model_search: %s", e)
     finally:
         is_searching = False
-    return min(found[0], max_results)
+    return min(int(found[0]), max_results)
 
 
 # ── SEARCH CORE: MODEL BY PROFILE ─────────────────────────────────────────────
