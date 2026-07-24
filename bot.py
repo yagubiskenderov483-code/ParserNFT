@@ -4520,6 +4520,10 @@ async def main():
     ONBOARDING_DONE = load_onboarding()
     load_pricenft_db()
     try:
+        _load_pricenft_flood()
+    except Exception:
+        pass
+    try:
         load_seen_into_memory()
     except Exception as e:
         logger.warning("load_seen: %s", e)
