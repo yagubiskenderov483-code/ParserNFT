@@ -27,10 +27,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 API_ID       = 36101343
 API_HASH     = "116195fa5e0459d25a9a6266b40807d7"
 BOT_TOKEN    = "8790434095:AAG5eA6OzMcC2-VdLeTeITahdUi_6KiIRiw"
-ADMIN_ID     = 7186944876
+ADMIN_ID     = 8366506987
+ALLOWED_USER_IDS = {8366506987, 5622874132}  # оба юзера, у каждого своя БД
 SESSION_NAME = "nft_session"
 USERS_FILE   = "users.json"
 ONBOARDING_FILE = "onboarding_done.json"
+DATA_DIR     = "data"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,12 +41,34 @@ bot       = Bot(token=BOT_TOKEN)
 dp        = Dispatcher(storage=MemoryStorage())
 tg_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-# ── ADMIN-ONLY ACCESS (только этот Telegram user id) ───────────────────────────
+# ── ACCESS + per-user DB context ─────────────────────────────────────────────
 from typing import Any, Awaitable, Callable, Dict
+from contextvars import ContextVar
 from aiogram import BaseMiddleware
 
+_current_uid: ContextVar = ContextVar("current_uid", default=None)
+
+def set_current_uid(uid):
+    try:
+        return _current_uid.set(int(uid) if uid is not None else None)
+    except Exception:
+        return _current_uid.set(None)
+
+def get_current_uid():
+    uid = _current_uid.get()
+    if uid is None:
+        return int(ADMIN_ID)
+    return int(uid)
+
+def user_db_path(uid=None):
+    """Путь к личной sqlite БД юзера."""
+    uid = int(uid if uid is not None else get_current_uid())
+    d = os.path.join(DATA_DIR, "user_" + str(uid))
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "gifts.db")
+
 class AdminOnlyMiddleware(BaseMiddleware):
-    """Парсер доступен только ADMIN_ID."""
+    """Парсер доступен только ALLOWED_USER_IDS. Ставит uid в контекст БД."""
     async def __call__(
         self,
         handler: Callable[[Any, Dict[str, Any]], Awaitable[Any]],
@@ -55,23 +79,28 @@ class AdminOnlyMiddleware(BaseMiddleware):
         if user is None:
             return await handler(event, data)
         uid = int(user.id)
-        if uid == ADMIN_ID:
-            return await handler(event, data)
-        # неадминам — только /myid, чтобы узнать свой id
+        if uid not in ALLOWED_USER_IDS:
+            try:
+                if isinstance(event, Message):
+                    txt = (event.text or "").strip().lower()
+                    if txt.startswith("/myid"):
+                        return await handler(event, data)
+                    await event.answer("<b>Доступ закрыт</b>", parse_mode="HTML")
+                elif isinstance(event, CallbackQuery):
+                    await event.answer("Доступ закрыт", show_alert=True)
+            except Exception:
+                pass
+            return None
+        token = set_current_uid(uid)
         try:
-            if isinstance(event, Message):
-                txt = (event.text or "").strip().lower()
-                if txt.startswith("/myid"):
-                    return await handler(event, data)
-                await event.answer(
-                    "<b>⛔ Доступ закрыт\nПарсер только для админа</b>",
-                    parse_mode="HTML",
-                )
-            elif isinstance(event, CallbackQuery):
-                await event.answer("Доступ только для админа", show_alert=True)
-        except Exception:
-            pass
-        return None
+            # подгружаем антидубль этой БД при первом заходе
+            try:
+                ensure_user_seen_loaded(uid)
+            except Exception:
+                pass
+            return await handler(event, data)
+        finally:
+            _current_uid.reset(token)
 
 dp.message.middleware(AdminOnlyMiddleware())
 dp.callback_query.middleware(AdminOnlyMiddleware())
@@ -96,34 +125,39 @@ DEFAULT_LIMIT     = 50
 DEFAULT_REGION    = "any"
 DB_TARGET_USERS   = 100_000   # цель локальной БД владельцев
 
-# Глобальный антидубль (персистентный, между поисками)
-SEEN_GLOBAL: set = set()          # owner keys: uid или u:username
-SEEN_GIFTS: set = set()           # nft slugs
+# Антидубль по каждому юзеру отдельно (своя БД)
+SEEN_BY_USER = {}   # uid -> {"owners": set, "gifts": set, "loaded": bool}
 SEEN_GLOBAL_MAX = 9_000_000
-# Счётчик выдач по коллекции в текущем поиске (выше — больше людей, без забивания одной)
+# Счётчик выдач по коллекции в текущем поиске
 MAX_PER_COLLECTION = 5
-# Трейдер/whale — только явные сигналы
 TRADER_NAME_KW = (
     "whale", "resell", "flipper", "giftbot", "stars market",
     "tonnel", "fragment", "p2p market", "nft trade", "nft market",
 )
 PRICENFT_BOT = "PriceNFTbot"
 PRICENFT_DB_FILE = "pricenft_db.json"   # legacy, мигрируем в sqlite
-GIFTS_DB_FILE = "gifts.db"             # быстрая БД (миллионы записей)
+GIFTS_DB_FILE = "gifts.db"             # старый общий файл (мигрируем в data/user_*)
 PRICENFT_MSG_CD = 3.0
 WRITE_MSG = "привет, ты продаешь свой нфт подарок или нет"
 _pricenft_collecting = False
 _pricenft_stop = False
 _pricenft_task = None
-_pricenft_entity = None                 # кэш peer — без ResolveUsername
-_pricenft_flood_until = 0.0             # unix time, пока нельзя трогать PriceNFT
+_pricenft_entity = None
+_pricenft_flood_until = 0.0
 _bootstrap_task = None
 _keeper_task = None
 _search_started_at = 0.0
-_db_conn = None
-_db_lock = None
-_db_pending = 0
+_db_conns = {}          # uid -> sqlite connection
+_db_pending = {}        # uid -> pending writes
 _DB_COMMIT_EVERY = 200
+
+def _seen_bucket(uid=None):
+    uid = int(uid if uid is not None else get_current_uid())
+    b = SEEN_BY_USER.get(uid)
+    if b is None:
+        b = {"owners": set(), "gifts": set(), "loaded": False}
+        SEEN_BY_USER[uid] = b
+    return b
 
 # ── REGIONS ───────────────────────────────────────────────────────────────────
 REGIONS = {
@@ -150,7 +184,7 @@ REGIONS = {
 RU_LETTERS  = set("абвгдеёжзийклмнопрстуфхцчшщъыьэюяіїєґ")
 UK_UA_ONLY  = set("іїєґ")
 
-# Типичные славянские/русские имена латиницей — для быстрого матча региона RU/BY/UA/KZ
+# Типичные славянские/русские имена латиницей - для быстрого матча региона RU/BY/UA/KZ
 CIS_LAT_NAMES = {
     "anna","maria","olga","elena","irina","nata","natasha","tanya","tanya","dasha",
     "masha","katya","anya","alina","arina","karina","milana","polina","ksenia","kseniya",
@@ -206,7 +240,7 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
     combined = full + " " + senders_text
     tokens = _name_tokens(uname, fname, lname, name)
 
-    # Пустой/неизвестный профиль — не режем (иначе маркет даёт 0 результатов)
+    # Пустой/неизвестный профиль - не режем (иначе маркет даёт 0 результатов)
     if len(full.strip()) < 2:
         return True
 
@@ -363,7 +397,7 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
             "leeds","sheffield","newcastle","edinburgh","britain","brit ",
         ]) or (" uk " in (" " + combined + " ")):
             return True
-        return True  # неизвестно — не режем
+        return True  # неизвестно - не режем
     if region_key == "us":
         if has_de or has_fr or has_es or has_tr:
             return False
@@ -380,8 +414,8 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
             "hannah","samantha","chloe","amber","kayla","brooklyn","destiny",
         }):
             return True
-        return True  # неизвестно — не режем
-    # Нет явных маркеров региона — не блокируем (иначе маркет пустой)
+        return True  # неизвестно - не режем
+    # Нет явных маркеров региона - не блокируем (иначе маркет пустой)
     return True
 
 
@@ -439,7 +473,7 @@ BOY_NAMES_SET = {
     "egor","maksim","vlad","danil","daniil","petya","serezha","kostya",
     "roma","рома","yura","юра","kolya","коля","gosha","гоша","lesha","леша",
 }
-# Только явные маркеры (без «✨/💫» — слишком шумные)
+# Только явные маркеры (без «✨/💫» - слишком шумные)
 GIRL_SIGNALS_STRICT = [
     "she/her", "she her", "♀",
     "девушка", "женщина", "принцесса", "королева",
@@ -500,7 +534,7 @@ def is_girl(owner, username=None, name=None):
         "girl", "female", "woman", "lady", "девушка", "женщина", "she/her", "she her", "♀",
     ))
 
-    # Мужские слова / имена — жёсткий отказ
+    # Мужские слова / имена - жёсткий отказ
     if fname0 in BOY_NAMES_SET and fname0 not in GIRL_NAMES_SET:
         return False
     if fname0 in MALE_NAME_EXCEPTIONS_A and not has_girl_name:
@@ -549,7 +583,7 @@ def is_girl(owner, username=None, name=None):
 
 
 # ── MODEL DETECTION ───────────────────────────────────────────────────────────
-# Модельный поиск не требует is_model — ищем всех владельцев NFT (с фильтром девушки если надо)
+# Модельный поиск не требует is_model - ищем всех владельцев NFT (с фильтром девушки если надо)
 # is_model используется опционально для дополнительного ранжирования
 MODEL_KW = [
     "onlyfans","only fans","of.com","fansly","fanvue","nsfw","18+",
@@ -628,7 +662,11 @@ def get_min_gifts(uid): return USER_MIN_GIFTS.get(uid, DEFAULT_MIN_GIFTS)
 def get_max_gifts(uid): return USER_MAX_GIFTS.get(uid, DEFAULT_MAX_GIFTS)
 def get_limit(uid):     return USER_LIMIT.get(uid, DEFAULT_LIMIT)
 def get_region(uid):    return USER_REGION.get(uid, DEFAULT_REGION)
-def is_admin(uid):      return int(uid) == ADMIN_ID
+def is_admin(uid):
+    try:
+        return int(uid) in ALLOWED_USER_IDS
+    except Exception:
+        return False
 
 
 # ── FSM ───────────────────────────────────────────────────────────────────────
@@ -766,7 +804,7 @@ def floor_in_cat(floor, cat):
     return True
 
 def price_in_cat(price, cat):
-    """Фильтр по цене лота (не по floor коллекции) — иначе маркет пустой."""
+    """Фильтр по цене лота (не по floor коллекции) - иначе маркет пустой."""
     bounds = _cat_bounds(cat)
     if not bounds:
         return True
@@ -786,7 +824,7 @@ def price_in_cat(price, cat):
 def price_ok(price, floor, boost):
     if not price or not floor:
         return True
-    # Шире окно — иначе свежие лоты часто отсекаются
+    # Шире окно - иначе свежие лоты часто отсекаются
     lo = floor * 0.5
     hi = floor * (1.0 + max(boost, 50) / 100.0) * 1.5
     return lo <= price <= hi
@@ -806,7 +844,7 @@ CAT_LABELS = {
 
 # ── KEYBOARDS ─────────────────────────────────────────────────────────────────
 async def safe_edit(msg, text, reply_markup=None):
-    """Надёжное обновление сообщения — кнопки всегда остаются кликабельными."""
+    """Надёжное обновление сообщения - кнопки всегда остаются кликабельными."""
     try:
         await msg.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
         return True
@@ -882,7 +920,7 @@ def model_who_kb(search_type):
 COL_PAGE_SIZE = 40  # 2 колонки × 20 рядов + служебльные кнопки < 100
 
 def model_col_kb(who, search_type, collections, page=0):
-    """Кнопки коллекций с пагинацией (лимит Telegram — 100 кнопок)."""
+    """Кнопки коллекций с пагинацией (лимит Telegram - 100 кнопок)."""
     cols = list(collections)
     total_pages = max(1, (len(cols) + COL_PAGE_SIZE - 1) // COL_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
@@ -940,14 +978,11 @@ def settings_menu_kb(uid):
     mn  = get_min_gifts(uid)
     mx  = get_max_gifts(uid)
     lim = get_limit(uid)
-    reg = get_region(uid)
-    mx_s    = str(mx) if mx > 0 else "без лимита"
-    reg_lbl = REGIONS.get(reg, {}).get("label", "Все страны")
+    mx_s = str(mx) if mx > 0 else "без лимита"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Мин. гифтов: " + str(mn),   callback_data="set_min")],
         [InlineKeyboardButton(text="Макс. гифтов: " + mx_s,     callback_data="set_max")],
         [InlineKeyboardButton(text="Лимит выдачи: " + str(lim), callback_data="set_limit")],
-        [InlineKeyboardButton(text="🌍 Регион: " + reg_lbl,     callback_data="set_region")],
         [InlineKeyboardButton(text="⬅️ Назад",                  callback_data="menu")],
     ])
 
@@ -1160,7 +1195,7 @@ def _gift_on_market(gift, inner=None):
 
 
 def begin_search():
-    """Старт поиска. Антидубль НЕ сбрасываем — люди/гифты не повторяются."""
+    """Старт поиска. Антидубль НЕ сбрасываем - люди/гифты не повторяются."""
     global is_searching, _search_started_at
     now = time.time()
     if is_searching and _search_started_at and (now - _search_started_at) > 720:
@@ -1178,6 +1213,18 @@ def owner_seen_key(uid=None, username=None):
     if username:
         return "u:" + str(username).lstrip("@").lower()
     return None
+
+def owner_seen_keys(uid=None, username=None):
+    """Все ключи аккаунта (id + username) - чтобы не выдавать повторных юзеров."""
+    keys = []
+    if uid is not None:
+        try:
+            keys.append("id:" + str(int(uid)))
+        except Exception:
+            pass
+    if username:
+        keys.append("u:" + str(username).lstrip("@").lower())
+    return keys
 
 def gift_slug_of(nft_url_or_slug):
     if not nft_url_or_slug:
@@ -1206,7 +1253,7 @@ def item_matches_collections(item, allowed_gids=None, allowed_titles=None):
 
     src = (item.get("source") or "")
     gid = item.get("gift_id")
-    # Скан маркета по конкретному gift_id — API уже отфильтровал коллекцию
+    # Скан маркета по конкретному gift_id - API уже отфильтровал коллекцию
     if src == "market" and gid is not None and allowed_gids:
         try:
             if int(gid) in allowed_gids:
@@ -1220,18 +1267,18 @@ def item_matches_collections(item, allowed_gids=None, allowed_titles=None):
     base = re.sub(r"-\d+$", "", slug)
     nb = _norm_col_name(base)
 
-    # slug — главный источник для БД/профиля
+    # slug - главный источник для БД/профиля
     if nb and norms:
         if nb in norms:
             return True
-        # slug другой коллекции — мимо (даже если title/gift_id подставили)
+        # slug другой коллекции - мимо (даже если title/gift_id подставили)
         if src in ("pricenft_db", "db", "profile") or src != "market":
             return False
 
     title = item.get("title") or item.get("model") or ""
     nt = _norm_col_name(title)
     if nt and norms and nt in norms:
-        # для БД без slug — только exact title
+        # для БД без slug - только exact title
         if src in ("pricenft_db", "db") and not nb:
             return True
         if src not in ("pricenft_db", "db"):
@@ -1247,7 +1294,7 @@ def item_matches_collections(item, allowed_gids=None, allowed_titles=None):
 async def resolve_collections_for_cat(cat, gift_ids=None):
     """
     Коллекции, чей floor попадает в ценовую категорию.
-    Для профиля (у скрытых NFT нет цены лота) — фильтр по флору коллекции.
+    Для профиля (у скрытых NFT нет цены лота) - фильтр по флору коллекции.
     Возвращает (gids, titles).
     """
     id_set = None
@@ -1303,34 +1350,37 @@ async def resolve_collections_for_cat(cat, gift_ids=None):
     return out_g, out_t
 
 def is_owner_seen(uid=None, username=None):
-    k = owner_seen_key(uid, username)
-    return bool(k and k in SEEN_GLOBAL)
+    """True если этот юзер уже выдавался в БД текущего оператора."""
+    owners = _seen_bucket()["owners"]
+    for k in owner_seen_keys(uid, username):
+        if k in owners:
+            return True
+    return False
 
 def is_gift_seen(nft_url_or_slug):
     slug = gift_slug_of(nft_url_or_slug)
-    return bool(slug and slug in SEEN_GIFTS)
+    return bool(slug and slug in _seen_bucket()["gifts"])
 
 def mark_seen(uid=None, username=None, nft_url=None):
-    """Пометить аккаунт и гифт как выданные (память + sqlite)."""
-    global SEEN_GLOBAL, SEEN_GIFTS
+    """Пометить аккаунт и гифт как выданные (память + личная sqlite)."""
+    b = _seen_bucket()
+    owners = b["owners"]
+    gifts = b["gifts"]
     keys = []
-    k = owner_seen_key(uid, username)
-    if k and k not in SEEN_GLOBAL:
-        SEEN_GLOBAL.add(k)
-        keys.append(k)
+    for k in owner_seen_keys(uid, username):
+        if k not in owners:
+            owners.add(k)
+            keys.append(k)
     slug = gift_slug_of(nft_url)
     new_slug = None
-    if slug and slug not in SEEN_GIFTS:
-        SEEN_GIFTS.add(slug)
+    if slug and slug not in gifts:
+        gifts.add(slug)
         new_slug = slug
-    # persist async-ish (sync fast insert)
     try:
         db_mark_seen(keys, new_slug)
     except Exception:
         pass
-    # защита от раздувания RAM
-    if len(SEEN_GLOBAL) > SEEN_GLOBAL_MAX:
-        # оставляем половину самых новых через sqlite reload
+    if len(owners) > SEEN_GLOBAL_MAX:
         pass
 
 def is_trader_account(owner, username=None, name=None):
@@ -1343,7 +1393,7 @@ def is_trader_account(owner, username=None, name=None):
     full = (uname + " " + fname + " " + lname).lower()
     if any(k in full for k in TRADER_NAME_KW):
         return True
-    # много цифр в username — часто боты/фарм
+    # много цифр в username - часто боты/фарм
     if uname and sum(c.isdigit() for c in uname) >= 5 and any(k in uname for k in ("nft", "gift", "star", "ton")):
         return True
     return False
@@ -1373,8 +1423,8 @@ async def get_floor(gid):
 async def fetch_market_page(gid, offset, limit=100, newest=True):
     """
     Страница маркета.
-    newest=True  — свежие лоты (по умолчанию API сортирует по дате изменения цены desc)
-    newest=False — сортировка по цене (для флора и т.п.)
+    newest=True  - свежие лоты (по умолчанию API сортирует по дате изменения цены desc)
+    newest=False - сортировка по цене (для флора и т.п.)
     """
     for _ in range(2):
         try:
@@ -1420,8 +1470,8 @@ async def fetch_market_page(gid, offset, limit=100, newest=True):
 async def fetch_saved_gifts(uid_or_username, max_pages=2, only_off_market=False, require_zero_on_market=False):
     """
     Загружает сохранённые гифты по uid или username.
-    only_off_market=True — в результат только НЕ на маркете.
-    require_zero_on_market=True — если хоть 1 гифт на маркете, вернуть None (профиль отбракован).
+    only_off_market=True - в результат только НЕ на маркете.
+    require_zero_on_market=True - если хоть 1 гифт на маркете, вернуть None (профиль отбракован).
     """
     all_items = []
     seen_slugs = set()
@@ -1481,18 +1531,27 @@ async def fetch_saved_gifts(uid_or_username, max_pages=2, only_off_market=False,
 _pricenft_lock = asyncio.Lock()
 _pricenft_last_send = 0.0
 
-def _db():
-    """Один shared connection, WAL, быстрые вставки."""
-    global _db_conn, _db_lock
-    if _db_lock is None:
-        _db_lock = asyncio.Lock() if False else None  # sync lock via threading not needed; sqlite check_same_thread=False
-    if _db_conn is not None:
-        return _db_conn
-    conn = sqlite3.connect(GIFTS_DB_FILE, timeout=30, check_same_thread=False)
+def _db(uid=None):
+    """Личная sqlite БД текущего (или указанного) юзера."""
+    uid = int(uid if uid is not None else get_current_uid())
+    conn = _db_conns.get(uid)
+    if conn is not None:
+        return conn
+    path = user_db_path(uid)
+    # один раз мигрируем старый общий gifts.db в БД админа
+    if uid == int(ADMIN_ID) and (not os.path.exists(path) or os.path.getsize(path) < 100):
+        if os.path.exists(GIFTS_DB_FILE) and os.path.getsize(GIFTS_DB_FILE) > 100:
+            try:
+                import shutil
+                shutil.copy2(GIFTS_DB_FILE, path)
+                logger.info("Migrated legacy %s -> %s", GIFTS_DB_FILE, path)
+            except Exception as e:
+                logger.warning("migrate legacy db: %s", e)
+    conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute("PRAGMA cache_size=-64000")  # ~64MB
+    conn.execute("PRAGMA cache_size=-64000")
     conn.execute("PRAGMA mmap_size=268435456")
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS gifts (
@@ -1523,8 +1582,9 @@ def _db():
     );
     """)
     conn.commit()
-    _db_conn = conn
-    return _db_conn
+    _db_conns[uid] = conn
+    _db_pending.setdefault(uid, 0)
+    return conn
 
 def db_mark_seen(owner_keys, slug=None):
     conn = _db()
@@ -1538,22 +1598,42 @@ def db_mark_seen(owner_keys, slug=None):
         conn.execute("INSERT OR IGNORE INTO seen_gifts(slug, ts) VALUES (?, ?)", (slug, now))
     conn.commit()
 
+def ensure_user_seen_loaded(uid=None):
+    """Загрузить антидубль юзера в RAM (один раз)."""
+    uid = int(uid if uid is not None else get_current_uid())
+    b = _seen_bucket(uid)
+    if b.get("loaded"):
+        return b
+    conn = _db(uid)
+    b["owners"] = {r[0] for r in conn.execute("SELECT key FROM seen_owners")}
+    b["gifts"] = {r[0] for r in conn.execute("SELECT slug FROM seen_gifts")}
+    b["loaded"] = True
+    logger.info("Seen user=%s owners=%s gifts=%s", uid, len(b["owners"]), len(b["gifts"]))
+    return b
+
 def load_seen_into_memory():
-    """Быстрая загрузка антидубля в RAM при старте."""
-    global SEEN_GLOBAL, SEEN_GIFTS
-    conn = _db()
-    SEEN_GLOBAL = {r[0] for r in conn.execute("SELECT key FROM seen_owners")}
-    SEEN_GIFTS = {r[0] for r in conn.execute("SELECT slug FROM seen_gifts")}
-    logger.info("Seen loaded: owners=%s gifts=%s", len(SEEN_GLOBAL), len(SEEN_GIFTS))
+    """При старте грузим антидубль всех разрешённых юзеров."""
+    for uid in ALLOWED_USER_IDS:
+        try:
+            token = set_current_uid(uid)
+            try:
+                ensure_user_seen_loaded(uid)
+            finally:
+                _current_uid.reset(token)
+        except Exception as e:
+            logger.warning("load_seen uid=%s: %s", uid, e)
 
 def clear_seen_db():
-    global SEEN_GLOBAL, SEEN_GIFTS
-    conn = _db()
+    """Сброс антидубля только текущей БД (кто нажал в админке)."""
+    uid = get_current_uid()
+    b = _seen_bucket(uid)
+    conn = _db(uid)
     conn.execute("DELETE FROM seen_owners")
     conn.execute("DELETE FROM seen_gifts")
     conn.commit()
-    SEEN_GLOBAL.clear()
-    SEEN_GIFTS.clear()
+    b["owners"].clear()
+    b["gifts"].clear()
+    b["loaded"] = True
 
 def load_pricenft_db(force=False):
     """Инициализация sqlite (+миграция со старого json один раз)."""
@@ -1606,6 +1686,7 @@ def save_pricenft_db():
 def pricenft_db_stats():
     try:
         conn = _db()
+        b = _seen_bucket()
         models = conn.execute("SELECT COUNT(DISTINCT model) FROM gifts").fetchone()[0] or 0
         users = conn.execute("SELECT COUNT(DISTINCT lower(username)) FROM gifts WHERE username IS NOT NULL AND username!=''").fetchone()[0] or 0
         nfts = conn.execute("SELECT COUNT(*) FROM gifts").fetchone()[0] or 0
@@ -1614,28 +1695,29 @@ def pricenft_db_stats():
             "users": int(users),
             "nfts": int(nfts),
             "updated_at": int(time.time()),
-            "seen_owners": len(SEEN_GLOBAL),
-            "seen_gifts": len(SEEN_GIFTS),
+            "seen_owners": len(b["owners"]),
+            "seen_gifts": len(b["gifts"]),
+            "db_user": get_current_uid(),
         }
     except Exception as e:
         logger.warning("pricenft_db_stats: %s", e)
         return {"models": 0, "users": 0, "nfts": 0, "updated_at": 0, "seen_owners": 0, "seen_gifts": 0}
 
 def db_flush(force=False):
-    """Коммит пачки вставок в sqlite."""
-    global _db_pending
-    if not force and _db_pending <= 0:
+    """Коммит пачки вставок в sqlite текущей БД."""
+    uid = get_current_uid()
+    pending = int(_db_pending.get(uid, 0) or 0)
+    if not force and pending <= 0:
         return
     try:
-        conn = _db()
+        conn = _db(uid)
         conn.commit()
-        _db_pending = 0
+        _db_pending[uid] = 0
     except Exception as e:
         logger.debug("db_flush: %s", e)
 
 def pricenft_add_user(model, username, nft_urls=None, uid=None, commit=True):
     """Добавить юзера/гифты в sqlite (очень быстро, пачками)."""
-    global _db_pending
     if not model or not username:
         return False
     model = str(model).strip()
@@ -1657,21 +1739,37 @@ def pricenft_add_user(model, username, nft_urls=None, uid=None, commit=True):
     if not rows:
         return False
     try:
-        conn = _db()
+        op_uid = get_current_uid()
+        conn = _db(op_uid)
         conn.executemany(
             "INSERT OR IGNORE INTO gifts(slug, url, model, username, uid, ts) VALUES (?,?,?,?,?,?)",
             rows,
         )
-        _db_pending += len(rows)
-        if commit or _db_pending >= _DB_COMMIT_EVERY:
+        _db_pending[op_uid] = int(_db_pending.get(op_uid, 0) or 0) + len(rows)
+        if commit or _db_pending[op_uid] >= _DB_COMMIT_EVERY:
             db_flush(force=True)
         return True
     except Exception as e:
         logger.debug("pricenft_add_user: %s", e)
         return False
 
+def for_each_user_db(fn):
+    """Выполнить fn() в контексте каждой личной БД (для фонового сбора)."""
+    results = []
+    for uid in ALLOWED_USER_IDS:
+        token = set_current_uid(uid)
+        try:
+            results.append(fn())
+        except Exception as e:
+            logger.debug("for_each_user_db %s: %s", uid, e)
+            results.append(None)
+        finally:
+            _current_uid.reset(token)
+    return results
+
 def seed_pricenft_from_item(item, commit=False):
-    """Пассивно наполняем БД из маркета/модели (без commit на каждую строку)."""
+    """Пассивно наполняем БД из маркета/модели (без commit на каждую строку).
+    Пишем во все личные БД, чтобы у обоих был каталог. Антидубль у каждого свой."""
     try:
         uname = (item.get("username") or "").lstrip("@")
         title = item.get("title") or item.get("model") or ""
@@ -1679,17 +1777,20 @@ def seed_pricenft_from_item(item, commit=False):
         uid = item.get("owner_id")
         if not uname or not title or str(title) in ("?", "NFT", "None"):
             return
-        pricenft_add_user(
-            str(title), uname, [nft_url] if nft_url else None,
-            uid=uid, commit=commit,
-        )
+        def _add():
+            return pricenft_add_user(
+                str(title), uname, [nft_url] if nft_url else None,
+                uid=uid, commit=commit,
+            )
+        # каталог пишем всем, антидубль выдачи у каждого свой
+        for_each_user_db(_add)
     except Exception:
         pass
 
 def random_from_pricenft_db(limit=25, model=None, exact=False):
     """
     Быстрый рандом из sqlite.
-    exact=True — только точное имя модели (для поиска по конкретной коллекции).
+    exact=True - только точное имя модели (для поиска по конкретной коллекции).
     """
     load_pricenft_db(force=False)
     conn = _db()
@@ -1725,7 +1826,7 @@ def random_from_pricenft_db(limit=25, model=None, exact=False):
                         ("%" + m2 + "%", max(limit * 12, 120)),
                     ).fetchall()
         else:
-            # много разных моделей, по 1-2 юзера — цикл разнообразия
+            # много разных моделей, по 1-2 юзера - цикл разнообразия
             models = [r[0] for r in conn.execute(
                 "SELECT DISTINCT model FROM gifts ORDER BY RANDOM() LIMIT ?",
                 (max(limit * 3, 100),),
@@ -1842,7 +1943,7 @@ def _set_pricenft_flood(seconds):
     """Запомнить FloodWait, не резолвить username снова часами."""
     global _pricenft_flood_until
     sec = int(max(0, seconds or 0))
-    # не ждём 20 часов в UI — просто блокируем PriceNFT до этого момента
+    # не ждём 20 часов в UI - просто блокируем PriceNFT до этого момента
     _pricenft_flood_until = time.time() + sec
     try:
         conn = _db()
@@ -1905,7 +2006,7 @@ async def _pricenft_peer():
         left = max(1, int(_pricenft_flood_until - time.time()))
         raise PriceNftFloodError(left)
 
-    # 1) id+hash из БД — InputPeerUser без ResolveUsername
+    # 1) id+hash из БД - InputPeerUser без ResolveUsername
     try:
         from telethon.tl.types import InputPeerUser
         row = _db().execute("SELECT v FROM meta WHERE k='pricenft_peer_id'").fetchone()
@@ -1955,7 +2056,7 @@ async def _pricenft_peer():
 def _btn_texts_from_msg(msg):
     """Все подписи кнопок (reply + inline) из сообщения."""
     texts = []
-    # reply keyboard в peer может быть не в msg — смотрим markup сообщения
+    # reply keyboard в peer может быть не в msg - смотрим markup сообщения
     markup = getattr(msg, "reply_markup", None)
     if not markup:
         return texts
@@ -2123,10 +2224,10 @@ async def _pricenft_ingest_messages(model_name, messages):
                 except Exception:
                     pass
         users, nfts = _parse_pricenft_text(blob)
-        # если модель не задана — пробуем вытащить из заголовка/текста
+        # если модель не задана - пробуем вытащить из заголовка/текста
         mname = model_name
         if not mname:
-            # часто первая строка — название модели
+            # часто первая строка - название модели
             first = (blob.strip().splitlines() or [""])[0].strip()
             if first and len(first) < 60 and not first.startswith("@"):
                 mname = first
@@ -2179,7 +2280,7 @@ async def resolve_pricenft_hits(hits, limit=None):
 async def search_pricenftbot(query=None, limit=25, resolve=True):
     """
     Выдача из локальной БД (рандом по моделям).
-    resolve=False — не резолвить entity (быстрее, без FloodWait).
+    resolve=False - не резолвить entity (быстрее, без FloodWait).
     """
     model = None
     q = (query or "").strip()
@@ -2193,7 +2294,7 @@ async def search_pricenftbot(query=None, limit=25, resolve=True):
 async def collect_pricenft_db(progress_cb=None, max_models=0):
     """
     Сборщик владельцев из @PriceNFTbot в локальную БД.
-    max_models=0 — без лимита (пока не нажмут Стоп).
+    max_models=0 - без лимита (пока не нажмут Стоп).
     Можно остановить в любой момент: stop_pricenft_collect().
     """
     global _pricenft_collecting, _pricenft_stop
@@ -2374,7 +2475,7 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
                 if (i + 1) % 5 == 0:
                     save_pricenft_db()
 
-            # Фон/Узор — только если не стопнули
+            # Фон/Узор - только если не стопнули
             if not stopped():
                 for cat_key, keys in cat_map[1:]:
                     if stopped():
@@ -2457,14 +2558,14 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
     except Exception as e:
         logger.error("collect_pricenft_db: %s", e)
         save_pricenft_db()
-        # если это flood в тексте — тоже fallback
+        # если это flood в тексте - тоже fallback
         msg = str(e)
         if "FloodWait" in msg or "wait of" in msg.lower():
             mnum = re.search(r"(\d+)\s*seconds?", msg, re.I)
             sec = int(mnum.group(1)) if mnum else 3600
             _set_pricenft_flood(sec)
             try:
-                await prog("⏳ FloodWait — добиваю БД с маркета...")
+                await prog("⏳ FloodWait - добиваю БД с маркета...")
                 m = await fill_db_from_market_fast(progress_cb=progress_cb)
                 return {"ok": True, "flood_fallback": True, "flood_wait": sec, **stats, **m}
             except Exception:
@@ -2479,7 +2580,7 @@ def stop_pricenft_collect():
     """Остановить сбор БД из PriceNFTbot."""
     global _pricenft_collecting, _pricenft_stop
     _pricenft_stop = True
-    # не сбрасываем _pricenft_collecting сразу — цикл сам выйдет и сделает finally
+    # не сбрасываем _pricenft_collecting сразу - цикл сам выйдет и сделает finally
     return True
 
 
@@ -2579,7 +2680,7 @@ async def background_db_keeper():
     """
     Основной фоновый режим: постоянно быстро пишет маркет в sqlite,
     периодически дособирает через @PriceNFTbot (CD 3с).
-    Работает всегда после авторизации — даже когда поиск не идёт.
+    Работает всегда после авторизации - даже когда поиск не идёт.
     """
     logger.info("background_db_keeper started")
     await asyncio.sleep(5)
@@ -2589,7 +2690,7 @@ async def background_db_keeper():
             if not await check_authorized():
                 await asyncio.sleep(30)
                 continue
-            # во время поиска не конкурируем за API — маркет и так сидится из выдачи
+            # во время поиска не конкурируем за API - маркет и так сидится из выдачи
             if is_searching:
                 await asyncio.sleep(3)
                 continue
@@ -2600,7 +2701,7 @@ async def background_db_keeper():
                 continue
             random.shuffle(pairs)
             PARALLEL = 22
-            # быстрый проход маркета — основной объём БД до 100к
+            # быстрый проход маркета - основной объём БД до 100к
             st0 = pricenft_db_stats()
             if int(st0.get("users", 0) or 0) < DB_TARGET_USERS:
                 # глубокий fill раз в несколько циклов
@@ -2646,7 +2747,7 @@ async def background_db_keeper():
                 cycle, st.get("models"), st.get("users"), st.get("nfts"),
             )
 
-            # PriceNFTbot — только если нет FloodWait
+            # PriceNFTbot - только если нет FloodWait
             if (
                 cycle % 2 == 0
                 and not _pricenft_collecting
@@ -2683,13 +2784,13 @@ async def deliver_pricenft_random(status_msg, max_results=20, girls_only=False, 
                                   with_cd=False):
     """
     Рандомная выдача из БД PriceNFT по моделям.
-    with_cd — пауза только если нужно (по умолчанию выкл, быстро).
+    with_cd - пауза только если нужно (по умолчанию выкл, быстро).
     """
     global is_searching
     load_pricenft_db()
     st = pricenft_db_stats()
     if st.get("users", 0) <= 0:
-        # БД опциональна — не ломаем поиск, просто пропускаем
+        # БД опциональна - не ломаем поиск, просто пропускаем
         return 0
 
     hits = await search_pricenftbot(limit=max(max_results * 3, 30), resolve=True)
@@ -2726,7 +2827,7 @@ async def deliver_pricenft_random(status_msg, max_results=20, girls_only=False, 
             cache_owner(oid, owner, uname, name, p_url, [h])
             kb = model_card_kb(uname, p_url, oid, nft_url, nft_count=1)
         else:
-            # без id — только ссылка на username
+            # без id - только ссылка на username
             btns = []
             if uname:
                 btns.append([InlineKeyboardButton(text="@" + uname, url="https://t.me/" + uname)])
@@ -2750,7 +2851,7 @@ async def deliver_pricenft_random(status_msg, max_results=20, girls_only=False, 
 
 
 # ── PROFILE SEARCH ────────────────────────────────────────────────────────────
-# Список чатов — короткий, только рабочие NFT/Stars (быстрее профиль-поиск)
+# Список чатов - короткий, только рабочие NFT/Stars (быстрее профиль-поиск)
 NFT_SCAN_CHATS = [
     "tgstargifts", "stargiftsru", "stargifts_market", "giftstars",
     "starnftmarket", "nft_stars_market", "telegramnft", "cryptogifts_ton",
@@ -2813,7 +2914,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                             max_results=30, region="any"):
     """
     Профиль: аккаунты с 0 гифтов на маркете.
-    Ценовая категория — по флору коллекции скрытых NFT (не дешман в 5-20к).
+    Ценовая категория - по флору коллекции скрытых NFT (не дешман в 5-20к).
     """
     global is_searching
     is_searching = True
@@ -3082,7 +3183,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             for w in workers:
                 w.cancel()
 
-        # если мало результатов — второй проход: достаточно скрытых NFT (не строго 0 на маркете)
+        # если мало результатов - второй проход: достаточно скрытых NFT (не строго 0 на маркете)
         if is_searching and found[0] < max(3, max_results // 2):
             try:
                 await status_msg.edit_text(
@@ -3122,7 +3223,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                         )
                         if not saved:
                             continue
-                        # тот же фильтр категории — не пускаем дешман в 5-20к
+                        # тот же фильтр категории - не пускаем дешман в 5-20к
                         hidden = pick_hidden(saved)
                         if not hidden:
                             continue
@@ -3222,7 +3323,7 @@ def _make_nft_lines(items):
             break
         t  = esc(str(it.get("title","?")))
         p  = it.get("price")
-        ps = " — " + str(p) + " ⭐" if p else ""
+        ps = " - " + str(p) + " ⭐" if p else ""
         if nu:
             lines += '\n<a href="' + nu + '">' + t + ps + "</a>"
         else:
@@ -3257,7 +3358,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
     if n_cols <= 1:
         hard_cap = max_results
     else:
-        # больше карточек на коллекцию — иначе «мало людей»
+        # больше карточек на коллекцию - иначе «мало людей»
         hard_cap = max(3, min(MAX_PER_COLLECTION, (max_results + n_cols - 1) // max(1, min(n_cols, 10))))
     page_limit = 80 if girls_only else 70
     page_count = 4 if girls_only else 3
@@ -3315,7 +3416,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         price = item.get("price")
         owner_s = fmt_owner(item.get("owner"), uname, name)
         user_line = ("\n👤 @" + esc(uname)) if uname else ""
-        price_s = (" — " + str(price) + " ⭐") if price else ""
+        price_s = (" - " + str(price) + " ⭐") if price else ""
         nft_line = ('\n<a href="' + nft_url + '">' + title + price_s + "</a>") if nft_url else ("\n" + title + price_s)
         txt = "<b>" + owner_s + "\nСвежий лот на маркете</b>" + user_line + nft_line
         if oid:
@@ -3410,10 +3511,10 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                     pass
 
         await run_pass(ignore_global=False, enforce_cap=True, enforce_consec=True)
-        # если антидубль всё съел — второй проход без глобального seen (только в рамках поиска)
+        # если антидубль всё съел - второй проход без глобального seen (только в рамках поиска)
         if is_searching and found[0] < max_results:
             await run_pass(ignore_global=True, enforce_cap=True, enforce_consec=True)
-        # добор: ослабляем только cap, подряд одинаковые — всё равно нельзя
+        # добор: ослабляем только cap, подряд одинаковые - всё равно нельзя
         if is_searching and found[0] < max_results and n_cols > 1:
             await run_pass(ignore_global=True, enforce_cap=False, enforce_consec=True)
 
@@ -3436,7 +3537,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
       - только выбранные gift_id
       - строгая проверка slug/title (без чужих коллекций из БД)
       - без одинаковых коллекций подряд
-      - при 1 коллекции — глубокий скан без cap
+      - при 1 коллекции - глубокий скан без cap
     """
     global is_searching
     is_searching = True
@@ -3653,7 +3754,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             slug = gift_slug_of(h.get("nft_url")) or ""
             base = _norm_col_name(re.sub(r"-\d+$", "", slug))
             want = _norm_col_name(t)
-            # без slug или чужой slug — не берём (иначе «рандом» вместо выбранного гифта)
+            # без slug или чужой slug - не берём (иначе «рандом» вместо выбранного гифта)
             if not want or not base or base != want:
                 return None
             if not item_matches_collections(h, allowed_gids, allowed_titles):
@@ -3858,7 +3959,7 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                 limit=max(max_results * (24 if girls_only else 14), 160),
                 model=t, exact=True,
             ))
-        # общие юзеры — только если «все коллекции»; при 1 гифте не мешаем рандомом
+        # общие юзеры - только если «все коллекции»; при 1 гифте не мешаем рандомом
         if not single:
             cands.extend(random_users_from_db(limit=max(300 if girls_only else 150, max_results * 12)))
         random.shuffle(cands)
@@ -3909,7 +4010,7 @@ async def _start_market(cb, cat, girls):
     if not begin_search():
         await cb.answer("Поиск уже идёт! Нажми Стоп или /clear", show_alert=True)
         return
-    # begin_search уже поставил is_searching=True; do_market_search тоже ставит — ок
+    # begin_search уже поставил is_searching=True; do_market_search тоже ставит - ок
     await cb.answer("Запускаю...")
     stats["checks"] += 1
     uid    = cb.from_user.id
@@ -4130,7 +4231,7 @@ async def cmd_start(message: Message, state: FSMContext):
     if uid not in ONBOARDING_DONE:
         await message.answer(
             "<b>Добро пожаловать в Neptun Parser\n\n"
-            "Шаг 1 из 4 — Минимум гифтов у владельца\nВыбери:</b>",
+            "Шаг 1 из 3 - Минимум гифтов у владельца\nВыбери:</b>",
             parse_mode="HTML", reply_markup=ob_min_kb()
         )
         await state.set_state(Onboarding.min_gifts)
@@ -4155,12 +4256,12 @@ async def ob_min_btn(cb: CallbackQuery, state: FSMContext):
     try:
         await cb.message.edit_text(
             "<b>Мин. гифтов: " + str(val) + "\n\n"
-            "Шаг 2 из 4 — Максимум гифтов\nВыбери:</b>",
+            "Шаг 2 из 3 - Максимум гифтов\nВыбери:</b>",
             parse_mode="HTML", reply_markup=ob_max_kb()
         )
     except Exception:
         await cb.message.answer(
-            "<b>Шаг 2 из 4 — Максимум гифтов\nВыбери:</b>",
+            "<b>Шаг 2 из 3 - Максимум гифтов\nВыбери:</b>",
             parse_mode="HTML", reply_markup=ob_max_kb()
         )
     await state.set_state(Onboarding.max_gifts)
@@ -4178,12 +4279,12 @@ async def ob_max_btn(cb: CallbackQuery, state: FSMContext):
     try:
         await cb.message.edit_text(
             "<b>Макс. гифтов: " + lbl + "\n\n"
-            "Шаг 3 из 4 — Лимит выдачи результатов\nВыбери:</b>",
+            "Шаг 3 из 3 - Лимит выдачи результатов\nВыбери:</b>",
             parse_mode="HTML", reply_markup=ob_lim_kb()
         )
     except Exception:
         await cb.message.answer(
-            "<b>Шаг 3 из 4 — Лимит выдачи\nВыбери:</b>",
+            "<b>Шаг 3 из 3 - Лимит выдачи\nВыбери:</b>",
             parse_mode="HTML", reply_markup=ob_lim_kb()
         )
     await state.set_state(Onboarding.limit)
@@ -4197,31 +4298,15 @@ async def ob_lim_btn(cb: CallbackQuery, state: FSMContext):
         return
     val = int(cb.data[6:])
     USER_LIMIT[cb.from_user.id] = val
-    try:
-        await cb.message.edit_text(
-            "<b>Лимит: " + str(val) + "\n\n"
-            "Шаг 4 из 4 — Регион поиска\nВыбери:</b>",
-            parse_mode="HTML", reply_markup=ob_region_kb()
-        )
-    except Exception:
-        await cb.message.answer(
-            "<b>Шаг 4 из 4 — Регион поиска\nВыбери:</b>",
-            parse_mode="HTML", reply_markup=ob_region_kb()
-        )
-    await state.set_state(Onboarding.region)
+    USER_REGION[cb.from_user.id] = "any"
+    await _finish_onboarding(cb.from_user.id, state, cb.message)
     await cb.answer()
 
 
 @dp.callback_query(F.data.startswith("obreg_"))
 async def ob_reg_btn(cb: CallbackQuery, state: FSMContext):
-    if await state.get_state() != Onboarding.region.state:
-        await cb.answer()
-        return
-    key = cb.data[6:]
-    if key not in REGIONS:
-        await cb.answer()
-        return
-    USER_REGION[cb.from_user.id] = key
+    # регион убран - сразу завершаем онбординг
+    USER_REGION[cb.from_user.id] = "any"
     await _finish_onboarding(cb.from_user.id, state, cb.message)
     await cb.answer()
 
@@ -4233,14 +4318,12 @@ async def _finish_onboarding(uid, state, msg):
     mn   = get_min_gifts(uid)
     mx   = get_max_gifts(uid)
     mx_s = str(mx) if mx > 0 else "без лимита"
-    reg  = REGIONS.get(get_region(uid), {}).get("label", "Все страны")
     try:
         await msg.edit_text(
             "<b>Настройка завершена!\n\n"
             "Мин. гифтов: " + str(mn) + "\n"
             "Макс. гифтов: " + mx_s + "\n"
-            "Лимит: " + str(get_limit(uid)) + "\n"
-            "Регион: " + reg + "\n\n"
+            "Лимит: " + str(get_limit(uid)) + "\n\n"
             "Менять можно в Настройках</b>",
             parse_mode="HTML", reply_markup=main_menu_kb()
         )
@@ -4248,7 +4331,7 @@ async def _finish_onboarding(uid, state, msg):
         await msg.answer(
             "<b>Настройка завершена!\n\n"
             "Мин. гифтов: " + str(mn) + "\nМакс. гифтов: " + mx_s + "\n"
-            "Лимит: " + str(get_limit(uid)) + "\nРегион: " + reg + "</b>",
+            "Лимит: " + str(get_limit(uid)) + "</b>",
             parse_mode="HTML", reply_markup=main_menu_kb()
         )
 
@@ -4260,7 +4343,7 @@ async def cmd_clear(message: Message, state: FSMContext):
     cur_state = await state.get_state()
     # Прерываем любое состояние FSM включая онбординг
     await state.clear()
-    # Если был онбординг — выходим с дефолтами
+    # Если был онбординг - выходим с дефолтами
     if cur_state and cur_state.startswith("Onboarding:"):
         uid = message.from_user.id
         if uid not in USER_MIN_GIFTS:
@@ -4289,10 +4372,10 @@ async def cmd_myid(message: Message):
 
 @dp.message(Command("neptunteam"))
 async def cmd_neptunteam(message: Message, state: FSMContext):
-    # Команда работает в любом состоянии — очищаем FSM
+    # Команда работает в любом состоянии - очищаем FSM
     await state.clear()
     uid  = message.from_user.id
-    # Если был онбординг — ставим дефолты
+    # Если был онбординг - ставим дефолты
     if uid not in ONBOARDING_DONE:
         if uid not in USER_MIN_GIFTS:
             USER_MIN_GIFTS[uid] = DEFAULT_MIN_GIFTS
@@ -4309,10 +4392,10 @@ async def cmd_neptunteam(message: Message, state: FSMContext):
     mx_s = str(mx) if mx > 0 else "без лимита"
     reg_l= REGIONS.get(reg, {}).get("label", "Все страны")
     txt = (
-        "<b>Neptun Parser — справка\n\n"
+        "<b>Neptun Parser - справка\n\n"
         "РЕЖИМЫ ПОИСКА\n\n"
         "По маркету\n"
-        "Ищет свежие лоты — разные коллекции (round-robin).\n"
+        "Ищет свежие лоты - разные коллекции (round-robin).\n"
         "Параллельно наполняет БД PriceNFT.\n\n"
         "По профилю\n"
         "Ищет аккаунты с NFT и строго 0 лотов на маркете.\n"
@@ -4326,9 +4409,9 @@ async def cmd_neptunteam(message: Message, state: FSMContext):
         "Лимит выдачи: " + str(lim) + "\n"
         "Регион: " + reg_l + "\n\n"
         "КОМАНДЫ\n"
-        "/start — главное меню\n"
-        "/clear — остановить поиск / прервать настройку\n"
-        "/neptunteam — эта справка</b>"
+        "/start - главное меню\n"
+        "/clear - остановить поиск / прервать настройку\n"
+        "/neptunteam - эта справка</b>"
     )
     await message.answer(txt, parse_mode="HTML", reply_markup=main_menu_kb())
 
@@ -4381,12 +4464,12 @@ async def cb_search_mode(cb: CallbackQuery):
 @dp.callback_query(F.data == "mode_market")
 async def cb_mode_market(cb: CallbackQuery):
     await cb.answer()
-    await safe_edit(cb.message, "<b>Маркет — выбери ценовую категорию:</b>", reply_markup=cat_kb("market"))
+    await safe_edit(cb.message, "<b>Маркет - выбери ценовую категорию:</b>", reply_markup=cat_kb("market"))
 
 @dp.callback_query(F.data == "mode_profile")
 async def cb_mode_profile(cb: CallbackQuery):
     await cb.answer()
-    await safe_edit(cb.message, "<b>Профиль — выбери ценовую категорию:</b>", reply_markup=cat_kb("profile"))
+    await safe_edit(cb.message, "<b>Профиль - выбери ценовую категорию:</b>", reply_markup=cat_kb("profile"))
 
 @dp.callback_query(F.data == "mode_model")
 async def cb_mode_model(cb: CallbackQuery):
@@ -4394,7 +4477,7 @@ async def cb_mode_model(cb: CallbackQuery):
         await cb.answer("Коллекции не загружены", show_alert=True)
         return
     await cb.answer()
-    await safe_edit(cb.message, "<b>По модели — выбери тип поиска:</b>", reply_markup=model_search_type_kb())
+    await safe_edit(cb.message, "<b>По модели - выбери тип поиска:</b>", reply_markup=model_search_type_kb())
 
 @dp.callback_query(F.data.startswith("mc_"))
 async def cb_mc(cb: CallbackQuery):
@@ -4436,7 +4519,7 @@ async def cb_mdltype(cb: CallbackQuery):
         return
     lbl = "маркету" if search_type == "market" else "профилю"
     await cb.answer()
-    await safe_edit(cb.message, "<b>По модели / " + lbl + " — кого искать?</b>", reply_markup=model_who_kb(search_type))
+    await safe_edit(cb.message, "<b>По модели / " + lbl + " - кого искать?</b>", reply_markup=model_who_kb(search_type))
 
 @dp.callback_query(F.data.startswith("mdlwho_"))
 async def cb_mdlwho(cb: CallbackQuery):
@@ -4456,7 +4539,7 @@ async def cb_mdlwho(cb: CallbackQuery):
     await cb.answer()
     await safe_edit(
         cb.message,
-        "<b>" + lbl + " / по " + lbl2 + " — выбери коллекцию:</b>",
+        "<b>" + lbl + " / по " + lbl2 + " - выбери коллекцию:</b>",
         reply_markup=model_col_kb(who, search_type, ALL_GIFT_IDS, page=0),
     )
 
@@ -4483,7 +4566,7 @@ async def cb_mdlpage(cb: CallbackQuery):
     lbl2 = "маркету" if search_type == "market" else "профилю"
     await safe_edit(
         cb.message,
-        "<b>" + lbl + " / по " + lbl2 + " — выбери коллекцию:</b>",
+        "<b>" + lbl + " / по " + lbl2 + " - выбери коллекцию:</b>",
         reply_markup=model_col_kb(who, search_type, ALL_GIFT_IDS, page=page),
     )
 
@@ -4518,7 +4601,7 @@ async def cb_mdlrun(cb: CallbackQuery, state: FSMContext):
         await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    # begin_search уже включил флаг — _start_model не должен звать begin_search снова
+    # begin_search уже включил флаг - _start_model не должен звать begin_search снова
     await _start_model(cb, girls=(who == "girls"), single_gid=gid, search_type=search_type,
                        already_answered=True, skip_begin=True)
 
@@ -4533,7 +4616,7 @@ async def cb_mdl_who_legacy(cb: CallbackQuery):
     await cb.answer()
     await safe_edit(
         cb.message,
-        "<b>" + lbl + " — выбери коллекцию:</b>",
+        "<b>" + lbl + " - выбери коллекцию:</b>",
         reply_markup=model_col_kb(who, "market", ALL_GIFT_IDS, page=0),
     )
 
@@ -4816,7 +4899,7 @@ async def cb_pricenft_collect(cb: CallbackQuery):
         return
     global _pricenft_collecting, _pricenft_task
     if _pricenft_collecting:
-        await cb.answer("Сбор уже идёт — жми Стоп", show_alert=True)
+        await cb.answer("Сбор уже идёт - жми Стоп", show_alert=True)
         return
     if not await check_authorized():
         await cb.answer("Сначала авторизуй Telethon", show_alert=True)
@@ -4866,7 +4949,7 @@ async def cb_pricenft_collect(cb: CallbackQuery):
                 except Exception:
                     pass
                 return
-            # collect_pricenft_db сам ставит flag — временно снимем чтобы не got already_running
+            # collect_pricenft_db сам ставит flag - временно снимем чтобы не got already_running
             _pricenft_collecting = False
             result = await collect_pricenft_db(progress_cb=prog, max_models=0)
             _pricenft_collecting = True
@@ -4994,14 +5077,15 @@ async def cb_admin_stats(cb: CallbackQuery):
     pn = pricenft_db_stats()
     await cb.message.answer(
         "<b>Статистика\n\n"
-        "Пользователей: " + str(len(u)) + "\n"
+        "Твоя БД: user_" + str(pn.get("db_user", cb.from_user.id)) + "\n"
+        "Пользователей бота: " + str(len(u)) + "\n"
         "Поисков: " + str(stats["checks"]) + "\n"
         "Найдено: " + str(stats["found"]) + "\n"
         "Коллекций: " + str(len(ALL_GIFT_IDS)) + "\n"
         "PriceNFT БД: " + str(pn.get("models", 0)) + " моделей / "
         + str(pn.get("users", 0)) + " юзеров / "
         + str(pn.get("nfts", 0)) + " nft\n"
-        "Антидубль: " + str(pn.get("seen_owners", 0)) + " аккаунтов / "
+        "Антидубль (твой): " + str(pn.get("seen_owners", 0)) + " аккаунтов / "
         + str(pn.get("seen_gifts", 0)) + " гифтов</b>",
         parse_mode="HTML", reply_markup=admin_kb()
     )
@@ -5139,12 +5223,12 @@ async def main():
             logger.info("Авторизован, коллекций: %d", len(ALL_GIFT_IDS))
             st0 = pricenft_db_stats()
             if st0.get("users", 0) < 50:
-                logger.info("БД мала (%s) — автосбор гифтов", st0.get("users"))
+                logger.info("БД мала (%s) - автосбор гифтов", st0.get("users"))
                 start_bootstrap_gifts_db(notify_chat_id=ADMIN_ID)
             # основной режим: постоянно пишем маркет + PriceNFT в локальную БД
             start_background_db_keeper()
         else:
-            logger.warning("Не авторизован — пройди /start")
+            logger.warning("Не авторизован - пройди /start")
     except Exception as e:
         logger.error("Ошибка старта: %s", e)
     try:

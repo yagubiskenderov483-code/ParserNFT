@@ -11,11 +11,12 @@ secrets.py
 users.json
 *.json
 
-# Локальные SQLite БД (маркет / профили)
+# Локальные SQLite БД (маркет / профили / личные)
 gifts.db
 gifts.db-*
 profile_gifts.db
 profile_gifts.db-*
+data/
 
 # Файлы сессии Telegram
 *.session
