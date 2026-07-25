@@ -2081,30 +2081,11 @@ def pricenft_add_user(model, username, nft_urls=None, uid=None, commit=True):
 
 def seed_pricenft_from_item(item, commit=False):
     """
-    Наполнение БД владельцами (фон/админка: маркет + PriceNFT).
-    Поиск по маркету seed НЕ вызывает — только API-выдача.
+    ОТКЛЮЧЕНО: гифты с маркета в БД не пишем.
+    Маркет-поиск ходит в API и выдаёт сам.
+    Профили копятся только в profile_gifts.db через profile_add_gifts.
     """
-    try:
-        uname = (item.get("username") or "").lstrip("@")
-        title = item.get("title") or item.get("model") or ""
-        nft_url = item.get("nft_url")
-        uid = item.get("owner_id")
-        # Gift #5177… ломает матчинг коллекций — берём имя из slug
-        t = str(title or "").strip()
-        if (not t) or t.startswith("Gift #") or t.startswith("gift #") or t in ("?", "NFT", "None"):
-            slug = gift_slug_of(nft_url) or ""
-            base = re.sub(r"-\d+$", "", slug)
-            if not base or base.lower().startswith("gift") or base.startswith("user:"):
-                return
-            title = base
-        if not uname or not title:
-            return
-        pricenft_add_user(
-            str(title), uname, [nft_url] if nft_url else None,
-            uid=uid, commit=commit,
-        )
-    except Exception:
-        pass
+    return
 
 def _norm_col_name(s):
     return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
@@ -2835,9 +2816,16 @@ async def _pricenft_click_or_send(msg, text):
 
 async def fill_db_from_market_fast(progress_cb=None, parallel=28, target_users=None):
     """
-    Быстрое наполнение БД с маркета до цели (по умолчанию 600к юзеров).
-    Несколько кругов по коллекциям + пагинация. Можно Стопнуть.
+    ОТКЛЮЧЕНО: маркет-гифты в БД не пишем.
+    Маркет выдаём только живым API в do_market_search / do_model_search.
     """
+    st = pricenft_db_stats()
+    if progress_cb:
+        try:
+            await progress_cb("Маркет→БД отключён. Маркет идёт только через API-поиск.")
+        except Exception:
+            pass
+    return {"ok": True, "disabled": True, **st}
     if target_users is None:
         target_users = DB_TARGET_USERS
     await ensure_collections()
@@ -3376,16 +3364,18 @@ _bootstrap_task = None
 
 async def bootstrap_gifts_db(notify_chat_id=None):
     """
-    Автосохранение гифтов в БД после авторизации:
-    1) Быстрый проход по маркету всех коллекций
-    2) Фоновый сбор через @PriceNFTbot
+    После авторизации: маркет в БД НЕ пишем.
+    Профили копятся в profile_gifts.db во время поиска.
+    Опционально — PriceNFTbot (не API-маркет).
     """
     global _pricenft_collecting
     if not await check_authorized():
         return {"ok": False, "error": "not_authorized"}
     await ensure_collections()
     load_pricenft_db()
+    load_profile_db()
     before = pricenft_db_stats()
+    before_p = profile_db_stats()
 
     async def _notify(txt):
         if not notify_chat_id:
@@ -3396,44 +3386,14 @@ async def bootstrap_gifts_db(notify_chat_id=None):
             pass
 
     await _notify(
-        "📦 Сохраняю гифты в БД...\n"
-        "Коллекций: " + str(len(ALL_GIFT_IDS)) + "\n"
-        "Сейчас: " + str(before.get("users", 0)) + " юзеров"
+        "📦 Маркет→БД выключен (маркет только через API-поиск)\n"
+        "Профили: " + str(before_p.get("users", 0)) + " юзеров / "
+        + str(before_p.get("nfts", 0)) + " NFT\n"
+        "Старая market-БД: " + str(before.get("users", 0)) + " юзеров"
     )
-
-    pairs = list(ALL_GIFT_IDS)
-    random.shuffle(pairs)
-    PARALLEL = 15
-    for i in range(0, len(pairs), PARALLEL):
-        chunk = pairs[i:i+PARALLEL]
-        async def one(gid, title):
-            try:
-                items, _ = await fetch_market_page(gid, "", limit=80, newest=True)
-            except Exception:
-                return 0
-            for it in items:
-                it = dict(it)
-                if title and (not it.get("title") or str(it.get("title")) in ("?", "NFT")):
-                    it["title"] = title
-                it["gift_id"] = gid
-                seed_pricenft_from_item(it, commit=False)
-            return len(items)
-        await asyncio.gather(*[one(gid, title) for gid, title in chunk], return_exceptions=True)
-        db_flush(force=True)
-        if (i // PARALLEL) % 4 == 0:
-            save_pricenft_db()
-            mid = pricenft_db_stats()
-            await _notify(
-                "📦 БД: " + str(mid.get("users", 0)) + " юзеров / "
-                + str(mid.get("models", 0)) + " моделей\n"
-                + str(min(i + PARALLEL, len(pairs))) + "/" + str(len(pairs))
-            )
-
-    db_flush(force=True)
-    save_pricenft_db()
-    after_m = pricenft_db_stats()
+    after_m = before
     await _notify(
-        "✅ Гифты с маркета в БД\n"
+        "✅ Готово: маркет не пишем в БД\n"
         "Моделей: " + str(after_m.get("models", 0)) + "\n"
         "Юзеров: " + str(after_m.get("users", 0)) + "\n"
         "Дальше @PriceNFTbot в фоне..."
@@ -3464,11 +3424,11 @@ def start_bootstrap_gifts_db(notify_chat_id=None):
 
 async def background_db_keeper():
     """
-    Основной фоновый режим: постоянно быстро пишет маркет в sqlite,
-    периодически дособирает через @PriceNFTbot (CD 3с).
-    Работает всегда после авторизации — даже когда поиск не идёт.
+    Фон: маркет в БД НЕ пишем (маркет = только live API в поиске).
+    Периодически можно дособирать PriceNFT (не лоты маркета из API).
+    Профильная БД растёт из найденных off-market гифтов.
     """
-    logger.info("background_db_keeper started")
+    logger.info("background_db_keeper started (no market→DB)")
     await asyncio.sleep(5)
     cycle = 0
     while True:
@@ -3476,61 +3436,16 @@ async def background_db_keeper():
             if not await check_authorized():
                 await asyncio.sleep(30)
                 continue
-            # во время поиска не конкурируем за API — маркет и так сидится из выдачи
             if any_searching():
                 await asyncio.sleep(3)
                 continue
             await ensure_collections()
-            pairs = list(ALL_GIFT_IDS) or []
-            if not pairs:
-                await asyncio.sleep(20)
-                continue
-            random.shuffle(pairs)
-            PARALLEL = 22
-            # быстрый проход маркета — основной объём БД до 600к
-            st0 = pricenft_db_stats()
-            if int(st0.get("users", 0) or 0) < DB_TARGET_USERS:
-                # глубокий fill раз в несколько циклов
-                if cycle % 3 == 0:
-                    try:
-                        await fill_db_from_market_fast(
-                            progress_cb=None, parallel=28, target_users=DB_TARGET_USERS
-                        )
-                    except Exception as e:
-                        logger.warning("keeper fill: %s", e)
-            for i in range(0, len(pairs), PARALLEL):
-                if any_searching():
-                    break
-                chunk = pairs[i:i + PARALLEL]
-
-                async def one(gid, title):
-                    try:
-                        items, _ = await fetch_market_page(gid, "", limit=100, newest=True)
-                    except Exception:
-                        return 0
-                    for it in items:
-                        it = dict(it)
-                        if title and (not it.get("title") or str(it.get("title")) in ("?", "NFT")):
-                            it["title"] = title
-                        it["gift_id"] = gid
-                        seed_pricenft_from_item(it, commit=False)
-                    return len(items)
-
-                await asyncio.gather(
-                    *[one(gid, title) for gid, title in chunk],
-                    return_exceptions=True,
-                )
-                db_flush(force=True)
-                # не душим API: короткая пауза между чанками
-                await asyncio.sleep(0.15)
-
-            db_flush(force=True)
-            save_pricenft_db()
             cycle += 1
             st = pricenft_db_stats()
+            st_p = profile_db_stats()
             logger.info(
-                "DB keeper cycle=%s models=%s users=%s nfts=%s",
-                cycle, st.get("models"), st.get("users"), st.get("nfts"),
+                "DB keeper cycle=%s market_db_users=%s profile_users=%s profile_nfts=%s",
+                cycle, st.get("users"), st_p.get("users"), st_p.get("nfts"),
             )
 
             # PriceNFTbot — только если нет FloodWait
@@ -3982,38 +3897,24 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         )
         workers = [asyncio.create_task(worker()) for _ in range(6)]
 
-        # 1) Сначала профильная БД (скрытые NFT), потом маркет-БД как добор кандидатов
+        # 1) ТОЛЬКО профильная БД (скрытые NFT). Маркет-БД не трогаем.
         if still() and found[0] < max_results:
             st_p = profile_db_stats()
-            st_m = pricenft_db_stats()
             try:
                 await status_msg.edit_text(
                     "<b>Профиль / " + esc(who_label(who))
                     + ((" / " + esc(CAT_LABELS.get(cat, str(cat)))) if cat_filter_on else "")
                     + ":</b> профили " + str(st_p.get("users", 0))
-                    + " · маркет " + str(st_m.get("users", 0))
-                    + " · ~15с · лимит " + str(max_results) + "...",
+                    + " · 0 на маркете · ~15с · лимит " + str(max_results) + "...",
                     parse_mode="HTML", reply_markup=stop_kb()
                 )
             except Exception:
                 pass
             models_f = allowed_titles if cat_filter_on else None
             cands = random_users_from_profile_db(
-                limit=max(120, max_results * 10),
+                limit=max(180, max_results * 12),
                 models=models_f,
             )
-            if len(cands) < max(60, max_results * 5):
-                more = random_users_from_db(
-                    limit=max(100, max_results * 8),
-                    models=models_f,
-                )
-                seen_u = {(c.get("username") or "").lower() for c in cands}
-                for h in more:
-                    lu = (h.get("username") or "").lower()
-                    if not lu or lu in seen_u:
-                        continue
-                    seen_u.add(lu)
-                    cands.append(h)
             random.shuffle(cands)
             for h in cands:
                 if not still() or found[0] >= max_results:
@@ -4213,21 +4114,9 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             sw = [asyncio.create_task(soft_worker()) for _ in range(4)]
             models_f = allowed_titles if cat_filter_on else None
             more = random_users_from_profile_db(
-                limit=max(80, max_results * 6),
+                limit=max(120, max_results * 8),
                 models=models_f,
             )
-            if len(more) < max(40, max_results * 3) and time_left() > 3:
-                extra = random_users_from_db(
-                    limit=max(60, max_results * 5),
-                    models=models_f,
-                )
-                seen_u = {(c.get("username") or "").lower() for c in more}
-                for h in extra:
-                    lu = (h.get("username") or "").lower()
-                    if not lu or lu in seen_u:
-                        continue
-                    seen_u.add(lu)
-                    more.append(h)
             random.shuffle(more)
             for h in more:
                 if not still() or found[0] >= max_results:
@@ -4897,39 +4786,9 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             return (time.time() - t0) < PRIMARY_BUDGET and still()
         def total_left():
             return (time.time() - t0) < TOTAL_BUDGET and still()
-        await progress("БД → маркет...")
-        # 1) сначала БД (мгновенно)
-        if allowed_titles:
-            need = max_results
-            titles_q = allowed_titles if single else random.sample(
-                allowed_titles, min(len(allowed_titles), 40)
-            )
-            def _load_hits(ignore_seen=False):
-                out = []
-                for t in titles_q:
-                    part = random_from_pricenft_db(
-                        limit=max(need * 8, 100), model=t, exact=True, ignore_seen=ignore_seen
-                    )
-                    for h in part:
-                        h = dict(h)
-                        h["title"] = t
-                        h["model"] = t
-                        h["source"] = "pricenft_db"
-                        if not h.get("nft_url"):
-                            continue
-                        if not item_matches_collections(h, allowed_gids, allowed_titles):
-                            continue
-                        out.append(h)
-                random.shuffle(out)
-                return out
-            hits = _load_hits(ignore_seen=False)
-            # БД: только мгновенный детект по имени (без get_entity)
-            await emit_pool(hits, use_global_seen=True, enforce_cap=False, allow_enrich=False)
-            if found[0] < max_results:
-                hits2 = _load_hits(ignore_seen=True)
-                await emit_pool(hits2, use_global_seen=False, enforce_cap=False, allow_enrich=False)
-
-        # 2) маркет — ограниченная выборка, меньше параллели
+        await progress("маркет API...")
+        # Маркет по моделям: только живой API, без БД и без seed
+        # 1) маркет — ограниченная выборка
         gids = list(allowed_gids)
         random.shuffle(gids)
         if not single:
@@ -5116,42 +4975,50 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                 hits.append(h)
         random.shuffle(hits)
 
-        for h in hits:
+        # Даже из profile_db — live-проверка: на маркете быть НЕ должно
+        sem0 = asyncio.Semaphore(6)
+
+        async def emit_verified(h):
             if not time_left() or found[0] >= max_results:
-                break
+                return
             uname = (h.get("username") or "").lstrip("@") or None
             uid = h.get("owner_id") or h.get("uid")
             name = h.get("name") or uname or ""
-            nft_url = h.get("nft_url")
-            if is_owner_seen(uid, uname) or is_gift_seen(nft_url):
-                continue
+            if not uname and not uid:
+                return
+            if is_owner_seen(uid, uname):
+                return
             if not pass_who(uname, name, h.get("owner")):
-                continue
+                return
             if region and region != "any":
                 if not region_match_full(None, uname, name, region):
-                    continue
-            show = allowed_titles[0] if single and allowed_titles else (h.get("title") or h.get("model") or "?")
-            await try_send(uid, uname, name, h.get("owner"), nft_url, show, h.get("profile_url"))
+                    return
+            async with sem0:
+                saved = await fetch_saved_gifts(
+                    uid or uname, max_pages=1,
+                    only_off_market=True, require_zero_on_market=True,
+                )
+            if not saved:
+                return
+            matched = [g for g in saved if g.get("nft_url") and gift_ok(g) and not g.get("on_market")]
+            if not matched:
+                return
+            show = allowed_titles[0] if single and allowed_titles else (matched[0].get("title") or h.get("title") or "?")
+            try:
+                profile_add_gifts(uname, uid=uid, gifts=matched, commit=True)
+            except Exception:
+                pass
+            await try_send(uid, uname, name, h.get("owner"), matched[0].get("nft_url"), show, h.get("profile_url"))
 
-        # 2) Кандидаты из маркет-БД — ТОЛЬКО после live-проверки 0 на маркете
+        await asyncio.gather(*[emit_verified(h) for h in hits[: max(max_results * 6, 40)]], return_exceptions=True)
+
+        # 2) Добор только из профильной БД (юзернеймы) + live-проверка 0 на маркете
         if total_left() and found[0] < max_results:
             await progress("проверка профилей...")
-            cands = []
-            for t in titles_q:
-                if not total_left() or found[0] >= max_results:
-                    break
-                part = random_from_pricenft_db(
-                    limit=max(max_results * 6, 80), model=t, exact=True, ignore_seen=True
-                )
-                for h in part:
-                    h = dict(h)
-                    h["title"] = h.get("title") or t
-                    h["model"] = h.get("model") or t
-                    if not h.get("username"):
-                        continue
-                    if who == "girls" and not is_girl(None, h.get("username"), h.get("name") or h.get("username"), soft=False):
-                        continue
-                    cands.append(h)
+            cands = random_users_from_profile_db(
+                limit=max(max_results * 10, 80),
+                models=allowed_titles if allowed_titles else None,
+            )
             random.shuffle(cands)
             cands = cands[: max(max_results * 8, 40)]
             sem = asyncio.Semaphore(6)
@@ -5162,6 +5029,8 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                 uname = (h.get("username") or "").lstrip("@") or None
                 uid = h.get("owner_id") or h.get("uid")
                 if not uname and not uid:
+                    return
+                if who == "girls" and not is_girl(None, uname, h.get("name") or uname, soft=False):
                     return
                 async with sem:
                     saved = await fetch_saved_gifts(
