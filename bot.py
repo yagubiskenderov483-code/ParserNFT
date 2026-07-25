@@ -741,12 +741,10 @@ def is_girl(owner, username=None, name=None, require_photo=False, has_photo=None
         if not (has_girl_name and score >= 5):
             return False
 
-    # рабочий порог как в старой версии: 2 балла (имя/окончание/ник)
-    if market_strict:
-        return score >= 2 and bool(fname0 or uname or bio_l)
-    if not strong and not soft_end and score < 2:
+    # как в рабочей старой версии: хватает 1 балла (имя/окончание/ник/эмодзи)
+    if not (fname0 or uname or bio_l):
         return False
-    return score >= 2 and bool(fname0 or uname or bio_l)
+    return score >= 1
 
 
 # ── MODEL DETECTION ───────────────────────────────────────────────────────────
