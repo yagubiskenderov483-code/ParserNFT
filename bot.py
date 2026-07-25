@@ -422,8 +422,87 @@ def region_match_full(owner, username, name, region_key, gift_senders_langs=None
 async def region_match_async(owner, username, name, region_key, uid=None, gift_senders=None):
     return region_match_full(owner, username, name, region_key, gift_senders)
 
-async def is_girl_async(owner, username=None, name=None, uid=None):
-    return is_girl(owner, username, name)
+async def is_girl_async(owner, username=None, name=None, uid=None, gifts=None):
+    """Жёсткая проверка девушки: bio + аватар из Telegram + подарки."""
+    peer = uid or username
+    ent = owner
+    bio = (getattr(owner, "bio", None) or "") if owner else ""
+    has_photo = bool(getattr(owner, "photo", None)) if owner else False
+    if peer:
+        try:
+            if ent is None:
+                ent = await tg_client.get_entity(peer)
+            try:
+                from telethon.tl.functions.users import GetFullUserRequest
+                full = await tg_client(GetFullUserRequest(ent))
+                fu = getattr(full, "full_user", None) or full
+                bio = (getattr(fu, "about", None) or bio or "") or ""
+                if getattr(fu, "profile_photo", None) is not None:
+                    has_photo = True
+                users = getattr(full, "users", None) or []
+                if users:
+                    ent = users[0]
+                    if getattr(ent, "photo", None) is not None:
+                        has_photo = True
+            except Exception:
+                if ent is not None and getattr(ent, "photo", None) is not None:
+                    has_photo = True
+        except Exception:
+            pass
+    if ent is not None and bio and not getattr(ent, "bio", None):
+        try:
+            setattr(ent, "bio", bio)
+        except Exception:
+            class _O:
+                pass
+            o = _O()
+            o.bio = bio
+            o.username = getattr(ent, "username", None) or username
+            o.first_name = getattr(ent, "first_name", None) or ""
+            o.last_name = getattr(ent, "last_name", None) or ""
+            o.photo = getattr(ent, "photo", None)
+            ent = o
+    return is_girl(
+        ent, username, name,
+        require_photo=True, has_photo=has_photo, gifts=gifts,
+    )
+
+
+def clearly_not_girl(owner, username=None, name=None):
+    """Быстрый отсев явных парней без API (до жёсткой async-проверки)."""
+    uname_raw = (getattr(owner, "username", "") or "") if owner else (username or "")
+    fname_raw = (getattr(owner, "first_name", "") or "") if owner else ""
+    lname_raw = (getattr(owner, "last_name", "") or "") if owner else ""
+    if not fname_raw and name:
+        parts = str(name).strip().split()
+        fname_raw = parts[0] if parts else ""
+        lname_raw = parts[1] if len(parts) > 1 else ""
+    fname0 = re.sub(r"[^a-zа-яёіїєґ]", "", (fname_raw or "").lower().split()[0] if fname_raw else "")
+    tokens = _name_tokens(fname_raw, lname_raw, uname_raw, name, fname0)
+    bio_l = ((getattr(owner, "bio", "") or "") if owner else "").lower()
+    full = (bio_l + " " + (uname_raw or "").lower() + " " + fname0).strip()
+    has_girl_name = bool((fname0 and fname0 in GIRL_NAMES_SET) or (tokens & GIRL_NAMES_SET))
+    has_girl_kw = any(x in full for x in (
+        "girl", "female", "woman", "lady", "девушка", "девочка", "женщина",
+        "she/her", "she her", "♀", "princess", "queen",
+    ))
+    if fname0 in BOY_NAMES_SET and fname0 not in GIRL_NAMES_SET:
+        return True
+    if fname0 in MALE_NAME_EXCEPTIONS_A and not (has_girl_name and has_girl_kw):
+        return True
+    if (tokens & BOY_NAMES_SET) and not has_girl_name:
+        return True
+    full_tokens = set(re.findall(r"[a-zа-яёіїєґ]+", full))
+    if (full_tokens & BOY_SIGNAL_WORDS) and not (has_girl_name and has_girl_kw):
+        return True
+    return False
+
+
+async def girl_ok(owner, username=None, name=None, uid=None, gifts=None):
+    """Быстрый отсев парней → жёсткое подтверждение async (bio/ава/подарки)."""
+    if clearly_not_girl(owner, username, name):
+        return False
+    return await is_girl_async(owner, username, name, uid=uid, gifts=gifts)
 
 
 # ── GIRL DETECTION ────────────────────────────────────────────────────────────
@@ -476,18 +555,27 @@ BOY_NAMES_SET = {
 # Только явные маркеры (без «✨/💫» - слишком шумные)
 GIRL_SIGNALS_STRICT = [
     "she/her", "she her", "♀",
-    "девушка", "женщина", "принцесса", "королева",
-    "girlfriend", "onlyfans",
+    "девушка", "девочка", "женщина", "принцесса", "королева",
+    "girlfriend", "onlyfans", "fansly", "fanvue",
+    "я девушка", "im a girl", "i'm a girl", "girl account",
 ]
 GIRL_UNAME_STRICT = (
     "girl", "lady", "woman", "female", "princess", "queen",
-    "devushka", "devochka", "miss",
+    "devushka", "devochka", "miss", "babe", "mommy",
 )
 GIRL_CHARS_STRICT = set("💅👩👸💃🌸💖💄🌺🦋🌷🌹♀🎀💋🩷❤️💕💞💘💝👄💗")
+# женские намёки в названиях/slug подарков
+GIRL_GIFT_KW = (
+    "heart", "love", "rose", "flower", "diamond", "kiss", "bow",
+    "princess", "queen", "bunny", "kitty", "sakura", "pearl", "candy",
+    "perfume", "lipstick", "ring", "crown", "angel", "fairy", "doll",
+    "сердц", "роз", "цвет", "поцелу", "бант", "принцесс", "корон",
+    "зайч", "китт", "кукл", "ангел", "фея", "жемчуг", "парфюм",
+)
 BOY_SIGNAL_WORDS = {
     "bro","guy","male","man","boy","king","boss","dude","lord","sultan",
     "парень","мужик","мужчина","папа","отец","дядя","сын","брат","муж","он",
-    "he","him","his",
+    "he","him","his","boyaccount","iamguy",
 }
 MALE_NAME_EXCEPTIONS_A = {
     # мужские имена на -a/-я
@@ -499,9 +587,32 @@ MALE_NAME_EXCEPTIONS_A = {
     "jora","жора","kolya","коля","boris","боря","borya","slava","слава",
 }
 
-def is_girl(owner, username=None, name=None):
-    """Детект девушки: жёстко режем парней, но даём нормальную выдачу.
-    Принимаем: известное имя / сильные маркеры / женские окончания (не «саша/женя»)."""
+def _girl_gift_boost(gifts):
+    """Баллы по подаркам в профиле (названия/slug)."""
+    if not gifts:
+        return 0
+    blob = " ".join(
+        str(g.get("title") or "") + " " + str(g.get("nft_url") or "") + " " + str(g.get("model") or "")
+        for g in gifts if isinstance(g, dict)
+    ).lower()
+    if not blob.strip():
+        return 0
+    hits = sum(1 for kw in GIRL_GIFT_KW if kw in blob)
+    score = 0
+    if hits >= 1:
+        score += 1
+    if hits >= 3:
+        score += 2
+    if any(ch in blob for ch in GIRL_CHARS_STRICT):
+        score += 1
+    # много NFT + женские маркеры в гифтах - доп.сигнал
+    if len(gifts) >= 3 and hits >= 2:
+        score += 1
+    return min(score, 4)
+
+def is_girl(owner, username=None, name=None, require_photo=False, has_photo=None, gifts=None):
+    """Жёсткий детект девушки по имени/нику/bio/аве/подаркам.
+    Парней режем сразу. Без сильного сигнала - отказ."""
     bio_raw   = (getattr(owner, "bio",        "") or "") if owner else ""
     uname_raw = (getattr(owner, "username",   "") or "") if owner else (username or "")
     fname_raw = (getattr(owner, "first_name", "") or "") if owner else ""
@@ -510,6 +621,9 @@ def is_girl(owner, username=None, name=None):
         parts = str(name).strip().split()
         fname_raw = parts[0] if parts else ""
         lname_raw = parts[1] if len(parts) > 1 else ""
+    if has_photo is None:
+        has_photo = bool(getattr(owner, "photo", None)) if owner else False
+    _gifts = gifts or []
 
     def _clean(s):
         s = (s or "").lower().strip()
@@ -528,40 +642,49 @@ def is_girl(owner, username=None, name=None):
 
     has_girl_name = bool(
         (fname0 and fname0 in GIRL_NAMES_SET)
-        or (tokens & GIRL_NAMES_SET)
+        or bool(tokens & GIRL_NAMES_SET)
     )
     has_girl_kw = any(x in full for x in (
-        "girl", "female", "woman", "lady", "девушка", "женщина", "she/her", "she her", "♀",
+        "girl", "female", "woman", "lady", "девушка", "девочка", "женщина",
+        "she/her", "she her", "♀", "princess", "queen",
     ))
 
-    # Мужские слова / имена - жёсткий отказ
+    # Мужские маркеры - мгновенный отказ
     if fname0 in BOY_NAMES_SET and fname0 not in GIRL_NAMES_SET:
         return False
-    if fname0 in MALE_NAME_EXCEPTIONS_A and not has_girl_name:
+    if fname0 in MALE_NAME_EXCEPTIONS_A and not (has_girl_name and has_girl_kw):
         return False
-    if (full_tokens & BOY_SIGNAL_WORDS) and not has_girl_kw and not has_girl_name:
+    if (full_tokens & BOY_SIGNAL_WORDS) and not (has_girl_name and has_girl_kw):
         return False
     if (tokens & BOY_NAMES_SET) and not has_girl_name:
         return False
 
     score = 0
+    strong = False
+    gboost = _girl_gift_boost(_gifts)
+
     if has_girl_name:
-        score += 3
+        score += 4
+        strong = True
 
-    # Женские окончания (без шумных «ка/ра/да/ма» в одиночку)
-    STRONG_RU = ("на", "ья", "ия", "ая", "яя", "ина", "ена", "ша", "ля", "ся", "ня", "та", "ла", "ва")
-    STRONG_LAT = ("ia", "ya", "ina", "yna", "ella", "ette", "elle", "ine", "lyn", "isha", "essa")
-    if fname0 and len(fname0) >= 3 and fname0 not in MALE_NAME_EXCEPTIONS_A:
-        if any(fname0.endswith(e) for e in STRONG_RU) or any(fname0.endswith(e) for e in STRONG_LAT):
-            score += 2
-        elif len(fname0) >= 4 and fname0[-1] in ("a", "а", "я"):
-            score += 2
-
-    if any(sig in full or sig in bio_raw or sig in uname_raw for sig in GIRL_SIGNALS_STRICT):
+    # bio / явные маркеры
+    if any(sig in full or sig in bio_raw for sig in GIRL_SIGNALS_STRICT):
+        score += 4
+        strong = True
+    if has_girl_kw:
         score += 2
+        strong = True
+    # bio не пустой + женские слова
+    if bio_l and has_girl_kw:
+        score += 1
+
+    # женские эмодзи в bio/нике/имени
     if any(ch in bio_raw or ch in uname_raw or ch in fname_raw for ch in GIRL_CHARS_STRICT):
         score += 2
+        if any(ch in bio_raw for ch in GIRL_CHARS_STRICT):
+            strong = True
 
+    # username маркеры
     uname_compact = re.sub(r"[^a-zа-яёіїєґ]", "", uname)
     for kw in GIRL_UNAME_STRICT:
         if kw in uname and (
@@ -572,14 +695,42 @@ def is_girl(owner, username=None, name=None):
             or uname.startswith(kw)
             or uname.endswith(kw)
         ):
-            score += 2
+            score += 3
+            strong = True
             break
     for gn in GIRL_NAMES_SET:
-        if len(gn) >= 4 and gn in uname:
+        if len(gn) >= 5 and gn in uname:
             score += 2
             break
 
-    return score >= 2 and bool(fname0 or uname)
+    # подарки
+    if gboost:
+        score += gboost
+        if gboost >= 2:
+            strong = True
+
+    # аватарка - лёгкий плюс (без неё при require_photo режем ниже)
+    if has_photo and (has_girl_name or has_girl_kw or gboost):
+        score += 1
+
+    # окончания - только как доп.балл, одних мало
+    STRONG_RU = ("на", "ья", "ия", "ая", "ина", "ена", "лла", "елла")
+    STRONG_LAT = ("ina", "yna", "ella", "ette", "elle", "issa", "enna")
+    if fname0 and len(fname0) >= 4 and fname0 not in MALE_NAME_EXCEPTIONS_A:
+        if any(fname0.endswith(e) for e in STRONG_RU) or any(fname0.endswith(e) for e in STRONG_LAT):
+            score += 1
+
+    if require_photo and not has_photo:
+        # без авы только супер-явные (имя + bio/kw + высокий score)
+        if not (has_girl_name and has_girl_kw and score >= 7):
+            return False
+
+    # обязательно сильный сигнал: имя / bio / nick / подарки
+    if not strong:
+        return False
+    # жёсткий порог
+    thr = 5 if (has_photo or gboost >= 2) else 6
+    return score >= thr and bool(fname0 or uname or bio_l)
 
 
 # ── MODEL DETECTION ───────────────────────────────────────────────────────────
@@ -1243,7 +1394,7 @@ def item_matches_collections(item, allowed_gids=None, allowed_titles=None):
     """
     Строго: лот принадлежит выбранным коллекциям.
     - market + gift_id из скана выбранной коллекции → доверяем API
-    - иначе slug/title должны совпасть с именем коллекции (БД/профиль)
+    - БД/профиль → slug ОБЯЗАН совпасть с коллекцией (иначе рандом)
     """
     allowed_gids = set(int(x) for x in (allowed_gids or []) if x is not None)
     titles = [t for t in (allowed_titles or []) if t]
@@ -1253,7 +1404,13 @@ def item_matches_collections(item, allowed_gids=None, allowed_titles=None):
 
     src = (item.get("source") or "")
     gid = item.get("gift_id")
-    # Скан маркета по конкретному gift_id - API уже отфильтровал коллекцию
+    slug = gift_slug_of(item.get("nft_url")) or ""
+    if slug.startswith("user:"):
+        return False
+    base = re.sub(r"-\d+$", "", slug)
+    nb = _norm_col_name(base)
+
+    # Маркет: gift_id из скана коллекции - источник истины
     if src == "market" and gid is not None and allowed_gids:
         try:
             if int(gid) in allowed_gids:
@@ -1261,34 +1418,9 @@ def item_matches_collections(item, allowed_gids=None, allowed_titles=None):
         except Exception:
             pass
 
-    slug = gift_slug_of(item.get("nft_url")) or ""
-    if slug.startswith("user:"):
-        return False
-    base = re.sub(r"-\d+$", "", slug)
-    nb = _norm_col_name(base)
-
-    # slug - главный источник для БД/профиля
-    if nb and norms:
-        if nb in norms:
-            return True
-        # slug другой коллекции - мимо (даже если title/gift_id подставили)
-        if src in ("pricenft_db", "db", "profile") or src != "market":
-            return False
-
-    title = item.get("title") or item.get("model") or ""
-    nt = _norm_col_name(title)
-    if nt and norms and nt in norms:
-        # для БД без slug - только exact title
-        if src in ("pricenft_db", "db") and not nb:
-            return True
-        if src not in ("pricenft_db", "db"):
-            return True
-
-    if gid is not None and allowed_gids and src == "market":
-        try:
-            return int(gid) in allowed_gids
-        except Exception:
-            return False
+    # БД / профиль / прочее: только точный slug == коллекция
+    if nb and norms and nb in norms:
+        return True
     return False
 
 async def resolve_collections_for_cat(cat, gift_ids=None):
@@ -1841,6 +1973,7 @@ def random_from_pricenft_db(limit=25, model=None, exact=False):
                 rows.extend(part)
             random.shuffle(rows)
 
+        want_norm = _norm_col_name(model) if (model and exact) else None
         for slug, url, mk, uname, uid in rows:
             if not uname:
                 continue
@@ -1853,6 +1986,14 @@ def random_from_pricenft_db(limit=25, model=None, exact=False):
                 continue
             if slug and str(slug).startswith("user:"):
                 url = None
+            # exact модель: slug базы обязан совпасть с коллекцией
+            if want_norm:
+                base = _norm_col_name(re.sub(r"-\d+$", "", str(slug or "")))
+                mk_n = _norm_col_name(mk)
+                if not base or base != want_norm:
+                    continue
+                if mk_n and mk_n != want_norm:
+                    continue
             seen_u.add(lu)
             results.append({
                 "owner": None, "owner_id": uid,
@@ -2808,7 +2949,7 @@ async def deliver_pricenft_random(status_msg, max_results=20, girls_only=False, 
         if is_trader_account(owner, uname, name):
             mark_seen(oid, uname, None)
             continue
-        if girls_only and not is_girl(owner, uname, name):
+        if girls_only and not await girl_ok(owner, uname, name, uid=oid):
             continue
         if region and region != "any":
             if not region_match_full(owner, uname, name, region):
@@ -2988,7 +3129,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         if is_trader_account(owner_obj, username, name):
             stats_skip["trader"] += 1
             return
-        if girls_only and not is_girl(owner_obj, username, name):
+        if girls_only and clearly_not_girl(owner_obj, username, name):
             stats_skip["girl"] += 1
             return
         if region and region != "any":
@@ -3003,6 +3144,10 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             return
         if not saved:
             stats_skip["empty"] += 1
+            return
+
+        if girls_only and not await girl_ok(owner_obj, username, name, uid=uid, gifts=saved):
+            stats_skip["girl"] += 1
             return
 
         hidden = pick_hidden(saved)
@@ -3167,7 +3312,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                     ln = (getattr(u_obj, "last_name", "") or "")
                     uname = getattr(u_obj, "username", None)
                     name = (fn + " " + ln).strip()
-                    if girls_only and not is_girl(u_obj, uname, name):
+                    if girls_only and clearly_not_girl(u_obj, uname, name):
                         continue
                     p_url = ("https://t.me/" + uname) if uname else ("tg://user?id=" + str(uid))
                     await emit_cand(uid, {
@@ -3216,12 +3361,14 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                         peer = uid or username
                         if not peer or is_owner_seen(uid, username):
                             continue
-                        if girls_only and not is_girl(owner_obj, username, name):
+                        if girls_only and clearly_not_girl(owner_obj, username, name):
                             continue
                         saved = await fetch_saved_gifts(
                             peer, max_pages=1, only_off_market=True, require_zero_on_market=False
                         )
                         if not saved:
+                            continue
+                        if girls_only and not await girl_ok(owner_obj, username, name, uid=uid, gifts=saved):
                             continue
                         # тот же фильтр категории - не пускаем дешман в 5-20к
                         hidden = pick_hidden(saved)
@@ -3468,7 +3615,10 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 # фильтр по цене ЛОТА в категории (не floor коллекции)
                 if not price_in_cat(price, cat):
                     continue
-                if girls_only and not is_girl(item.get("owner"), item.get("username"), item.get("name")):
+                if girls_only and not await girl_ok(
+                    item.get("owner"), item.get("username"), item.get("name"),
+                    uid=item.get("owner_id"),
+                ):
                     continue
                 if region and region != "any":
                     if not region_match_full(item.get("owner"), item.get("username"), item.get("name"), region):
@@ -3569,22 +3719,35 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
     else:
         hard_cap = max(3, min(MAX_PER_COLLECTION, (max_results + n_cols - 1) // max(1, min(n_cols, 10))))
     page_limit = 100 if (girls_only or single) else 80
-    page_count = 5 if single else (4 if girls_only else 3)
+    # одна модель - копаем глубже, чтобы не уходить в чужие гифты из БД
+    page_count = 8 if single else (5 if girls_only else 3)
     label = allowed_titles[0] if single and allowed_titles else (str(n_cols) + " коллекций")
 
     def _item_gid(item):
         gid = item.get("gift_id")
         if gid is not None:
             try:
-                return int(gid)
+                ig = int(gid)
+                if ig in allowed_gids:
+                    return ig
             except Exception:
                 pass
+        # сначала slug - главный ключ модели
+        slug = gift_slug_of(item.get("nft_url")) or ""
+        base = _norm_col_name(re.sub(r"-\d+$", "", slug))
+        if base:
+            for g, t in title_by_gid.items():
+                if t and _norm_col_name(t) == base and int(g) in allowed_gids:
+                    return int(g)
+            for t, g in NFT_COLLECTIONS.items():
+                if _norm_col_name(t) == base and int(g) in allowed_gids:
+                    return int(g)
         title = str(item.get("title") or item.get("model") or "").strip()
         if not title:
             return None
         nt = _norm_col_name(title)
         for g, t in title_by_gid.items():
-            if t and _norm_col_name(t) == nt:
+            if t and _norm_col_name(t) == nt and int(g) in allowed_gids:
                 return int(g)
         return None
 
@@ -3598,6 +3761,23 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
         nft_url = item.get("nft_url")
         slug = gift_slug_of(nft_url)
         gid = _item_gid(item)
+        # при выборе 1 модели - gid обязан быть этой коллекцией
+        if single and allowed_gids and (gid is None or gid not in allowed_gids):
+            # маркет со скана этой коллекции уже проставил gift_id
+            try:
+                raw = item.get("gift_id")
+                if raw is None or int(raw) not in allowed_gids:
+                    return False
+                gid = int(raw)
+            except Exception:
+                return False
+        # slug чужой коллекции - никогда
+        if slug and allowed_titles:
+            base = _norm_col_name(re.sub(r"-\d+$", "", slug))
+            norms = {_norm_col_name(t) for t in allowed_titles if t}
+            src = item.get("source") or ""
+            if base and norms and base not in norms and src != "market":
+                return False
         ok_key = oid if oid else ("u:" + str(uname).lower())
         if not ignore_global:
             if is_owner_seen(oid, uname) or is_gift_seen(slug):
@@ -3698,7 +3878,10 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 it["source"] = "market"
                 if title:
                     it["title"] = title
-                if girls_only and not is_girl(it.get("owner"), it.get("username"), it.get("name")):
+                if girls_only and not await girl_ok(
+                    it.get("owner"), it.get("username"), it.get("name"),
+                    uid=it.get("owner_id"),
+                ):
                     continue
                 if region and region != "any":
                     if not region_match_full(it.get("owner"), it.get("username"), it.get("name"), region):
@@ -3723,6 +3906,8 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
         gids = list(allowed_gids)
         random.shuffle(gids)
         PARALLEL = 8 if single else 16
+        # подряд одинаковые коллекции нельзя при n_cols>1 (даже на доборе)
+        consec_multi = True
 
         async def run_pass(ignore_global=False, enforce_cap=True, enforce_consec=True):
             for i in range(0, len(gids), PARALLEL):
@@ -3743,7 +3928,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 except Exception:
                     pass
 
-        await run_pass(ignore_global=False, enforce_cap=True, enforce_consec=True)
+        await run_pass(ignore_global=False, enforce_cap=True, enforce_consec=consec_multi)
 
         def _prep_db_hit(h, t):
             """Только эта коллекция: exact title + slug обязан совпасть с моделью."""
@@ -3759,7 +3944,12 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 return None
             if not item_matches_collections(h, allowed_gids, allowed_titles):
                 return None
-            if single and allowed_gids:
+            # проставляем gift_id выбранной коллекции
+            for g, tt in title_by_gid.items():
+                if tt and _norm_col_name(tt) == want and int(g) in allowed_gids:
+                    h["gift_id"] = int(g)
+                    break
+            if single and allowed_gids and h.get("gift_id") is None:
                 h["gift_id"] = next(iter(allowed_gids))
             return h
 
@@ -3782,17 +3972,20 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             for h in hits:
                 if not is_searching or found[0] >= max_results:
                     break
-                if girls_only and not is_girl(None, h.get("username"), h.get("name")):
+                if girls_only and not await girl_ok(
+                    None, h.get("username"), h.get("name"), uid=h.get("owner_id"),
+                ):
                     continue
                 if region and region != "any":
                     if not region_match_full(None, h.get("username"), h.get("name"), region):
                         continue
-                await send_item(h, ignore_global=False, enforce_cap=True, enforce_consec=True)
+                await send_item(h, ignore_global=False, enforce_cap=True, enforce_consec=consec_multi)
 
         if is_searching and found[0] < max_results:
-            await run_pass(ignore_global=True, enforce_cap=True, enforce_consec=True)
+            await run_pass(ignore_global=True, enforce_cap=True, enforce_consec=consec_multi)
 
         # финальный добор: маркет ещё раз + БД только с верным slug
+        # cap можно ослабить, подряд одинаковые при multi - нельзя
         if is_searching and found[0] < max_results:
             if allowed_titles:
                 need = max_results - found[0]
@@ -3806,11 +3999,13 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 for h in hits:
                     if not is_searching or found[0] >= max_results:
                         break
-                    if girls_only and not is_girl(None, h.get("username"), h.get("name")):
+                    if girls_only and not await girl_ok(
+                        None, h.get("username"), h.get("name"), uid=h.get("owner_id"),
+                    ):
                         continue
-                    await send_item(h, ignore_global=True, enforce_cap=False, enforce_consec=(not single))
+                    await send_item(h, ignore_global=True, enforce_cap=False, enforce_consec=consec_multi)
             if is_searching and found[0] < max_results:
-                await run_pass(ignore_global=True, enforce_cap=False, enforce_consec=(not single))
+                await run_pass(ignore_global=True, enforce_cap=False, enforce_consec=consec_multi)
 
         db_flush(force=True)
         try:
@@ -3871,7 +4066,7 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                 return
         if is_owner_seen(uid, username):
             return
-        if girls_only and not is_girl(owner_obj, username, name):
+        if girls_only and clearly_not_girl(owner_obj, username, name):
             return
         if region and region != "any":
             if not region_match_full(owner_obj, username, name, region):
@@ -3888,6 +4083,8 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
         ]
         if not matched:
             return
+        if girls_only and not await girl_ok(owner_obj, username, name, uid=uid, gifts=saved):
+            return
         if uid is None and username:
             try:
                 ent = await tg_client.get_entity(username)
@@ -3901,28 +4098,32 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                 return
             seen_owners.add(ok_key)
             found[0] += 1
+        # показываем ТОЛЬКО выбранную модель (не чужие гифты профиля)
         mark_seen(uid, username, matched[0].get("nft_url"))
+        for g in matched[1:8]:
+            mark_seen(None, None, g.get("nft_url"))
         profile_url = info.get("profile_url") or (("https://t.me/" + username) if username else None)
         show = allowed_titles[0] if single and allowed_titles else (matched[0].get("title") or "?")
         if uid:
             cache_owner(uid, owner_obj, username, name, profile_url, matched)
         lines = []
         seen_s = set()
-        for g in matched[:5]:
+        # при 1 модели - до 3 ссылок именно этой коллекции
+        for g in matched[:(3 if single else 5)]:
             u = g.get("nft_url")
             if not u or u in seen_s:
                 continue
             seen_s.add(u)
-            lines.append('\n<a href="' + u + '">' + esc(str(g.get("title") or show)) + "</a>")
+            lines.append('\n<a href="' + u + '">' + esc(str(show if single else (g.get("title") or show))) + "</a>")
         txt = (
             "<b>" + fmt_owner(owner_obj, username, name)
             + "\n🎨 " + esc(str(show))
-            + "\nNFT в профиле: " + str(len(matched)) + "</b>"
+            + "\nNFT этой модели: " + str(len(matched)) + "</b>"
             + "".join(lines)
         )
         kb = owner_card_kb(
             username, profile_url, uid or 0,
-            nft_url_for_msg=matched[0].get("nft_url") if len(matched) == 1 else None,
+            nft_url_for_msg=matched[0].get("nft_url"),
             nft_count=len(matched),
         )
         try:
@@ -3956,12 +4157,25 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
         )
         for t in titles_q:
             cands.extend(random_from_pricenft_db(
-                limit=max(max_results * (24 if girls_only else 14), 160),
+                limit=max(max_results * (28 if girls_only else 16), 200),
                 model=t, exact=True,
             ))
-        # общие юзеры - только если «все коллекции»; при 1 гифте не мешаем рандомом
+        # общие юзеры - только если «все коллекции»; при 1 гифте строго без рандома
         if not single:
             cands.extend(random_users_from_db(limit=max(300 if girls_only else 150, max_results * 12)))
+        # отсев кандидатов с чужим slug ещё до fetch профиля
+        if single and allowed_titles:
+            want = _norm_col_name(allowed_titles[0])
+            filtered = []
+            for h in cands:
+                slug = gift_slug_of(h.get("nft_url")) or ""
+                base = _norm_col_name(re.sub(r"-\d+$", "", slug))
+                if base and base == want:
+                    filtered.append(h)
+                elif not slug:
+                    # username без slug - можно проверить профиль позже
+                    filtered.append(h)
+            cands = filtered
         random.shuffle(cands)
 
         sem = asyncio.Semaphore(20)
