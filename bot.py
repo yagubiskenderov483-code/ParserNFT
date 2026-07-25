@@ -4905,7 +4905,7 @@ async def _start_market(cb, cat, who="all"):
                 do_market_search(status, ids, cat=cat, who=who,
                                  boost=boost, max_results=lim, region=reg,
                                  chat_id=chat_id, search_token=token),
-                timeout=22
+                timeout=28
             )
         except asyncio.TimeoutError:
             end_search(chat_id, token)
