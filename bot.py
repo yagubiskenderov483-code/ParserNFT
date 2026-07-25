@@ -18,7 +18,7 @@ from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, WebAppInfo
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -33,6 +33,12 @@ SESSION_NAME = "nft_session"
 USERS_FILE   = "users.json"
 ONBOARDING_FILE = "onboarding_done.json"
 DATA_DIR     = "data"
+
+# Кнопки главного меню
+REVIEWS_URL  = "https://t.me/otzivneptun"          # канал отзывов
+MINI_APP_URL = "https://t.me/Neptunteambot"        # миниапп / бот Neptun
+# если это https веб-приложение (не t.me) - откроется как WebApp
+MINI_APP_IS_WEBAPP = False
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1021,11 +1027,24 @@ async def safe_edit(msg, text, reply_markup=None):
             return False
 
 def main_menu_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Поиск",      callback_data="search_mode_select")],
-        [InlineKeyboardButton(text="⚙️ Настройки",  callback_data="settings_menu"),
+    rows = [
+        [InlineKeyboardButton(text="🔍 Поиск", callback_data="search_mode_select")],
+        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings_menu"),
          InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
-    ])
+    ]
+    extra = []
+    if REVIEWS_URL:
+        extra.append(InlineKeyboardButton(text="💬 Отзывы", url=REVIEWS_URL))
+    if MINI_APP_URL:
+        if MINI_APP_IS_WEBAPP:
+            extra.append(InlineKeyboardButton(
+                text="📱 Миниапп", web_app=WebAppInfo(url=MINI_APP_URL)
+            ))
+        else:
+            extra.append(InlineKeyboardButton(text="📱 Миниапп", url=MINI_APP_URL))
+    if extra:
+        rows.append(extra)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def search_mode_select_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
