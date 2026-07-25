@@ -2996,7 +2996,8 @@ def _make_nft_lines(items):
 async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                            boost=100, min_gifts=1, max_gifts=0,
                            max_results=30, region="any"):
-    """Маркет: быстрый стрим лотов. Жёсткий лимит выдачи. Цена лота по категории."""
+    """Маркет: быстрый стрим лотов. Жёсткий лимит выдачи. Цена лота по категории.
+    Разнообразие: не одна коллекция подряд + лимит на коллекцию."""
     global is_searching
     is_searching = True
     try:
@@ -3008,14 +3009,24 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
     found       = [0]
     seen_slugs  = set()
     seen_owners = set()
+    last_gid    = [None]
+    col_counts  = {}
+    n_cols = max(1, len(gift_ids or []))
+    if n_cols <= 1:
+        hard_cap = max_results
+    elif n_cols <= 8:
+        hard_cap = max(2, (max_results + 3) // 4)
+    else:
+        hard_cap = max(1, min(MAX_PER_COLLECTION, max(1, max_results // 10)))
 
-    async def send_one(item, ignore_global=False):
+    async def send_one(item, ignore_global=False, enforce_div=True):
         oid = item.get("owner_id")
         uname = item.get("username")
         if not oid and not uname:
             return False
         nft_url = item.get("nft_url")
         slug = gift_slug_of(nft_url)
+        gid = item.get("gift_id")
         ok_key = oid if oid else ("u:" + str(uname).lower())
         if not ignore_global:
             if is_owner_seen(oid, uname) or is_gift_seen(slug):
@@ -3027,15 +3038,28 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 return False
             if slug and slug in seen_slugs:
                 return False
+            # не забиваем выдачу одной коллекцией и не шлём одинаковые подряд
+            if enforce_div and n_cols > 1 and gid is not None:
+                if col_counts.get(gid, 0) >= hard_cap:
+                    return False
+                if last_gid[0] is not None and last_gid[0] == gid and found[0] + 1 < max_results:
+                    return False
             seen_owners.add(ok_key)
             if slug:
                 seen_slugs.add(slug)
+            if gid is not None:
+                col_counts[gid] = col_counts.get(gid, 0) + 1
+            prev_last = last_gid[0]
+            last_gid[0] = gid
             found[0] += 1
             slot = found[0]
         # жёсткий стоп после резерва
         if slot > max_results:
             async with lock:
                 found[0] = max(0, found[0] - 1)
+                if gid is not None and col_counts.get(gid, 0) > 0:
+                    col_counts[gid] -= 1
+                last_gid[0] = prev_last
             return False
         mark_seen(oid, uname, nft_url)
         try:
@@ -3069,9 +3093,12 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 seen_owners.discard(ok_key)
                 if slug:
                     seen_slugs.discard(slug)
+                if gid is not None and col_counts.get(gid, 0) > 0:
+                    col_counts[gid] -= 1
+                last_gid[0] = prev_last
             return False
 
-    async def scan_col(gid, title="", ignore_global=False):
+    async def scan_col(gid, title="", ignore_global=False, enforce_div=True):
         if not is_searching or found[0] >= max_results:
             return
         offset = ""
@@ -3102,7 +3129,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 if region and region != "any":
                     if not region_match_full(item.get("owner"), item.get("username"), item.get("name"), region):
                         continue
-                await send_one(item, ignore_global=ignore_global)
+                await send_one(item, ignore_global=ignore_global, enforce_div=enforce_div)
             if not nxt:
                 return
             offset = nxt
@@ -3119,13 +3146,14 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
         random.shuffle(valid_pairs)
 
         PARALLEL = 20
-        async def run_pass(ignore_global=False):
+        async def run_pass(ignore_global=False, enforce_div=True):
             for i in range(0, len(valid_pairs), PARALLEL):
                 if not is_searching or found[0] >= max_results:
                     break
                 chunk = valid_pairs[i:i+PARALLEL]
                 await asyncio.gather(
-                    *[scan_col(gid, t, ignore_global=ignore_global) for gid, t in chunk],
+                    *[scan_col(gid, t, ignore_global=ignore_global, enforce_div=enforce_div)
+                      for gid, t in chunk],
                     return_exceptions=True,
                 )
                 try:
@@ -3136,10 +3164,13 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 except Exception:
                     pass
 
-        await run_pass(ignore_global=False)
+        await run_pass(ignore_global=False, enforce_div=True)
         # если антидубль всё съел — второй проход без глобального seen (только в рамках поиска)
         if is_searching and found[0] < max_results:
-            await run_pass(ignore_global=True)
+            await run_pass(ignore_global=True, enforce_div=True)
+        # добор без разнообразия, если из-за cap/подряд недобрали
+        if is_searching and found[0] < max_results and n_cols > 1:
+            await run_pass(ignore_global=True, enforce_div=False)
 
         db_flush(force=True)
         try:
@@ -3156,7 +3187,8 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
 # ── SEARCH CORE: MODEL ────────────────────────────────────────────────────────
 async def do_model_search(status_msg, gift_ids, girls_only=False,
                           max_results=30, region="any"):
-    """Модель: быстрый стрим + добор из БД. Жёсткий лимит выдачи."""
+    """Модель: быстрый стрим + добор из БД. Жёсткий лимит выдачи.
+    При нескольких коллекциях — без одинаковых подряд + лимит на коллекцию."""
     global is_searching
     is_searching = True
     try:
@@ -3168,6 +3200,8 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
     found       = [0]
     seen_slugs  = set()
     seen_owners = set()
+    last_gid    = [None]
+    col_counts  = {}
     title_by_gid = {gid: title for gid, title in ALL_GIFT_IDS}
     for gid in gift_ids:
         if gid not in title_by_gid:
@@ -3175,14 +3209,35 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 if i == gid:
                     title_by_gid[gid] = t
                     break
+    n_cols = max(1, len(gift_ids or []))
+    if n_cols <= 1:
+        hard_cap = max_results
+    elif n_cols <= 8:
+        hard_cap = max(2, (max_results + 3) // 4)
+    else:
+        hard_cap = max(1, min(MAX_PER_COLLECTION, max(1, max_results // 10)))
 
-    async def send_item(item, ignore_global=False):
+    def _item_gid(item):
+        gid = item.get("gift_id")
+        if gid is not None:
+            return gid
+        # добор из БД: маппим по title/model
+        title = str(item.get("title") or item.get("model") or "").strip()
+        if not title:
+            return None
+        for g, t in title_by_gid.items():
+            if t and t.lower() == title.lower():
+                return g
+        return None
+
+    async def send_item(item, ignore_global=False, enforce_div=True):
         oid = item.get("owner_id")
         uname = item.get("username")
         nft_url = item.get("nft_url")
         slug = gift_slug_of(nft_url)
         if not oid and not uname:
             return False
+        gid = _item_gid(item)
         ok_key = oid if oid else ("u:" + str(uname).lower())
         if not ignore_global:
             if is_owner_seen(oid, uname) or is_gift_seen(slug):
@@ -3194,14 +3249,26 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 return False
             if slug and slug in seen_slugs:
                 return False
+            if enforce_div and n_cols > 1 and gid is not None:
+                if col_counts.get(gid, 0) >= hard_cap:
+                    return False
+                if last_gid[0] is not None and last_gid[0] == gid and found[0] + 1 < max_results:
+                    return False
             seen_owners.add(ok_key)
             if slug:
                 seen_slugs.add(slug)
+            if gid is not None:
+                col_counts[gid] = col_counts.get(gid, 0) + 1
+            prev_last = last_gid[0]
+            last_gid[0] = gid
             found[0] += 1
             slot = found[0]
         if slot > max_results:
             async with lock:
                 found[0] = max(0, found[0] - 1)
+                if gid is not None and col_counts.get(gid, 0) > 0:
+                    col_counts[gid] -= 1
+                last_gid[0] = prev_last
             return False
         mark_seen(oid, uname, nft_url)
         try:
@@ -3244,9 +3311,12 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 seen_owners.discard(ok_key)
                 if slug:
                     seen_slugs.discard(slug)
+                if gid is not None and col_counts.get(gid, 0) > 0:
+                    col_counts[gid] -= 1
+                last_gid[0] = prev_last
             return False
 
-    async def scan_col(gid, ignore_global=False):
+    async def scan_col(gid, ignore_global=False, enforce_div=True):
         title = title_by_gid.get(gid) or ""
         offset = ""
         for _ in range(2):
@@ -3271,7 +3341,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 if region and region != "any":
                     if not region_match_full(it.get("owner"), it.get("username"), it.get("name"), region):
                         continue
-                await send_item(it, ignore_global=ignore_global)
+                await send_item(it, ignore_global=ignore_global, enforce_div=enforce_div)
             if not nxt:
                 return
             offset = nxt
@@ -3288,12 +3358,13 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
         random.shuffle(gids)
         PARALLEL = 16
 
-        async def run_pass(ignore_global=False):
+        async def run_pass(ignore_global=False, enforce_div=True):
             for i in range(0, len(gids), PARALLEL):
                 if not is_searching or found[0] >= max_results:
                     break
                 await asyncio.gather(
-                    *[scan_col(g, ignore_global=ignore_global) for g in gids[i:i+PARALLEL]],
+                    *[scan_col(g, ignore_global=ignore_global, enforce_div=enforce_div)
+                      for g in gids[i:i+PARALLEL]],
                     return_exceptions=True,
                 )
                 try:
@@ -3304,7 +3375,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 except Exception:
                     pass
 
-        await run_pass(ignore_global=False)
+        await run_pass(ignore_global=False, enforce_div=True)
 
         # добор из БД строго до лимита
         if is_searching and found[0] < max_results:
@@ -3322,10 +3393,29 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                     break
                 if girls_only and not is_girl(None, h.get("username"), h.get("name")):
                     continue
-                await send_item(h, ignore_global=False)
+                await send_item(h, ignore_global=False, enforce_div=True)
 
         if is_searching and found[0] < max_results:
-            await run_pass(ignore_global=True)
+            await run_pass(ignore_global=True, enforce_div=True)
+        if is_searching and found[0] < max_results and n_cols > 1:
+            # добор: сначала БД без разнообразия, потом маркет
+            titles = [title_by_gid[g] for g in gift_ids if title_by_gid.get(g)]
+            need = max_results - found[0]
+            hits = []
+            if titles:
+                for t in titles:
+                    hits.extend(random_from_pricenft_db(limit=max(need * 4, 40), model=t))
+            else:
+                hits = random_from_pricenft_db(limit=max(need * 5, 60))
+            random.shuffle(hits)
+            for h in hits:
+                if not is_searching or found[0] >= max_results:
+                    break
+                if girls_only and not is_girl(None, h.get("username"), h.get("name")):
+                    continue
+                await send_item(h, ignore_global=True, enforce_div=False)
+            if is_searching and found[0] < max_results:
+                await run_pass(ignore_global=True, enforce_div=False)
 
         db_flush(force=True)
         try:
