@@ -77,13 +77,14 @@ TRADER_NAME_KW = (
 PRICENFT_BOT = "PriceNFTbot"
 PRICENFT_DB_FILE = "pricenft_db.json"   # legacy, мигрируем в sqlite
 GIFTS_DB_FILE = "gifts.db"             # быстрая БД (миллионы записей)
-PRICENFT_MSG_CD = 3.0
+PRICENFT_MSG_CD = 3.2
 WRITE_MSG = "привет, ты продаешь свой нфт подарок или нет"
 _pricenft_collecting = False
 _pricenft_stop = False
 _pricenft_task = None
 _pricenft_entity = None                 # кэш peer — без ResolveUsername
 _pricenft_flood_until = 0.0             # unix time, пока нельзя трогать PriceNFT
+_pricenft_cursor = 0                    # продолжение сбора с модели N
 _bootstrap_task = None
 _keeper_task = None
 _db_conn = None
@@ -2278,14 +2279,26 @@ def random_users_from_db(limit=400, models=None):
         logger.warning("random_users_from_db: %s", e)
     return out
 
+_PRICENFT_SKIP_USERS = {
+    "pricenftbot", "gift_alerts", "tonnel_network_bot", "username", "telegram",
+    "durov", "gif", "share", "addstickers", "proxy", "premium",
+}
+
 def _parse_pricenft_text(text):
-    """Достаём @username и nft-ссылки из ответа PriceNFTbot."""
+    """Достаём @username / t.me/user и nft-ссылки из ответа PriceNFTbot."""
     text = text or ""
     users = []
     nfts = []
     for m in re.finditer(r"@([A-Za-z][A-Za-z0-9_]{3,})", text):
         u = m.group(1)
-        if u.lower() in ("pricenftbot", "gift_alerts", "tonnel_network_bot", "username", "telegram"):
+        if u.lower() in _PRICENFT_SKIP_USERS:
+            continue
+        users.append(u)
+    # t.me/username (не nft/, не joinchat, не +)
+    for m in re.finditer(r"(?:https?://)?t\.me/([A-Za-z][A-Za-z0-9_]{3,})(?:\b|/|$)", text, re.I):
+        u = m.group(1)
+        lu = u.lower()
+        if lu in _PRICENFT_SKIP_USERS or lu in ("nft", "share", "proxy", "addstickers", "s"):
             continue
         users.append(u)
     for m in re.finditer(r"(?:https?://)?t\.me/nft/([A-Za-z0-9_\-]+)", text, re.I):
@@ -2302,6 +2315,26 @@ def _parse_pricenft_text(text):
             seen_n.add(n)
             out_n.append(n)
     return out_u, out_n
+
+def _users_from_buttons(msg):
+    """Юзернеймы иногда приходят кнопками, не текстом."""
+    out = []
+    for t in _btn_texts_from_msg(msg):
+        s = str(t or "").strip()
+        if not s:
+            continue
+        m = re.fullmatch(r"@?([A-Za-z][A-Za-z0-9_]{3,31})", s)
+        if not m:
+            continue
+        u = m.group(1)
+        if u.lower() in _PRICENFT_SKIP_USERS:
+            continue
+        # отсекаем явные nav/action кнопки
+        low = u.lower()
+        if low in ("next", "back", "menu", "search", "model", "cancel", "more"):
+            continue
+        out.append(u)
+    return out
 
 async def _pricenft_wait_cd():
     """CD 3 сек перед каждым сообщением к PriceNFTbot."""
@@ -2505,25 +2538,25 @@ async def _pricenft_ingest_messages(model_name, messages):
     for msg in messages or []:
         if getattr(msg, "out", False):
             continue
-        blob = getattr(msg, "message", "") or ""
+        blob = getattr(msg, "message", "") or getattr(msg, "raw_text", "") or ""
         for ent in (getattr(msg, "entities", None) or []):
             url = getattr(ent, "url", None)
             if url:
                 blob += "\n" + url
-            # text mention / url mention
             user_id = getattr(ent, "user_id", None)
             if user_id and hasattr(ent, "offset") and hasattr(ent, "length"):
                 try:
-                    mention = blob[ent.offset:ent.offset + ent.length]
+                    mention = (getattr(msg, "message", "") or "")[ent.offset:ent.offset + ent.length]
                     if mention.startswith("@"):
                         blob += "\n" + mention
                 except Exception:
                     pass
         users, nfts = _parse_pricenft_text(blob)
-        # если модель не задана — пробуем вытащить из заголовка/текста
+        for bu in _users_from_buttons(msg):
+            if bu not in users:
+                users.append(bu)
         mname = model_name
         if not mname:
-            # часто первая строка — название модели
             first = (blob.strip().splitlines() or [""])[0].strip()
             if first and len(first) < 60 and not first.startswith("@"):
                 mname = first
@@ -2532,7 +2565,6 @@ async def _pricenft_ingest_messages(model_name, messages):
         for u in users:
             if pricenft_add_user(mname, u, nfts, commit=False):
                 added += 1
-        # nft slug → model hint (PlushPepe-123)
         for nu in nfts:
             slug = nu.rsplit("/", 1)[-1]
             base = re.sub(r"-\d+$", "", slug)
@@ -2542,6 +2574,47 @@ async def _pricenft_ingest_messages(model_name, messages):
                     pricenft_add_user(base, u, [nu], commit=False)
     db_flush(force=True)
     return added
+
+async def _pricenft_ingest_model_pages(model_name, max_pages=8):
+    """
+    После выбора модели: забираем юзеров и листаем «Далее/Ещё»,
+    иначе бот отдаёт 1 страницу и сбор «замирает» на одной записи.
+    """
+    total = 0
+    for page in range(max_pages):
+        if _pricenft_stop:
+            break
+        await asyncio.sleep(0.8)
+        msgs = await _pricenft_latest(12)
+        got = await _pricenft_ingest_messages(model_name, msgs)
+        total += got
+        last = next((m for m in msgs if not getattr(m, "out", False)), None)
+        btns = _btn_texts_from_msg(last) if last else []
+        nxt = _find_btn_text(btns, ("далее", "next", "ещё", "еще", "more", "→", "»", "продолж"))
+        if not nxt:
+            break
+        try:
+            await _pricenft_click_or_send(last, nxt)
+            await asyncio.sleep(PRICENFT_MSG_CD)
+        except FloodWaitError as e:
+            sec = min(int(getattr(e, "seconds", 5) or 5), 45)
+            logger.warning("pricenft page flood sleep %ss", sec)
+            await asyncio.sleep(sec)
+            break
+        except Exception:
+            break
+    # назад к списку моделей
+    try:
+        msgs = await _pricenft_latest(3)
+        last = next((m for m in msgs if not getattr(m, "out", False)), None)
+        btns = _btn_texts_from_msg(last) if last else []
+        back = _find_btn_text(btns, ("назад", "back", "←", "меню", "menu", "поиск", "search"))
+        if back:
+            await _pricenft_click_or_send(last, back)
+            await asyncio.sleep(PRICENFT_MSG_CD)
+    except Exception:
+        pass
+    return total
 
 async def resolve_pricenft_hits(hits, limit=None):
     """Резолвим username → entity/id для выдачи в боте."""
@@ -2591,15 +2664,15 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
     """
     Сборщик владельцев из @PriceNFTbot в локальную БД.
     max_models=0 — без лимита (пока не нажмут Стоп).
-    Можно остановить в любой момент: stop_pricenft_collect().
+    FloodWait на одной модели НЕ роняет весь сбор — ждём коротко и идём дальше.
     """
-    global _pricenft_collecting, _pricenft_stop
+    global _pricenft_collecting, _pricenft_stop, _pricenft_cursor
     if _pricenft_collecting:
         return {"ok": False, "error": "already_running"}
     _pricenft_collecting = True
     _pricenft_stop = False
     load_pricenft_db()
-    stats = {"models_clicked": 0, "added": 0, "errors": 0, "stopped": False}
+    stats = {"models_clicked": 0, "added": 0, "errors": 0, "stopped": False, "soft_floods": 0}
 
     async def prog(text):
         if progress_cb:
@@ -2609,34 +2682,57 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
                 pass
 
     def stopped():
-        return _pricenft_stop or not _pricenft_collecting
+        # только кнопка Стоп — НЕ смотрим _pricenft_collecting (иначе сбор рвётся)
+        return bool(_pricenft_stop)
+
+    async def soft_flood_sleep(e, where=""):
+        sec = int(getattr(e, "seconds", 0) or 0)
+        stats["soft_floods"] += 1
+        if sec >= 120:
+            # долгий flood — запомним и выйдем мягко с тем что есть
+            _set_pricenft_flood(sec)
+            return "abort"
+        wait = max(3, min(sec + 1, 60))
+        logger.warning("pricenft soft flood %s sleep %ss (raw=%s)", where, wait, sec)
+        await prog("⏳ FloodWait " + str(wait) + "с, продолжаю...\nЮзеров: " + str(pricenft_db_stats().get("users", 0)))
+        await asyncio.sleep(wait)
+        return "continue"
 
     try:
         if not await check_authorized():
             return {"ok": False, "error": "not_authorized"}
 
         _load_pricenft_flood()
-        if _pricenft_flood_active():
+        # FloodWait от ResolveUsername не должен блокировать сбор, если peer уже в кэше/БД
+        peer_cached = _pricenft_entity is not None
+        if not peer_cached:
+            try:
+                row = _db().execute("SELECT v FROM meta WHERE k='pricenft_peer_id'").fetchone()
+                peer_cached = bool(row and row[0])
+            except Exception:
+                peer_cached = False
+        if _pricenft_flood_active() and not peer_cached:
             left = max(1, int(_pricenft_flood_until - time.time()))
             hrs = left / 3600.0
             st = pricenft_db_stats()
+            flood_s = (
+                ("⏳ Telegram FloodWait ~" + str(int(hrs)) + "ч")
+                if hrs >= 1 else
+                ("⏳ FloodWait ~" + str(left) + "с")
+            )
             await prog(
-                "⏳ Telegram FloodWait ~" + str(int(hrs)) + "ч\n"
-                "PriceNFTbot временно недоступен.\n"
-                "Маркет в БД не пишем — подожди FloodWait.\n"
+                flood_s
+                + "\nНужен ResolveUsername @PriceNFTbot — подожди.\n"
                 "В БД сейчас: " + str(st.get("users", 0)) + " юзеров"
             )
-            return {
-                "ok": False,
-                "error": "pricenft_flood",
-                "flood_wait": left,
-                **stats,
-                **st,
-            }
+            return {"ok": False, "error": "pricenft_flood", "flood_wait": left, **stats, **st}
+        if _pricenft_flood_active() and peer_cached:
+            # сбрасываем ложный блок — peer уже известен
+            global _pricenft_flood_until
+            _pricenft_flood_until = 0.0
 
         async with _pricenft_lock:
-            # один раз резолвим peer в кэш
-            await prog("PriceNFTbot: подключение (кэш peer)...")
+            await prog("PriceNFTbot: подключение...")
             await _pricenft_peer()
 
             await prog("PriceNFTbot: /start ...")
@@ -2644,8 +2740,7 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
             await asyncio.sleep(PRICENFT_MSG_CD)
             if stopped():
                 stats["stopped"] = True
-                st = pricenft_db_stats()
-                return {"ok": True, **stats, **st}
+                return {"ok": True, **stats, **pricenft_db_stats()}
 
             await prog("PriceNFTbot: /search ...")
             await _pricenft_send("/search")
@@ -2683,12 +2778,11 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
             await open_category(cat_map[0][1])
             if stopped():
                 stats["stopped"] = True
-                st = pricenft_db_stats()
-                return {"ok": True, **stats, **st}
+                return {"ok": True, **stats, **pricenft_db_stats()}
 
             model_names = []
             seen_btn = set()
-            for page in range(40):
+            for page in range(60):
                 if stopped():
                     break
                 msgs = await _pricenft_latest(3)
@@ -2697,29 +2791,31 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
                 nav_keys = ("далее", "next", "ещё", "еще", "more", "назад", "back",
                             "меню", "menu", "отмена", "cancel", "поиск", "search",
                             "модель", "model", "фон", "узор", "pattern", "background")
-                page_models = []
                 for t in btns:
                     low = t.lower().strip()
                     if any(k in low for k in nav_keys):
                         continue
-                    if low in seen_btn:
-                        continue
-                    if len(t) < 2 or len(t) > 64:
+                    if low in seen_btn or len(t) < 2 or len(t) > 64:
                         continue
                     seen_btn.add(low)
-                    page_models.append(t)
-                model_names.extend(page_models)
+                    model_names.append(t)
                 if max_models and len(model_names) >= max_models:
                     break
                 nxt = _find_btn_text(btns, ("далее", "next", "ещё", "еще", "more", "→", "»"))
                 if not nxt:
                     break
                 await prog("PriceNFTbot: страница моделей " + str(page + 2) + "...")
-                await _pricenft_click_or_send(last, nxt)
-                await asyncio.sleep(PRICENFT_MSG_CD)
+                try:
+                    await _pricenft_click_or_send(last, nxt)
+                    await asyncio.sleep(PRICENFT_MSG_CD)
+                except FloodWaitError as e:
+                    if await soft_flood_sleep(e, "models_page") == "abort":
+                        break
+                except Exception:
+                    break
 
             await ensure_collections()
-            col_titles = [t for _, t in ALL_GIFT_IDS]
+            col_titles = [t for _, t in ALL_GIFT_IDS if t and not str(t).startswith("Gift #")]
             random.shuffle(col_titles)
             seen_m = {x.lower() for x in model_names}
             for t in col_titles:
@@ -2733,16 +2829,27 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
                 model_names = col_titles[:]
             if max_models:
                 model_names = model_names[:max_models]
-            random.shuffle(model_names)
-            await prog("Моделей к сбору: " + str(len(model_names)) + "\nМожно нажать Стоп в любой момент")
+
+            # продолжаем с курсора, если прошлый заход оборвался
+            start_i = int(_pricenft_cursor or 0) % max(1, len(model_names))
+            if start_i > 0 and start_i < len(model_names):
+                model_names = model_names[start_i:] + model_names[:start_i]
+            await prog(
+                "Моделей к сбору: " + str(len(model_names))
+                + "\nСтарт с #" + str(start_i + 1)
+                + "\n⏹ Стоп в любой момент"
+            )
 
             for i, mname in enumerate(model_names):
                 if stopped():
                     stats["stopped"] = True
                     break
+                _pricenft_cursor = (start_i + i + 1) % max(1, len(model_names))
+                st_now = pricenft_db_stats()
                 await prog(
-                    "Модель " + str(i + 1) + "/" + str(len(model_names)) + ": "
-                    + mname + "\nВ БД юзеров: " + str(pricenft_db_stats()["users"])
+                    "Модель " + str(i + 1) + "/" + str(len(model_names)) + ": " + mname
+                    + "\nЮзеров в БД: " + str(st_now.get("users", 0))
+                    + " | +за сессию: " + str(stats["added"])
                     + "\n⏹ Можно остановить"
                 )
                 try:
@@ -2754,29 +2861,38 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
                     else:
                         await _pricenft_send(mname)
                     await asyncio.sleep(PRICENFT_MSG_CD)
-                    await asyncio.sleep(1.0)
-                    msgs = await _pricenft_latest(10)
-                    added = await _pricenft_ingest_messages(mname, msgs)
+                    added = await _pricenft_ingest_model_pages(mname, max_pages=8)
                     stats["added"] += added
                     stats["models_clicked"] += 1
-                    msgs = await _pricenft_latest(2)
-                    last = next((m for m in msgs if not getattr(m, "out", False)), None)
-                    btns = _btn_texts_from_msg(last) if last else []
-                    back = _find_btn_text(btns, ("назад", "back", "←"))
-                    if back:
-                        await _pricenft_click_or_send(last, back)
-                        await asyncio.sleep(PRICENFT_MSG_CD)
+                    if added == 0:
+                        # модель без выдачи — не считаем фаталом
+                        logger.info("pricenft model empty: %s", mname)
+                except FloodWaitError as e:
+                    stats["errors"] += 1
+                    if await soft_flood_sleep(e, "model:" + str(mname)[:40]) == "abort":
+                        await prog(
+                            "⏳ Долгий FloodWait — сохранил прогресс.\n"
+                            "Юзеров: " + str(pricenft_db_stats().get("users", 0))
+                            + "\nЗапусти сбор снова позже"
+                        )
+                        break
+                    continue
+                except PriceNftFloodError as e:
+                    stats["errors"] += 1
+                    _set_pricenft_flood(getattr(e, "seconds", 0) or 0)
+                    break
                 except Exception as e:
                     stats["errors"] += 1
                     logger.warning("collect model %s: %s", mname, e)
-                if (i + 1) % 5 == 0:
+                    await asyncio.sleep(1.0)
+                if (i + 1) % 3 == 0:
                     save_pricenft_db()
+                    db_flush(force=True)
 
-            # Фон/Узор — только если не стопнули
-            if not stopped():
+            # Фон/Узор — коротко, если не стоп и нет долгого flood
+            if not stopped() and not _pricenft_flood_active():
                 for cat_key, keys in cat_map[1:]:
-                    if stopped():
-                        stats["stopped"] = True
+                    if stopped() or _pricenft_flood_active():
                         break
                     try:
                         await prog("PriceNFTbot: категория " + cat_key + "...")
@@ -2792,23 +2908,17 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
                             if any(k in low for k in ("назад", "back", "далее", "next", "меню", "menu", "поиск")):
                                 continue
                             options.append(t)
-                        for t in options[:20]:
-                            if stopped():
-                                stats["stopped"] = True
+                        for t in options[:15]:
+                            if stopped() or _pricenft_flood_active():
                                 break
                             await prog(cat_key + ": " + t + "\nЮзеров: " + str(pricenft_db_stats()["users"]))
-                            await _pricenft_click_or_send(last, t)
-                            await asyncio.sleep(PRICENFT_MSG_CD)
-                            await asyncio.sleep(1.0)
-                            msgs = await _pricenft_latest(8)
-                            stats["added"] += await _pricenft_ingest_messages(t, msgs)
-                            msgs = await _pricenft_latest(2)
-                            last2 = next((m for m in msgs if not getattr(m, "out", False)), None)
-                            btns2 = _btn_texts_from_msg(last2) if last2 else []
-                            back = _find_btn_text(btns2, ("назад", "back", "←"))
-                            if back:
-                                await _pricenft_click_or_send(last2, back)
+                            try:
+                                await _pricenft_click_or_send(last, t)
                                 await asyncio.sleep(PRICENFT_MSG_CD)
+                                stats["added"] += await _pricenft_ingest_model_pages(t, max_pages=4)
+                            except FloodWaitError as e:
+                                if await soft_flood_sleep(e, "cat:" + cat_key) == "abort":
+                                    break
                             msgs = await _pricenft_latest(3)
                             last = next((m for m in msgs if not getattr(m, "out", False)), None)
                     except Exception as e:
@@ -2816,6 +2926,7 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
                         logger.warning("collect cat %s: %s", cat_key, e)
 
             save_pricenft_db()
+            db_flush(force=True)
             st = pricenft_db_stats()
             prefix = "⏹ Сбор остановлен\n" if stats["stopped"] else "✅ Сбор готов\n"
             await prog(
@@ -2823,44 +2934,34 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
                 + "Моделей в БД: " + str(st["models"]) + "\n"
                 + "Юзеров: " + str(st["users"]) + "\n"
                 + "NFT-ссылок: " + str(st["nfts"]) + "\n"
-                + "Кликов: " + str(stats["models_clicked"]) + " | +записей: " + str(stats["added"])
+                + "Кликов: " + str(stats["models_clicked"])
+                + " | +записей: " + str(stats["added"])
+                + " | soft-flood: " + str(stats["soft_floods"])
             )
             return {"ok": True, **stats, **st}
     except (FloodWaitError, PriceNftFloodError) as e:
         sec = int(getattr(e, "seconds", 0) or 0)
         _set_pricenft_flood(sec)
         save_pricenft_db()
-        hrs = max(1, sec // 3600)
         st = pricenft_db_stats()
         await prog(
-            "⏳ FloodWait ~" + str(hrs) + "ч\n"
-            "Сохранил что есть. Маркет в БД не пишем.\n"
+            "⏳ FloodWait — сохранил что есть.\n"
             "Юзеров в БД: " + str(st.get("users", 0))
+            + "\n+за сессию: " + str(stats["added"])
+            + "\nЗапусти сбор снова позже"
         )
-        return {
-            "ok": False,
-            "error": "flood_wait_" + str(sec) + "s",
-            "flood_wait": sec,
-            **stats,
-            **st,
-        }
+        return {"ok": True, "partial": True, "flood_wait": sec, **stats, **st}
     except Exception as e:
         logger.error("collect_pricenft_db: %s", e)
         save_pricenft_db()
-        msg = str(e)
-        if "FloodWait" in msg or "wait of" in msg.lower():
-            mnum = re.search(r"(\d+)\s*seconds?", msg, re.I)
-            sec = int(mnum.group(1)) if mnum else 3600
-            _set_pricenft_flood(sec)
-            st = pricenft_db_stats()
-            await prog(
-                "⏳ FloodWait — маркет в БД не пишем.\n"
-                "Юзеров в БД: " + str(st.get("users", 0))
-            )
-            return {"ok": False, "error": "flood_wait_" + str(sec) + "s", "flood_wait": sec, **stats, **st}
-        return {"ok": False, "error": str(e), **stats}
+        st = pricenft_db_stats()
+        await prog("❌ Ошибка сбора: " + esc(str(e))[:180] + "\nЮзеров: " + str(st.get("users", 0)))
+        return {"ok": False, "error": str(e), **stats, **st}
     finally:
         _pricenft_collecting = False
+        # stop сбрасываем только если не нажали Стоп во время finally гонки
+        if not _pricenft_stop:
+            pass
         _pricenft_stop = False
 
 
@@ -5610,34 +5711,32 @@ async def cb_pricenft_collect(cb: CallbackQuery):
             pass
 
     async def runner():
-        global _pricenft_collecting, _pricenft_stop
-        _pricenft_collecting = True
-        _pricenft_stop = False
         try:
-            await prog("🚀 Сбор @PriceNFTbot...")
-            # collect_pricenft_db сам ставит flag — временно снимем чтобы не got already_running
-            _pricenft_collecting = False
+            await prog("🚀 Сбор @PriceNFTbot...\nЛистаю модели и юзеров, FloodWait не роняет сбор")
             result = await collect_pricenft_db(progress_cb=prog, max_models=0)
-            _pricenft_collecting = True
             try:
                 st = pricenft_db_stats()
-                if result and result.get("ok"):
+                if result and (result.get("ok") or result.get("partial")):
                     prefix = "⏹ Сбор остановлен" if result.get("stopped") else "✅ БД обновлена (PriceNFT)"
+                    if result.get("partial"):
+                        prefix = "⚠️ Сбор частично (FloodWait)"
                     await status.edit_text(
                         "<b>" + prefix + "</b>\n"
                         "Моделей: " + str(st.get("models", 0)) + "\n"
                         "Юзеров: " + str(st.get("users", 0)) + " / " + str(DB_TARGET_USERS) + "\n"
-                        "NFT: " + str(st.get("nfts", 0)),
+                        "NFT: " + str(st.get("nfts", 0)) + "\n"
+                        "+за сессию: " + str((result or {}).get("added", 0)),
                         parse_mode="HTML", reply_markup=admin_kb()
                     )
                 else:
                     wait = int((result or {}).get("flood_wait", 0) or 0)
                     if wait:
-                        hrs = max(1, wait // 3600)
+                        hrs = max(1, wait // 3600) if wait >= 3600 else 0
+                        wait_s = (("~" + str(hrs) + "ч") if hrs else ("~" + str(wait) + "с"))
                         await status.edit_text(
-                            "<b>⚠️ PriceNFT FloodWait ~" + str(hrs) + "ч</b>\n"
-                            "Маркет в БД не пишем — подожди.\n"
-                            "Юзеров в БД: " + str(st.get("users", 0)),
+                            "<b>⚠️ PriceNFT FloodWait " + wait_s + "</b>\n"
+                            "Юзеров в БД: " + str(st.get("users", 0)) + "\n"
+                            "Запусти сбор снова позже",
                             parse_mode="HTML", reply_markup=admin_kb()
                         )
                     else:
@@ -5648,9 +5747,15 @@ async def cb_pricenft_collect(cb: CallbackQuery):
                         )
             except Exception:
                 pass
-        finally:
-            _pricenft_collecting = False
-            _pricenft_stop = False
+        except Exception as e:
+            logger.error("admin pricenft runner: %s", e)
+            try:
+                await status.edit_text(
+                    "<b>❌ Ошибка:</b> " + esc(str(e))[:200],
+                    parse_mode="HTML", reply_markup=admin_kb()
+                )
+            except Exception:
+                pass
 
     _pricenft_task = asyncio.create_task(runner())
 
