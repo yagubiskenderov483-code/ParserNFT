@@ -2012,13 +2012,10 @@ def pricenft_add_user(model, username, nft_urls=None, uid=None, commit=True):
 
 def seed_pricenft_from_item(item, commit=False):
     """
-    Пишем в БД ТОЛЬКО профильные/PriceNFT источники.
-    Маркет сюда НЕ пишем — маркет-поиск берёт лоты напрямую из API.
+    Наполнение БД владельцами (фон/админка: маркет + PriceNFT).
+    Поиск по маркету seed НЕ вызывает — только API-выдача.
     """
     try:
-        src = str(item.get("source") or "").lower()
-        if src in ("market", "resale", "market_page"):
-            return
         uname = (item.get("username") or "").lstrip("@")
         title = item.get("title") or item.get("model") or ""
         nft_url = item.get("nft_url")
@@ -2516,21 +2513,101 @@ async def _pricenft_click_or_send(msg, text):
 
 async def fill_db_from_market_fast(progress_cb=None, parallel=28, target_users=None):
     """
-    УСТАРЕЛО: маркет больше НЕ пишем в БД.
-    БД только из @PriceNFTbot (профили / позор). Маркет-поиск — напрямую из API.
+    Быстрое наполнение БД с маркета до цели (по умолчанию 600к юзеров).
+    Несколько кругов по коллекциям + пагинация. Можно Стопнуть.
     """
-    load_pricenft_db(force=False)
-    st = pricenft_db_stats()
-    if progress_cb:
-        try:
-            await progress_cb(
-                "Маркет→БД отключён.\n"
-                "БД только через @PriceNFTbot.\n"
-                "Сейчас юзеров: " + str(st.get("users", 0))
+    if target_users is None:
+        target_users = DB_TARGET_USERS
+    await ensure_collections()
+    load_pricenft_db()
+    pairs = list(ALL_GIFT_IDS)
+    if not pairs:
+        return {"ok": False, "error": "no_collections", **pricenft_db_stats()}
+    total = 0
+    rounds = 0
+
+    async def prog(t):
+        if progress_cb:
+            try:
+                await progress_cb(t)
+            except Exception:
+                pass
+
+    # круги пока не набрали цель / не стоп
+    while True:
+        if _pricenft_stop:
+            break
+        st0 = pricenft_db_stats()
+        users0 = int(st0.get("users", 0) or 0)
+        if users0 >= target_users:
+            await prog("✅ Цель БД достигнута: " + str(users0) + " / " + str(target_users))
+            break
+        rounds += 1
+        random.shuffle(pairs)
+        await prog(
+            "Маркет→БД круг " + str(rounds)
+            + "\nЮзеров: " + str(users0) + " / " + str(target_users)
+            + "\nКоллекций: " + str(len(pairs))
+        )
+        for i in range(0, len(pairs), parallel):
+            if _pricenft_stop:
+                break
+            if int(pricenft_db_stats().get("users", 0) or 0) >= target_users:
+                break
+            chunk = pairs[i:i + parallel]
+
+            async def one(gid, title):
+                n = 0
+                offset = ""
+                for _page in range(5):
+                    try:
+                        items, nxt = await fetch_market_page(gid, offset, limit=100, newest=True)
+                    except Exception:
+                        break
+                    if not items:
+                        break
+                    for it in items:
+                        it = dict(it)
+                        if title and (not it.get("title") or str(it.get("title")) in ("?", "NFT")):
+                            it["title"] = title
+                        it["gift_id"] = gid
+                        seed_pricenft_from_item(it, commit=False)
+                        n += 1
+                    if not nxt:
+                        break
+                    offset = nxt
+                return n
+
+            parts = await asyncio.gather(
+                *[one(gid, title) for gid, title in chunk],
+                return_exceptions=True,
             )
-        except Exception:
-            pass
-    return {"ok": True, "seeded": 0, "rounds": 0, "disabled": True, "target": target_users or DB_TARGET_USERS, **st}
+            for p in parts:
+                if isinstance(p, int):
+                    total += p
+            db_flush(force=True)
+            if (i // parallel) % 2 == 0:
+                st = pricenft_db_stats()
+                await prog(
+                    "Маркет→БД круг " + str(rounds) + ": "
+                    + str(min(i + parallel, len(pairs))) + "/" + str(len(pairs))
+                    + "\nЮзеров: " + str(st.get("users", 0)) + " / " + str(target_users)
+                    + " | NFT: " + str(st.get("nfts", 0))
+                )
+        db_flush(force=True)
+        save_pricenft_db()
+        # защита от бесконечного круга если юзеры не растут
+        st1 = pricenft_db_stats()
+        if int(st1.get("users", 0) or 0) <= users0 and rounds >= 3:
+            await prog("Рост юзеров остановился на " + str(st1.get("users", 0)))
+            break
+        if rounds >= 30:
+            break
+
+    db_flush(force=True)
+    save_pricenft_db()
+    st = pricenft_db_stats()
+    return {"ok": True, "seeded": total, "rounds": rounds, "target": target_users, **st}
 
 async def _pricenft_ingest_messages(model_name, messages):
     """Парсим ответы бота и кладём юзеров в БД под model_name."""
@@ -2977,8 +3054,9 @@ _bootstrap_task = None
 
 async def bootstrap_gifts_db(notify_chat_id=None):
     """
-    После авторизации: только @PriceNFTbot → БД (профили/позор).
-    Маркет в БД НЕ пишем — поиск по маркету идёт напрямую из API.
+    Автосохранение гифтов в БД после авторизации:
+    1) Быстрый проход по маркету всех коллекций
+    2) Фоновый сбор через @PriceNFTbot
     """
     global _pricenft_collecting
     if not await check_authorized():
@@ -2996,28 +3074,60 @@ async def bootstrap_gifts_db(notify_chat_id=None):
             pass
 
     await _notify(
-        "📦 БД профилей через @PriceNFTbot...\n"
-        "Маркет в БД не пишем.\n"
+        "📦 Сохраняю гифты в БД...\n"
+        "Коллекций: " + str(len(ALL_GIFT_IDS)) + "\n"
         "Сейчас: " + str(before.get("users", 0)) + " юзеров"
     )
 
-    if _pricenft_collecting:
-        return {"ok": True, "already": True, **before}
+    pairs = list(ALL_GIFT_IDS)
+    random.shuffle(pairs)
+    PARALLEL = 15
+    for i in range(0, len(pairs), PARALLEL):
+        chunk = pairs[i:i+PARALLEL]
+        async def one(gid, title):
+            try:
+                items, _ = await fetch_market_page(gid, "", limit=80, newest=True)
+            except Exception:
+                return 0
+            for it in items:
+                it = dict(it)
+                if title and (not it.get("title") or str(it.get("title")) in ("?", "NFT")):
+                    it["title"] = title
+                it["gift_id"] = gid
+                seed_pricenft_from_item(it, commit=False)
+            return len(items)
+        await asyncio.gather(*[one(gid, title) for gid, title in chunk], return_exceptions=True)
+        db_flush(force=True)
+        if (i // PARALLEL) % 4 == 0:
+            save_pricenft_db()
+            mid = pricenft_db_stats()
+            await _notify(
+                "📦 БД: " + str(mid.get("users", 0)) + " юзеров / "
+                + str(mid.get("models", 0)) + " моделей\n"
+                + str(min(i + PARALLEL, len(pairs))) + "/" + str(len(pairs))
+            )
 
-    try:
-        result = await collect_pricenft_db(progress_cb=None, max_models=80)
-        st = pricenft_db_stats()
-        await _notify(
-            "✅ PriceNFT в БД\n"
-            "Моделей: " + str(st.get("models", 0)) + "\n"
-            "Юзеров: " + str(st.get("users", 0))
-        )
-        return {"ok": True, **(result or {}), **st}
-    except Exception as e:
-        logger.warning("bootstrap PriceNFT: %s", e)
-        await _notify("⚠️ PriceNFT: " + esc(str(e))[:200])
-        return {"ok": False, "error": str(e), **pricenft_db_stats()}
+    db_flush(force=True)
+    save_pricenft_db()
+    after_m = pricenft_db_stats()
+    await _notify(
+        "✅ Гифты с маркета в БД\n"
+        "Моделей: " + str(after_m.get("models", 0)) + "\n"
+        "Юзеров: " + str(after_m.get("users", 0)) + "\n"
+        "Дальше @PriceNFTbot в фоне..."
+    )
 
+    async def _bg_price():
+        try:
+            await collect_pricenft_db(progress_cb=None, max_models=80)
+            st = pricenft_db_stats()
+            await _notify("✅ PriceNFT в БД: " + str(st.get("models", 0)) + " моделей / " + str(st.get("users", 0)) + " юзеров")
+        except Exception as e:
+            logger.warning("bg PriceNFT: %s", e)
+
+    if not _pricenft_collecting:
+        asyncio.create_task(_bg_price())
+    return {"ok": True, **after_m}
 
 def start_bootstrap_gifts_db(notify_chat_id=None):
     global _bootstrap_task
@@ -3032,42 +3142,95 @@ def start_bootstrap_gifts_db(notify_chat_id=None):
 
 async def background_db_keeper():
     """
-    Фон: только досбор БД через @PriceNFTbot (профили/позор).
-    Маркет НЕ трогаем — чтобы не жрать API и не мешать поиску по маркету.
+    Основной фоновый режим: постоянно быстро пишет маркет в sqlite,
+    периодически дособирает через @PriceNFTbot (CD 3с).
+    Работает всегда после авторизации — даже когда поиск не идёт.
     """
-    logger.info("background_db_keeper started (PriceNFT only, no market→DB)")
-    await asyncio.sleep(8)
+    logger.info("background_db_keeper started")
+    await asyncio.sleep(5)
     cycle = 0
     while True:
         try:
             if not await check_authorized():
                 await asyncio.sleep(30)
                 continue
-            if any_searching() or _pricenft_collecting or _pricenft_flood_active():
-                await asyncio.sleep(10)
+            # во время поиска не конкурируем за API — маркет и так сидится из выдачи
+            if any_searching():
+                await asyncio.sleep(3)
                 continue
+            await ensure_collections()
+            pairs = list(ALL_GIFT_IDS) or []
+            if not pairs:
+                await asyncio.sleep(20)
+                continue
+            random.shuffle(pairs)
+            PARALLEL = 22
+            # быстрый проход маркета — основной объём БД до 600к
+            st0 = pricenft_db_stats()
+            if int(st0.get("users", 0) or 0) < DB_TARGET_USERS:
+                # глубокий fill раз в несколько циклов
+                if cycle % 3 == 0:
+                    try:
+                        await fill_db_from_market_fast(
+                            progress_cb=None, parallel=28, target_users=DB_TARGET_USERS
+                        )
+                    except Exception as e:
+                        logger.warning("keeper fill: %s", e)
+            for i in range(0, len(pairs), PARALLEL):
+                if any_searching():
+                    break
+                chunk = pairs[i:i + PARALLEL]
+
+                async def one(gid, title):
+                    try:
+                        items, _ = await fetch_market_page(gid, "", limit=100, newest=True)
+                    except Exception:
+                        return 0
+                    for it in items:
+                        it = dict(it)
+                        if title and (not it.get("title") or str(it.get("title")) in ("?", "NFT")):
+                            it["title"] = title
+                        it["gift_id"] = gid
+                        seed_pricenft_from_item(it, commit=False)
+                    return len(items)
+
+                await asyncio.gather(
+                    *[one(gid, title) for gid, title in chunk],
+                    return_exceptions=True,
+                )
+                db_flush(force=True)
+                # не душим API: короткая пауза между чанками
+                await asyncio.sleep(0.15)
+
+            db_flush(force=True)
+            save_pricenft_db()
             cycle += 1
-            # раз в несколько циклов — тихий досбор PriceNFT
-            if cycle % 3 == 0:
+            st = pricenft_db_stats()
+            logger.info(
+                "DB keeper cycle=%s models=%s users=%s nfts=%s",
+                cycle, st.get("models"), st.get("users"), st.get("nfts"),
+            )
+
+            # PriceNFTbot — только если нет FloodWait
+            if (
+                cycle % 2 == 0
+                and not _pricenft_collecting
+                and not any_searching()
+                and not _pricenft_flood_active()
+            ):
                 try:
-                    await collect_pricenft_db(progress_cb=None, max_models=30)
+                    await collect_pricenft_db(progress_cb=None, max_models=40)
                     db_flush(force=True)
                     save_pricenft_db()
                 except Exception as e:
                     logger.warning("keeper PriceNFT: %s", e)
-            st = pricenft_db_stats()
-            if cycle % 6 == 0:
-                logger.info(
-                    "DB keeper cycle=%s models=%s users=%s nfts=%s",
-                    cycle, st.get("models"), st.get("users"), st.get("nfts"),
-                )
-            await asyncio.sleep(45)
+
+            await asyncio.sleep(8)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.warning("background_db_keeper: %s", e)
-            await asyncio.sleep(20)
-
+            await asyncio.sleep(15)
 
 def start_background_db_keeper():
     global _keeper_task
@@ -5148,7 +5311,7 @@ async def cmd_neptunteam(message: Message, state: FSMContext):
         "<b>Neptun Parser — справка\n\n"
         "РЕЖИМЫ ПОИСКА\n\n"
         "По маркету\n"
-        "Лоты напрямую с маркета (API). В БД не пишем.\n\n"
+        "Лоты с API. В момент поиска в БД не пишет; БД растёт в фоне.\n\n"
         "По профилю\n"
         "Ищет аккаунты с NFT и строго 0 лотов на маркете.\n"
         "БД = @PriceNFTbot (профили / позор).\n\n"
@@ -5689,11 +5852,11 @@ async def cb_pricenft_collect(cb: CallbackQuery):
         [InlineKeyboardButton(text="Админ", callback_data="admin_panel")],
     ])
     status = await cb.message.answer(
-        "<b>📦 База данных (профили / позор)</b>\n"
-        "Источник: только @PriceNFTbot\n"
-        "Маркет в БД НЕ пишем\n"
+        "<b>📦 База данных</b>\n"
         "Цель: " + str(DB_TARGET_USERS) + " юзеров\n"
         "Сейчас: " + str(pricenft_db_stats().get("users", 0)) + "\n"
+        "1) Быстрый маркет→БД\n"
+        "2) @PriceNFTbot (если нет FloodWait)\n"
         "Можно остановить в любой момент",
         parse_mode="HTML",
         reply_markup=stop_kb_db,
@@ -5702,7 +5865,7 @@ async def cb_pricenft_collect(cb: CallbackQuery):
     async def prog(text):
         try:
             await status.edit_text(
-                "<b>📦 База данных (PriceNFT)</b>\n" + esc(text),
+                "<b>📦 База данных</b>\n" + esc(text),
                 parse_mode="HTML",
                 reply_markup=stop_kb_db,
             )
@@ -5710,51 +5873,64 @@ async def cb_pricenft_collect(cb: CallbackQuery):
             pass
 
     async def runner():
+        global _pricenft_collecting, _pricenft_stop
+        _pricenft_collecting = True
+        _pricenft_stop = False
         try:
-            await prog("🚀 Сбор @PriceNFTbot...\nЛистаю модели и юзеров, FloodWait не роняет сбор")
-            result = await collect_pricenft_db(progress_cb=prog, max_models=0)
-            try:
-                st = pricenft_db_stats()
-                if result and (result.get("ok") or result.get("partial")):
-                    prefix = "⏹ Сбор остановлен" if result.get("stopped") else "✅ БД обновлена (PriceNFT)"
-                    if result.get("partial"):
-                        prefix = "⚠️ Сбор частично (FloodWait)"
+            # сначала быстро набираем с маркета к 600к
+            await prog("🚀 Активный сбор до " + str(DB_TARGET_USERS) + " юзеров...")
+            mres = await fill_db_from_market_fast(progress_cb=prog, parallel=28, target_users=DB_TARGET_USERS)
+            if _pricenft_stop:
+                try:
                     await status.edit_text(
-                        "<b>" + prefix + "</b>\n"
-                        "Моделей: " + str(st.get("models", 0)) + "\n"
-                        "Юзеров: " + str(st.get("users", 0)) + " / " + str(DB_TARGET_USERS) + "\n"
-                        "NFT: " + str(st.get("nfts", 0)) + "\n"
-                        "+за сессию: " + str((result or {}).get("added", 0)),
+                        "<b>⏹ Сбор остановлен</b>\n"
+                        "Юзеров: " + str(mres.get("users", 0)) + " / " + str(DB_TARGET_USERS) + "\n"
+                        "NFT: " + str(mres.get("nfts", 0)),
                         parse_mode="HTML", reply_markup=admin_kb()
                     )
-                else:
-                    wait = int((result or {}).get("flood_wait", 0) or 0)
-                    if wait:
-                        hrs = max(1, wait // 3600) if wait >= 3600 else 0
-                        wait_s = (("~" + str(hrs) + "ч") if hrs else ("~" + str(wait) + "с"))
+                except Exception:
+                    pass
+                return
+            # collect_pricenft_db сам ставит flag — временно снимем чтобы не got already_running
+            _pricenft_collecting = False
+            result = await collect_pricenft_db(progress_cb=prog, max_models=0)
+            _pricenft_collecting = True
+            # ещё раз маркет если не добили
+            if int(pricenft_db_stats().get("users", 0) or 0) < DB_TARGET_USERS and not _pricenft_stop:
+                await fill_db_from_market_fast(progress_cb=prog, target_users=DB_TARGET_USERS)
+                result = {**(result or {}), **pricenft_db_stats()}
+            try:
+                if result.get("ok") or mres.get("ok"):
+                    if result.get("flood_fallback"):
+                        wait = int(result.get("flood_wait", 0) or 0)
+                        hrs = max(1, wait // 3600) if wait else "?"
                         await status.edit_text(
-                            "<b>⚠️ PriceNFT FloodWait " + wait_s + "</b>\n"
-                            "Юзеров в БД: " + str(st.get("users", 0)) + "\n"
-                            "Запусти сбор снова позже",
+                            "<b>⚠️ PriceNFT FloodWait ~" + str(hrs) + "ч</b>\n"
+                            "БД наполнена с маркета:\n"
+                            "Юзеров: " + str(result.get("users", mres.get("users", 0))) + " / " + str(DB_TARGET_USERS) + "\n"
+                            "NFT: " + str(result.get("nfts", mres.get("nfts", 0))),
                             parse_mode="HTML", reply_markup=admin_kb()
                         )
                     else:
+                        prefix = "⏹ Сбор остановлен" if result.get("stopped") else "✅ БД обновлена"
+                        st = pricenft_db_stats()
                         await status.edit_text(
-                            "<b>❌ Сбор не удался:</b> " + esc(str((result or {}).get("error", "?")))
-                            + "\nЮзеров в БД: " + str(st.get("users", 0)),
+                            "<b>" + prefix + "</b>\n"
+                            "Моделей: " + str(st.get("models", 0)) + "\n"
+                            "Юзеров: " + str(st.get("users", 0)) + " / " + str(DB_TARGET_USERS) + "\n"
+                            "NFT: " + str(st.get("nfts", 0)),
                             parse_mode="HTML", reply_markup=admin_kb()
                         )
+                else:
+                    await status.edit_text(
+                        "<b>❌ Сбор не удался:</b> " + esc(str((result or {}).get("error", "?"))),
+                        parse_mode="HTML", reply_markup=admin_kb()
+                    )
             except Exception:
                 pass
-        except Exception as e:
-            logger.error("admin pricenft runner: %s", e)
-            try:
-                await status.edit_text(
-                    "<b>❌ Ошибка:</b> " + esc(str(e))[:200],
-                    parse_mode="HTML", reply_markup=admin_kb()
-                )
-            except Exception:
-                pass
+        finally:
+            _pricenft_collecting = False
+            _pricenft_stop = False
 
     _pricenft_task = asyncio.create_task(runner())
 
@@ -5920,7 +6096,7 @@ async def auth_code(message: Message, state: FSMContext):
         await message.answer(
             "<b>Авторизован как @" + esc(str(me.username or me.first_name)) + "\n"
             "Коллекций: " + str(len(ALL_GIFT_IDS)) + "\n"
-            "БД профилей: @PriceNFTbot (маркет не пишем)</b>",
+            "Быстро наполняю БД с маркета (поиск в БД не пишет)</b>",
             parse_mode="HTML", reply_markup=main_menu_kb()
         )
         start_bootstrap_gifts_db(notify_chat_id=message.chat.id)
@@ -5944,7 +6120,7 @@ async def auth_password(message: Message, state: FSMContext):
         await message.answer(
             "<b>Авторизован как @" + esc(str(me.username or me.first_name)) + "\n"
             "Коллекций: " + str(len(ALL_GIFT_IDS)) + "\n"
-            "БД профилей: @PriceNFTbot (маркет не пишем)</b>",
+            "Быстро наполняю БД с маркета (поиск в БД не пишет)</b>",
             parse_mode="HTML", reply_markup=main_menu_kb()
         )
         start_bootstrap_gifts_db(notify_chat_id=message.chat.id)
@@ -5988,9 +6164,9 @@ async def main():
             logger.info("Авторизован, коллекций: %d", len(ALL_GIFT_IDS))
             st0 = pricenft_db_stats()
             if st0.get("users", 0) < 50:
-                logger.info("БД мала (%s) — автосбор PriceNFT (без маркета)", st0.get("users"))
+                logger.info("БД мала (%s) — автосбор маркет→БД + PriceNFT", st0.get("users"))
                 start_bootstrap_gifts_db(notify_chat_id=ADMIN_ID)
-            # фон: только PriceNFT → БД; маркет API свободен для поиска
+            # фон: маркет→БД когда поиск не идёт; поиск маркета seed не пишет
             start_background_db_keeper()
         else:
             logger.warning("Не авторизован — пройди /start")
