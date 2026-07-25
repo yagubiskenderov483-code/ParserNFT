@@ -2666,7 +2666,7 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
     max_models=0 — без лимита (пока не нажмут Стоп).
     FloodWait на одной модели НЕ роняет весь сбор — ждём коротко и идём дальше.
     """
-    global _pricenft_collecting, _pricenft_stop, _pricenft_cursor
+    global _pricenft_collecting, _pricenft_stop, _pricenft_cursor, _pricenft_flood_until
     if _pricenft_collecting:
         return {"ok": False, "error": "already_running"}
     _pricenft_collecting = True
@@ -2728,7 +2728,6 @@ async def collect_pricenft_db(progress_cb=None, max_models=0):
             return {"ok": False, "error": "pricenft_flood", "flood_wait": left, **stats, **st}
         if _pricenft_flood_active() and peer_cached:
             # сбрасываем ложный блок — peer уже известен
-            global _pricenft_flood_until
             _pricenft_flood_until = 0.0
 
         async with _pricenft_lock:
