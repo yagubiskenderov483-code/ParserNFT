@@ -4977,10 +4977,10 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                                   max_results=30, region="any", who=None,
                                   chat_id=None, search_token=None):
     """
-    Быстрый профиль/модель (~10с):
-      1) сразу шлём хиты из БД с nft_url нужной коллекции (без Telethon на каждого)
-      2) при недоборе — лёгкая проверка saved_gifts параллельно
-      3) добиваем без global seen до лимита
+    Быстрый профиль/модель (~15с):
+      1) хиты из profile_gifts.db (скрытые NFT, не маркет)
+      2) кандидаты из маркет-БД — только после live-проверки 0 на маркете
+      3) who=girls — строгий фильтр девушек
     """
     chat_id = chat_id or (status_msg.chat.id if getattr(status_msg, "chat", None) else None)
     if search_token is not None and chat_id is not None:
