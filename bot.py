@@ -735,46 +735,53 @@ def gifts_in_range(count, mn, mx):
         return False
     return True
 
+def _cat_bounds(cat):
+    """Границы категории в ⭐ (включительно)."""
+    if not cat or cat in ("any", "all", "none"):
+        return None
+    return {
+        "cheap":   (0,       2000),
+        "mid":     (2000,    5000),
+        "hard":    (5000,    20000),   # 5-20к
+        "ultra":   (20000,   100000),
+        "extreme": (100000,  10**12),
+    }.get(cat)
+
 def floor_in_cat(floor, cat):
-    CATS = {
-        "cheap":   (None,  2000),
-        "mid":     (2000,  5000),
-        "hard":    (5000,  20000),
-        "ultra":   (20000, 100000),
-        "extreme": (100000, None),
-    }
-    c = CATS.get(cat)
-    if not c:
+    """Флор коллекции попадает в ценовую категорию."""
+    bounds = _cat_bounds(cat)
+    if not bounds:
         return True
-    mn, mx = c
-    if mn and floor < mn:
+    if floor is None:
         return False
-    if mx and floor > mx:
+    try:
+        floor = int(floor)
+    except Exception:
+        return False
+    mn, mx = bounds
+    if mn is not None and floor < mn:
+        return False
+    if mx is not None and floor > mx:
         return False
     return True
 
 def price_in_cat(price, cat):
     """Фильтр по цене лота (не по floor коллекции) — иначе маркет пустой."""
-    if not cat or cat in ("any", "all", "none"):
+    bounds = _cat_bounds(cat)
+    if not bounds:
         return True
     if price is None:
-        return True
+        return False
     try:
         price = int(price)
     except Exception:
-        return True
-    CATS = {
-        "cheap":   (0,      2000),
-        "mid":     (2000,   5000),
-        "hard":    (5000,   20000),
-        "ultra":   (20000,  100000),
-        "extreme": (100000, 10**12),
-    }
-    c = CATS.get(cat)
-    if not c:
-        return True
-    mn, mx = c
-    return mn <= price <= mx
+        return False
+    mn, mx = bounds
+    if mn is not None and price < mn:
+        return False
+    if mx is not None and price > mx:
+        return False
+    return True
 
 def price_ok(price, floor, boost):
     if not price or not floor:
@@ -1188,7 +1195,8 @@ def _norm_col_name(s):
 def item_matches_collections(item, allowed_gids=None, allowed_titles=None):
     """
     Строго: лот принадлежит выбранным коллекциям.
-    Приоритет: slug NFT → title → gift_id с маркета.
+    - market + gift_id из скана выбранной коллекции → доверяем API
+    - иначе slug/title должны совпасть с именем коллекции (БД/профиль)
     """
     allowed_gids = set(int(x) for x in (allowed_gids or []) if x is not None)
     titles = [t for t in (allowed_titles or []) if t]
@@ -1197,37 +1205,102 @@ def item_matches_collections(item, allowed_gids=None, allowed_titles=None):
         return True
 
     src = (item.get("source") or "")
+    gid = item.get("gift_id")
+    # Скан маркета по конкретному gift_id — API уже отфильтровал коллекцию
+    if src == "market" and gid is not None and allowed_gids:
+        try:
+            if int(gid) in allowed_gids:
+                return True
+        except Exception:
+            pass
+
     slug = gift_slug_of(item.get("nft_url")) or ""
     if slug.startswith("user:"):
         return False
     base = re.sub(r"-\d+$", "", slug)
     nb = _norm_col_name(base)
 
-    # slug — главный источник истины
-    if slug and norms:
-        if nb and nb in norms:
+    # slug — главный источник для БД/профиля
+    if nb and norms:
+        if nb in norms:
             return True
-        if nb:
+        # slug другой коллекции — мимо (даже если title/gift_id подставили)
+        if src in ("pricenft_db", "db", "profile") or src != "market":
             return False
-
-    # из БД без проверяемого slug — не доверяем
-    if src in ("pricenft_db", "db") and not (nb and nb in norms):
-        title = item.get("title") or item.get("model") or ""
-        nt = _norm_col_name(title)
-        return bool(nt and norms and nt in norms)
 
     title = item.get("title") or item.get("model") or ""
     nt = _norm_col_name(title)
     if nt and norms and nt in norms:
-        return True
+        # для БД без slug — только exact title
+        if src in ("pricenft_db", "db") and not nb:
+            return True
+        if src not in ("pricenft_db", "db"):
+            return True
 
-    gid = item.get("gift_id")
-    if gid is not None and allowed_gids:
+    if gid is not None and allowed_gids and src == "market":
         try:
             return int(gid) in allowed_gids
         except Exception:
             return False
     return False
+
+async def resolve_collections_for_cat(cat, gift_ids=None):
+    """
+    Коллекции, чей floor попадает в ценовую категорию.
+    Для профиля (у скрытых NFT нет цены лота) — фильтр по флору коллекции.
+    Возвращает (gids, titles).
+    """
+    id_set = None
+    if gift_ids:
+        try:
+            id_set = {int(x) for x in gift_ids}
+        except Exception:
+            id_set = set(gift_ids)
+    pairs = []
+    for gid, title in (ALL_GIFT_IDS or []):
+        try:
+            gid_i = int(gid)
+        except Exception:
+            continue
+        if id_set is not None and gid_i not in id_set:
+            continue
+        pairs.append((gid_i, title or ""))
+    if not pairs and gift_ids:
+        try:
+            pairs = [(int(g), "") for g in gift_ids]
+        except Exception:
+            pairs = []
+    if not cat or cat in ("any", "all", "none") or not _cat_bounds(cat):
+        return [g for g, _ in pairs], [t for _, t in pairs if t]
+
+    out_g, out_t = [], []
+    PARALLEL = 16
+
+    async def _one(gid, title):
+        fl = await get_floor(gid)
+        if fl is None:
+            return None
+        if floor_in_cat(fl, cat):
+            return gid, title
+        return None
+
+    for i in range(0, len(pairs), PARALLEL):
+        if not is_searching:
+            break
+        chunk = pairs[i:i + PARALLEL]
+        parts = await asyncio.gather(
+            *[_one(g, t) for g, t in chunk],
+            return_exceptions=True,
+        )
+        for p in parts:
+            if isinstance(p, tuple) and len(p) == 2:
+                out_g.append(p[0])
+                if p[1]:
+                    out_t.append(p[1])
+    if not out_g:
+        logger.warning("resolve_collections_for_cat(%s): empty floors, fallback all", cat)
+        return [g for g, _ in pairs], [t for _, t in pairs if t]
+    return out_g, out_t
 
 def is_owner_seen(uid=None, username=None):
     k = owner_seen_key(uid, username)
@@ -2740,8 +2813,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                             max_results=30, region="any"):
     """
     Профиль: аккаунты с 0 гифтов на маркете.
-    Кандидаты: рандом из локальной БД + чаты (НЕ текущие продавцы маркета).
-    seen помечаем только при реальной выдаче.
+    Ценовая категория — по флору коллекции скрытых NFT (не дешман в 5-20к).
     """
     global is_searching
     is_searching = True
@@ -2751,7 +2823,34 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
     checked   = set()
     check_q = asyncio.Queue()
     feeder_done = asyncio.Event()
-    stats_skip = {"market": 0, "empty": 0, "girl": 0, "range": 0, "trader": 0, "seen": 0}
+    stats_skip = {"market": 0, "empty": 0, "girl": 0, "range": 0, "trader": 0, "seen": 0, "cat": 0}
+    allowed_gids = set()
+    allowed_titles = []
+    cat_filter_on = bool(cat and cat not in ("any", "all", "none") and _cat_bounds(cat))
+
+    def gift_in_cat(g):
+        if not cat_filter_on:
+            return True
+        fake = {
+            "nft_url": g.get("nft_url"),
+            "title": g.get("title"),
+            "model": g.get("title"),
+            "gift_id": None,
+            "source": "profile",
+        }
+        return item_matches_collections(fake, allowed_gids, allowed_titles)
+
+    def pick_hidden(saved):
+        hidden = []
+        for g in saved or []:
+            if g.get("on_market") or not g.get("nft_url"):
+                continue
+            if is_gift_seen(g.get("nft_url")):
+                continue
+            if not gift_in_cat(g):
+                continue
+            hidden.append(g)
+        return hidden
 
     async def emit_cand(key, info):
         if not key or key in checked:
@@ -2805,15 +2904,9 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             stats_skip["empty"] += 1
             return
 
-        hidden = []
-        for g in saved:
-            if g.get("on_market") or not g.get("nft_url"):
-                continue
-            if is_gift_seen(g.get("nft_url")):
-                continue
-            hidden.append(g)
+        hidden = pick_hidden(saved)
         if not hidden:
-            stats_skip["empty"] += 1
+            stats_skip["cat" if cat_filter_on else "empty"] += 1
             return
         if len(hidden) < min_gifts:
             stats_skip["range"] += 1
@@ -2850,8 +2943,9 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         owner_s = fmt_owner(owner_obj, username, name)
         first_nft_url = hidden[0].get("nft_url")
         nft_count = len(hidden)
-        txt = ("<b>" + owner_s + "\nNFT в профиле (0 на маркете): " + str(nft_count) + "</b>"
-               + _make_nft_lines(hidden))
+        cat_note = (" / " + CAT_LABELS.get(cat, str(cat))) if cat_filter_on else ""
+        txt = ("<b>" + owner_s + "\nNFT в профиле (0 на маркете" + cat_note + "): "
+               + str(nft_count) + "</b>" + _make_nft_lines(hidden))
         kb = owner_card_kb(username, profile_url, uid or 0,
                            nft_url_for_msg=first_nft_url if nft_count == 1 else None,
                            nft_count=nft_count)
@@ -2881,24 +2975,56 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                 check_q.task_done()
 
     try:
+        # ценовая категория → коллекции по флору (5-20к = hard, не дешман)
+        if cat_filter_on:
+            try:
+                await status_msg.edit_text(
+                    "<b>Профиль / " + esc(CAT_LABELS.get(cat, str(cat)))
+                    + ":</b> считаю флоры коллекций...",
+                    parse_mode="HTML", reply_markup=stop_kb()
+                )
+            except Exception:
+                pass
+            gids, titles = await resolve_collections_for_cat(cat, gift_ids)
+            allowed_gids = set(int(g) for g in gids)
+            allowed_titles = list(titles)
+            logger.info("profile cat=%s collections=%s", cat, len(allowed_gids))
+        else:
+            allowed_gids = set(int(g) for g in (gift_ids or []))
+            title_by = {gid: title for gid, title in ALL_GIFT_IDS}
+            allowed_titles = [title_by[g] for g in allowed_gids if title_by.get(g)]
+
         await status_msg.edit_text(
-            "<b>Ищу профили с 0 гифтов на маркете...</b>",
+            "<b>Ищу профили с 0 гифтов на маркете"
+            + ((" / " + esc(CAT_LABELS.get(cat, str(cat)))) if cat_filter_on else "")
+            + "...</b>",
             parse_mode="HTML", reply_markup=stop_kb()
         )
         workers = [asyncio.create_task(worker()) for _ in range(22)]
 
-        # 1) Быстрый рандом из БД
+        # 1) Быстрый рандом из БД (с приоритетом моделей категории)
         if is_searching and found[0] < max_results:
             st = pricenft_db_stats()
             try:
                 await status_msg.edit_text(
-                    "<b>Профиль:</b> БД (" + str(st.get("users", 0)) + " юзеров)...",
+                    "<b>Профиль"
+                    + ((" / " + esc(CAT_LABELS.get(cat, str(cat)))) if cat_filter_on else "")
+                    + ":</b> БД (" + str(st.get("users", 0)) + " юзеров)...",
                     parse_mode="HTML", reply_markup=stop_kb()
                 )
             except Exception:
                 pass
             db_lim = max(600 if girls_only else 250, max_results * (25 if girls_only else 12))
-            cands = random_users_from_db(limit=db_lim)
+            cands = []
+            if cat_filter_on and allowed_titles:
+                titles_q = list(allowed_titles)
+                random.shuffle(titles_q)
+                for t in titles_q[:80]:
+                    cands.extend(random_from_pricenft_db(
+                        limit=max(db_lim // max(10, min(len(titles_q), 40)), 20),
+                        model=t, exact=True,
+                    ))
+            cands.extend(random_users_from_db(limit=db_lim))
             random.shuffle(cands)
             for h in cands:
                 if not is_searching or found[0] >= max_results:
@@ -2996,7 +3122,10 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                         )
                         if not saved:
                             continue
-                        hidden = [g for g in saved if g.get("nft_url") and not g.get("on_market") and not is_gift_seen(g.get("nft_url"))]
+                        # тот же фильтр категории — не пускаем дешман в 5-20к
+                        hidden = pick_hidden(saved)
+                        if not hidden:
+                            continue
                         if len(hidden) < min_gifts:
                             continue
                         if max_gifts and max_gifts > 0 and len(hidden) > max_gifts:
@@ -3018,8 +3147,10 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                         profile_url = info.get("profile_url") or (("https://t.me/" + username) if username else None)
                         if uid:
                             cache_owner(uid, owner_obj, username, name, profile_url, hidden)
+                        cat_note = (" / " + CAT_LABELS.get(cat, str(cat))) if cat_filter_on else ""
                         txt = ("<b>" + fmt_owner(owner_obj, username, name)
-                               + "\nNFT в профиле (скрытые): " + str(len(hidden)) + "</b>"
+                               + "\nNFT в профиле (скрытые" + cat_note + "): "
+                               + str(len(hidden)) + "</b>"
                                + _make_nft_lines(hidden))
                         kb = owner_card_kb(username, profile_url, uid or 0,
                                            nft_url_for_msg=hidden[0].get("nft_url") if len(hidden) == 1 else None,
@@ -3036,7 +3167,13 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                         soft_q.task_done()
 
             sw = [asyncio.create_task(soft_worker()) for _ in range(18)]
-            more = random_users_from_db(limit=max(500 if girls_only else 200, max_results * (20 if girls_only else 10)))
+            more = []
+            if cat_filter_on and allowed_titles:
+                for t in allowed_titles[:60]:
+                    more.extend(random_from_pricenft_db(
+                        limit=max(max_results * 4, 40), model=t, exact=True,
+                    ))
+            more.extend(random_users_from_db(limit=max(500 if girls_only else 200, max_results * (20 if girls_only else 10))))
             random.shuffle(more)
             for h in more:
                 if not is_searching or found[0] >= max_results:
@@ -3507,7 +3644,25 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
 
         await run_pass(ignore_global=False, enforce_cap=True, enforce_consec=True)
 
-        # добор из БД: только exact модель + slug match
+        def _prep_db_hit(h, t):
+            """Только эта коллекция: exact title + slug обязан совпасть с моделью."""
+            h = dict(h)
+            h["title"] = t
+            h["model"] = t
+            h["source"] = "pricenft_db"
+            slug = gift_slug_of(h.get("nft_url")) or ""
+            base = _norm_col_name(re.sub(r"-\d+$", "", slug))
+            want = _norm_col_name(t)
+            # без slug или чужой slug — не берём (иначе «рандом» вместо выбранного гифта)
+            if not want or not base or base != want:
+                return None
+            if not item_matches_collections(h, allowed_gids, allowed_titles):
+                return None
+            if single and allowed_gids:
+                h["gift_id"] = next(iter(allowed_gids))
+            return h
+
+        # добор из БД: только exact модель + slug == коллекция
         if is_searching and found[0] < max_results and allowed_titles:
             need = max_results - found[0]
             hits = []
@@ -3515,15 +3670,13 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 allowed_titles, min(len(allowed_titles), 50)
             )
             for t in titles_q:
-                part = random_from_pricenft_db(limit=max(need * (12 if girls_only else 6), 60), model=t, exact=True)
+                part = random_from_pricenft_db(
+                    limit=max(need * (14 if girls_only else 8), 80), model=t, exact=True,
+                )
                 for h in part:
-                    h = dict(h)
-                    h["title"] = t
-                    h["model"] = t
-                    h["source"] = "pricenft_db"
-                    if not item_matches_collections(h, allowed_gids, allowed_titles):
-                        continue
-                    hits.append(h)
+                    hh = _prep_db_hit(h, t)
+                    if hh:
+                        hits.append(hh)
             random.shuffle(hits)
             for h in hits:
                 if not is_searching or found[0] >= max_results:
@@ -3538,21 +3691,20 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
         if is_searching and found[0] < max_results:
             await run_pass(ignore_global=True, enforce_cap=True, enforce_consec=True)
 
-        # финальный добор: ослабляем только cap
+        # финальный добор: маркет ещё раз + БД только с верным slug
         if is_searching and found[0] < max_results:
             if allowed_titles:
                 need = max_results - found[0]
                 hits = []
                 for t in (allowed_titles if single else allowed_titles[:80]):
-                    hits.extend(random_from_pricenft_db(limit=max(need * 8, 80), model=t, exact=True))
+                    for h in random_from_pricenft_db(limit=max(need * 10, 100), model=t, exact=True):
+                        hh = _prep_db_hit(h, t)
+                        if hh:
+                            hits.append(hh)
                 random.shuffle(hits)
                 for h in hits:
                     if not is_searching or found[0] >= max_results:
                         break
-                    h = dict(h)
-                    h["source"] = "pricenft_db"
-                    if not item_matches_collections(h, allowed_gids, allowed_titles):
-                        continue
                     if girls_only and not is_girl(None, h.get("username"), h.get("name")):
                         continue
                     await send_item(h, ignore_global=True, enforce_cap=False, enforce_consec=(not single))
@@ -3696,18 +3848,19 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             parse_mode="HTML", reply_markup=stop_kb()
         )
 
-        # 1) кандидаты из БД по exact модели
+        # 1) кандидаты из БД ТОЛЬКО по exact модели (не рандом всех гифтов)
         cands = []
         titles_q = allowed_titles if single else random.sample(
             allowed_titles, min(len(allowed_titles), 40)
         )
         for t in titles_q:
             cands.extend(random_from_pricenft_db(
-                limit=max(max_results * (20 if girls_only else 10), 120),
+                limit=max(max_results * (24 if girls_only else 14), 160),
                 model=t, exact=True,
             ))
-        # общие юзеры как добор
-        cands.extend(random_users_from_db(limit=max(400 if girls_only else 200, max_results * 15)))
+        # общие юзеры — только если «все коллекции»; при 1 гифте не мешаем рандомом
+        if not single:
+            cands.extend(random_users_from_db(limit=max(300 if girls_only else 150, max_results * 12)))
         random.shuffle(cands)
 
         sem = asyncio.Semaphore(20)
