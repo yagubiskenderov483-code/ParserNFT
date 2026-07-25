@@ -3615,8 +3615,8 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
     """
     Профиль: аккаунты с 0 гифтов на маркете.
     cat — фильтр по флору коллекции скрытых NFT (у off-market нет цены лота).
-    Кандидаты: профильная БД (скрытые NFT) → маркет-БД → чаты.
-    Найденные скрытые гифты пишем в profile_gifts.db.
+    Кандидаты: ТОЛЬКО profile_gifts.db + чаты. Маркет-БД не используется.
+    Строго 0 гифтов на маркете. Найденное → profile_gifts.db.
     seen помечаем только при реальной выдаче.
     """
     chat_id = chat_id or (status_msg.chat.id if getattr(status_msg, "chat", None) else None)
