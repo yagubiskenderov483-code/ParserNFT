@@ -502,10 +502,17 @@ def clearly_not_girl(owner, username=None, name=None):
 
 
 async def girl_ok(owner, username=None, name=None, uid=None, gifts=None,
-                  market_strict=False):
-    """Быстрый отсев парней → жёсткое подтверждение async (bio/ава/подарки)."""
+                  market_strict=False, enrich=True):
+    """Проверка девушки.
+    enrich=False - быстрый sync (для маркета, без GetFullUser/FloodWait).
+    enrich=True  - тянем bio/аву (профиль)."""
     if clearly_not_girl(owner, username, name):
         return False
+    if not enrich:
+        return is_girl(
+            owner, username, name,
+            require_photo=False, gifts=gifts, market_strict=market_strict,
+        )
     return await is_girl_async(
         owner, username, name, uid=uid, gifts=gifts, market_strict=market_strict,
     )
@@ -621,8 +628,8 @@ def _girl_gift_boost(gifts):
 
 def is_girl(owner, username=None, name=None, require_photo=False, has_photo=None,
             gifts=None, market_strict=False):
-    """Жёсткий детект девушки по имени/нику/bio/аве/подаркам.
-    market_strict=True (маркет): имя+ава недостаточно - нужно bio/ник подтверждение."""
+    """Детект девушки: парней режем жёстко, девушек пропускаем по имени/нику/bio.
+    market_strict - чуть строже (нужно имя или ник или явный маркер), без убийства выдачи."""
     bio_raw   = (getattr(owner, "bio",        "") or "") if owner else ""
     uname_raw = (getattr(owner, "username",   "") or "") if owner else (username or "")
     fname_raw = (getattr(owner, "first_name", "") or "") if owner else ""
@@ -668,9 +675,8 @@ def is_girl(owner, username=None, name=None, require_photo=False, has_photo=None
         return False
     if (tokens & BOY_NAMES_SET) and not has_girl_name:
         return False
-    # мужское слово в bio - отказ даже при женском имени
     if bio_l and any(w in bio_l.split() for w in (
-        "парень", "мужчина", "мужик", "he/him", "boy", "guy",
+        "парень", "мужчина", "мужик", "he/him",
     )):
         if "she/her" not in bio_l and "девушка" not in bio_l:
             return False
@@ -678,38 +684,22 @@ def is_girl(owner, username=None, name=None, require_photo=False, has_photo=None
     score = 0
     strong = False
     gboost = _girl_gift_boost(_gifts)
-    sig_name = False
-    sig_bio = False
-    sig_uname = False
-    sig_emoji = False
-    sig_gifts = False
 
     if has_girl_name:
         score += 4
         strong = True
-        sig_name = True
 
-    # bio / явные маркеры
     if any(sig in full or sig in bio_raw for sig in GIRL_SIGNALS_STRICT):
-        score += 4
+        score += 3
         strong = True
-        sig_bio = True
     if has_girl_kw:
         score += 2
         strong = True
-        if bio_l and has_girl_kw:
-            score += 1
-            sig_bio = True
 
-    # женские эмодзи в bio/нике/имени
-    if any(ch in bio_raw for ch in GIRL_CHARS_STRICT):
+    if any(ch in bio_raw or ch in uname_raw or ch in fname_raw for ch in GIRL_CHARS_STRICT):
         score += 2
         strong = True
-        sig_emoji = True
-    elif any(ch in uname_raw or ch in fname_raw for ch in GIRL_CHARS_STRICT):
-        score += 1
 
-    # username маркеры
     uname_compact = re.sub(r"[^a-zа-яёіїєґ]", "", uname)
     for kw in GIRL_UNAME_STRICT:
         if kw in uname and (
@@ -722,53 +712,46 @@ def is_girl(owner, username=None, name=None, require_photo=False, has_photo=None
         ):
             score += 3
             strong = True
-            sig_uname = True
             break
     for gn in GIRL_NAMES_SET:
-        if len(gn) >= 5 and gn in uname:
+        if len(gn) >= 4 and gn in uname:
             score += 2
-            sig_uname = True
+            strong = True
             break
 
-    # подарки
     if gboost:
         score += gboost
         if gboost >= 2:
-            sig_gifts = True
-            # одних подарков мало для strong на маркете
-            if not market_strict:
-                strong = True
+            strong = True
 
-    # аватарка - лёгкий плюс
-    if has_photo and (has_girl_name or has_girl_kw or gboost):
+    if has_photo and (has_girl_name or has_girl_kw):
         score += 1
 
-    # окончания - только как доп.балл, одних мало
-    STRONG_RU = ("на", "ья", "ия", "ая", "ина", "ена", "лла", "елла")
-    STRONG_LAT = ("ina", "yna", "ella", "ette", "elle", "issa", "enna")
-    if fname0 and len(fname0) >= 4 and fname0 not in MALE_NAME_EXCEPTIONS_A:
+    # женские окончания имени
+    STRONG_RU = ("на", "ья", "ия", "ая", "ина", "ена", "лла", "елла", "ка", "ша", "ля")
+    STRONG_LAT = ("ina", "yna", "ella", "ette", "elle", "issa", "enna", "ia", "ya")
+    soft_end = False
+    if fname0 and len(fname0) >= 3 and fname0 not in MALE_NAME_EXCEPTIONS_A:
         if any(fname0.endswith(e) for e in STRONG_RU) or any(fname0.endswith(e) for e in STRONG_LAT):
-            score += 1
+            score += 2
+            soft_end = True
+        elif len(fname0) >= 4 and fname0[-1] in ("a", "а", "я"):
+            score += 2
+            soft_end = True
 
     if require_photo and not has_photo:
-        if not (has_girl_name and has_girl_kw and score >= 7):
+        if not (has_girl_name and score >= 5):
             return False
 
-    if not strong:
-        return False
-
-    # Маркет: имя+ава = часто фейк трейдера. Нужно 2 источника + bio/ник/emoji
+    # маркет: имя / ник / окончание / маркеры - достаточно; парней уже срезали
     if market_strict:
-        buckets = sum([sig_name, sig_bio, sig_uname, sig_emoji, sig_gifts])
-        if buckets < 2:
+        if not (has_girl_name or has_girl_kw or soft_end or strong):
             return False
-        # обязательно подтверждение из профиля (bio/ник/emoji), не только имя
-        if not (sig_bio or sig_uname or sig_emoji):
-            return False
-        thr = 6
-        return score >= thr and bool(fname0 or uname or bio_l)
+        return score >= 3 and bool(fname0 or uname)
 
-    thr = 5 if (has_photo or gboost >= 2) else 6
+    if not strong and not soft_end:
+        return False
+    thr = 3 if has_girl_name else (4 if (has_photo or soft_end) else 5)
     return score >= thr and bool(fname0 or uname or bio_l)
 
 
@@ -3002,7 +2985,7 @@ async def deliver_pricenft_random(status_msg, max_results=20, girls_only=False, 
         if is_trader_account(owner, uname, name):
             mark_seen(oid, uname, None)
             continue
-        if girls_only and not await girl_ok(owner, uname, name, uid=oid):
+        if girls_only and not await girl_ok(owner, uname, name, uid=oid, enrich=False):
             continue
         if region and region != "any":
             if not region_match_full(owner, uname, name, region):
@@ -3539,9 +3522,8 @@ def _make_nft_lines(items):
 async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                            boost=100, min_gifts=1, max_gifts=0,
                            max_results=30, region="any"):
-    """Маркет: свежие лоты (порядок API = недавно выставленные).
-    Девушки: market_strict (имя+ава недостаточно).
-    Разнообразие: не одна коллекция подряд + лимит на коллекцию."""
+    """Маркет: свежие лоты (порядок API), цена лота по категории.
+    Девушки: быстрый sync-фильтр (без GetFullUser на каждый лот)."""
     global is_searching
     is_searching = True
     try:
@@ -3555,16 +3537,11 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
     seen_owners = set()
     last_gid    = [None]
     col_counts  = {}
-    n_cols = max(1, len(gift_ids or []))
-    if n_cols <= 1:
-        hard_cap = max_results
-    else:
-        hard_cap = max(3, min(MAX_PER_COLLECTION, (max_results + n_cols - 1) // max(1, min(n_cols, 10))))
-    # свежие = первые страницы; для девушек чуть глубже из-за жёсткого фильтра
-    page_limit = 60 if girls_only else 50
-    page_count = 5 if girls_only else 3
+    # свежие страницы; для девушек/категории копаем глубже
+    page_limit = 80
+    page_count = 6 if girls_only else 4
 
-    async def send_one(item, ignore_global=False, enforce_cap=True, enforce_consec=True):
+    async def send_one(item, ignore_global=False, enforce_cap=True, enforce_consec=True, n_cols=1, hard_cap=5):
         oid = item.get("owner_id")
         uname = item.get("username")
         if not oid and not uname:
@@ -3583,7 +3560,6 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 return False
             if slug and slug in seen_slugs:
                 return False
-            # не забиваем выдачу одной коллекцией и не шлём одинаковые подряд
             if n_cols > 1 and gid is not None:
                 if enforce_cap and col_counts.get(gid, 0) >= hard_cap:
                     return False
@@ -3642,28 +3618,8 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 last_gid[0] = prev_last
             return False
 
-    async def process_item(item, title="", ignore_global=False, enforce_cap=True, enforce_consec=True):
-        if not is_searching or found[0] >= max_results:
-            return False
-        item = dict(item)
-        item["source"] = "market"
-        if title and (not item.get("title") or str(item.get("title")) in ("?", "NFT")):
-            item["title"] = title
-        if not price_in_cat(item.get("price"), cat):
-            return False
-        if girls_only and not await girl_ok(
-            item.get("owner"), item.get("username"), item.get("name"),
-            uid=item.get("owner_id"), market_strict=True,
-        ):
-            return False
-        if region and region != "any":
-            if not region_match_full(item.get("owner"), item.get("username"), item.get("name"), region):
-                return False
-        return await send_one(item, ignore_global=ignore_global,
-                              enforce_cap=enforce_cap, enforce_consec=enforce_consec)
-
-    async def scan_col(gid, title="", ignore_global=False, enforce_cap=True, enforce_consec=True):
-        """Скан одной коллекции: страницы строго newest-first, без shuffle."""
+    async def scan_col(gid, title="", ignore_global=False, enforce_cap=True,
+                       enforce_consec=True, n_cols=1, hard_cap=5):
         if not is_searching or found[0] >= max_results:
             return
         offset = ""
@@ -3677,12 +3633,34 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 return
             if not items:
                 return
-            # порядок API сохраняем - это свежие лоты
+            # newest-first, без shuffle
             for item in items:
                 if not is_searching or found[0] >= max_results:
                     return
-                await process_item(item, title=title, ignore_global=ignore_global,
-                                   enforce_cap=enforce_cap, enforce_consec=enforce_consec)
+                item = dict(item)
+                item["gift_id"] = int(gid)
+                item["source"] = "market"
+                if title and (not item.get("title") or str(item.get("title")) in ("?", "NFT")):
+                    item["title"] = title
+                if not price_in_cat(item.get("price"), cat):
+                    continue
+                # быстрый фильтр девушек: sync, без GetFullUser (иначе FloodWait и 0 результатов)
+                if girls_only:
+                    if clearly_not_girl(item.get("owner"), item.get("username"), item.get("name")):
+                        continue
+                    if not await girl_ok(
+                        item.get("owner"), item.get("username"), item.get("name"),
+                        uid=item.get("owner_id"), market_strict=True, enrich=False,
+                    ):
+                        continue
+                if region and region != "any":
+                    if not region_match_full(item.get("owner"), item.get("username"), item.get("name"), region):
+                        continue
+                await send_one(
+                    item, ignore_global=ignore_global,
+                    enforce_cap=enforce_cap, enforce_consec=enforce_consec,
+                    n_cols=n_cols, hard_cap=hard_cap,
+                )
             if not nxt:
                 return
             offset = nxt
@@ -3692,88 +3670,96 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             "<b>Ищу свежие лоты на маркете...\nЛимит выдачи: " + str(max_results) + "</b>",
             parse_mode="HTML", reply_markup=stop_kb()
         )
-        id_set = set(gift_ids)
-        valid_pairs = [(gid, title) for gid, title in ALL_GIFT_IDS if gid in id_set] if ALL_GIFT_IDS else [(gid, "") for gid in gift_ids]
+
+        # если есть ценовая категория - сначала коллекции с подходящим флором
+        valid_pairs = []
+        cat_on = bool(cat and cat not in ("any", "all", "none") and _cat_bounds(cat))
+        if cat_on:
+            try:
+                await status_msg.edit_text(
+                    "<b>Маркет / " + esc(CAT_LABELS.get(cat, str(cat)))
+                    + ":</b> подбираю коллекции...",
+                    parse_mode="HTML", reply_markup=stop_kb()
+                )
+            except Exception:
+                pass
+            gids_cat, titles_cat = await resolve_collections_for_cat(cat, gift_ids)
+            title_by = {gid: title for gid, title in (ALL_GIFT_IDS or [])}
+            for i, g in enumerate(gids_cat):
+                t = titles_cat[i] if i < len(titles_cat) else title_by.get(g, "")
+                valid_pairs.append((int(g), t or ""))
+            logger.info("market cat=%s collections=%s", cat, len(valid_pairs))
+
         if not valid_pairs:
-            valid_pairs = [(gid, "") for gid in gift_ids]
-        # не перемешиваем коллекции каждый раз целиком - берём по кругу свежие с каждой
-        random.shuffle(valid_pairs)
+            id_set = set(int(x) for x in (gift_ids or []))
+            valid_pairs = [(gid, title) for gid, title in ALL_GIFT_IDS if gid in id_set] if ALL_GIFT_IDS else []
+            if not valid_pairs:
+                valid_pairs = [(int(gid), "") for gid in (gift_ids or [])]
 
-        # Фаза 1: только 1-я страница каждой коллекции (самые свежие), round-robin
-        async def fetch_first_pages():
-            sem = asyncio.Semaphore(16)
-            out = {}
-
-            async def one(gid, title):
-                async with sem:
-                    try:
-                        items, nxt = await fetch_market_page(gid, "", limit=page_limit, newest=True)
-                    except Exception:
-                        items, nxt = [], ""
-                    return gid, title, items or [], nxt
-
-            parts = await asyncio.gather(
-                *[one(g, t) for g, t in valid_pairs],
-                return_exceptions=True,
+        if not valid_pairs:
+            await status_msg.edit_text(
+                "<b>Нет коллекций для поиска. Авторизуй Telethon в /admin</b>",
+                parse_mode="HTML", reply_markup=menu_kb()
             )
-            for p in parts:
-                if isinstance(p, tuple) and len(p) == 4:
-                    gid, title, items, nxt = p
-                    out[gid] = {"title": title, "items": items, "nxt": nxt}
-            return out
+            return 0
 
-        first = await fetch_first_pages()
-        # round-robin по индексам внутри страниц - свежие со всех коллекций
-        max_len = max((len(v["items"]) for v in first.values()), default=0)
-        for idx in range(max_len):
-            if not is_searching or found[0] >= max_results:
-                break
-            for gid, title in valid_pairs:
+        random.shuffle(valid_pairs)
+        n_cols = max(1, len(valid_pairs))
+        if n_cols <= 1:
+            hard_cap = max_results
+        else:
+            hard_cap = max(4, min(MAX_PER_COLLECTION + 2, (max_results + n_cols - 1) // max(1, min(n_cols, 12))))
+
+        PARALLEL = 18
+
+        async def run_pass(ignore_global=False, enforce_cap=True, enforce_consec=True):
+            for i in range(0, len(valid_pairs), PARALLEL):
                 if not is_searching or found[0] >= max_results:
                     break
-                bucket = first.get(gid)
-                if not bucket or idx >= len(bucket["items"]):
-                    continue
-                await process_item(
-                    bucket["items"][idx], title=bucket["title"],
-                    ignore_global=False, enforce_cap=True, enforce_consec=True,
+                chunk = valid_pairs[i:i + PARALLEL]
+                await asyncio.gather(
+                    *[scan_col(
+                        gid, t,
+                        ignore_global=ignore_global,
+                        enforce_cap=enforce_cap,
+                        enforce_consec=enforce_consec,
+                        n_cols=n_cols,
+                        hard_cap=hard_cap,
+                    ) for gid, t in chunk],
+                    return_exceptions=True,
                 )
-            if idx % 8 == 0:
                 try:
                     await status_msg.edit_text(
-                        "<b>Маркет (свежие):</b> " + str(found[0]) + "/" + str(max_results),
+                        "<b>Маркет:</b> " + str(found[0]) + "/" + str(max_results)
+                        + (" / " + esc(CAT_LABELS.get(cat, "")) if cat_on else ""),
                         parse_mode="HTML", reply_markup=stop_kb()
                     )
                 except Exception:
                     pass
 
-        # Фаза 2: более глубокий скан если мало результатов
+        await run_pass(ignore_global=False, enforce_cap=True, enforce_consec=True)
         if is_searching and found[0] < max_results:
-            PARALLEL = 12
+            await run_pass(ignore_global=True, enforce_cap=True, enforce_consec=True)
+        if is_searching and found[0] < max_results and n_cols > 1:
+            await run_pass(ignore_global=True, enforce_cap=False, enforce_consec=True)
 
-            async def run_pass(ignore_global=False, enforce_cap=True, enforce_consec=True):
-                for i in range(0, len(valid_pairs), PARALLEL):
-                    if not is_searching or found[0] >= max_results:
-                        break
-                    chunk = valid_pairs[i:i + PARALLEL]
-                    await asyncio.gather(
-                        *[scan_col(gid, t, ignore_global=ignore_global,
-                                   enforce_cap=enforce_cap, enforce_consec=enforce_consec)
-                          for gid, t in chunk],
-                        return_exceptions=True,
+        # если категория по флору дала мало - добор по всем коллекциям, фильтр по цене лота
+        if cat_on and is_searching and found[0] < max(3, max_results // 3):
+            id_set = set(int(x) for x in (gift_ids or []))
+            all_pairs = [(gid, title) for gid, title in ALL_GIFT_IDS if gid in id_set] if ALL_GIFT_IDS else [(int(g), "") for g in (gift_ids or [])]
+            extra = [p for p in all_pairs if p[0] not in {g for g, _ in valid_pairs}]
+            random.shuffle(extra)
+            valid_pairs = extra[:120]
+            n_cols = max(1, len(valid_pairs))
+            if valid_pairs:
+                try:
+                    await status_msg.edit_text(
+                        "<b>Маркет:</b> добор по цене лота...\n"
+                        + str(found[0]) + "/" + str(max_results),
+                        parse_mode="HTML", reply_markup=stop_kb()
                     )
-                    try:
-                        await status_msg.edit_text(
-                            "<b>Маркет:</b> " + str(found[0]) + "/" + str(max_results),
-                            parse_mode="HTML", reply_markup=stop_kb()
-                        )
-                    except Exception:
-                        pass
-
-            await run_pass(ignore_global=False, enforce_cap=True, enforce_consec=True)
-            if is_searching and found[0] < max_results:
-                await run_pass(ignore_global=True, enforce_cap=True, enforce_consec=True)
-            if is_searching and found[0] < max_results and n_cols > 1:
+                except Exception:
+                    pass
                 await run_pass(ignore_global=True, enforce_cap=False, enforce_consec=True)
 
         db_flush(force=True)
@@ -3879,15 +3865,15 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 gid = int(raw)
             except Exception:
                 return False
-        # slug чужой коллекции - никогда (и на маркете тоже, если slug читается)
+        # slug чужой коллекции: на маркете с верным gift_id - ок; иначе отказ
+        src = item.get("source") or ""
         if slug and allowed_titles:
             base = _norm_col_name(re.sub(r"-\d+$", "", slug))
             norms = {_norm_col_name(t) for t in allowed_titles if t}
-            if base and norms and base not in norms:
-                return False
-        # при 1 модели без slug - только market+верный gift_id
-        if single and allowed_titles and not slug:
-            src = item.get("source") or ""
+            if base and norms and base not in norms and not any(n in base or base in n for n in norms if len(n) >= 4):
+                if not (src == "market" and gid is not None and gid in allowed_gids):
+                    return False
+        if single and not slug:
             try:
                 if src != "market" or int(item.get("gift_id")) not in allowed_gids:
                     return False
@@ -3993,18 +3979,22 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 it["source"] = "market"
                 if title:
                     it["title"] = title
-                # жёстко: slug должен быть этой модели (если читается)
+                # gift_id из скана маркета - источник истины; slug сверяем мягко
                 slug = gift_slug_of(it.get("nft_url")) or ""
                 if slug and title:
                     base = _norm_col_name(re.sub(r"-\d+$", "", slug))
                     want = _norm_col_name(title)
-                    if base and want and base != want:
+                    # отсекаем только явный чужой slug (не подстрока)
+                    if base and want and base != want and want not in base and base not in want:
                         continue
-                if girls_only and not await girl_ok(
-                    it.get("owner"), it.get("username"), it.get("name"),
-                    uid=it.get("owner_id"), market_strict=True,
-                ):
-                    continue
+                if girls_only:
+                    if clearly_not_girl(it.get("owner"), it.get("username"), it.get("name")):
+                        continue
+                    if not await girl_ok(
+                        it.get("owner"), it.get("username"), it.get("name"),
+                        uid=it.get("owner_id"), market_strict=True, enrich=False,
+                    ):
+                        continue
                 if region and region != "any":
                     if not region_match_full(it.get("owner"), it.get("username"), it.get("name"), region):
                         continue
@@ -4019,7 +4009,6 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             await status_msg.edit_text("<b>Коллекция не выбрана</b>", parse_mode="HTML", reply_markup=menu_kb())
             return 0
         if not allowed_titles and single:
-            # без имени коллекции slug не проверить - всё равно сканим gift_id
             logger.warning("model search: no title for gids=%s", allowed_gids)
         await status_msg.edit_text(
             "<b>Модель: " + esc(str(label))
@@ -4095,7 +4084,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                     break
                 if girls_only and not await girl_ok(
                     None, h.get("username"), h.get("name"),
-                    uid=h.get("owner_id"), market_strict=True,
+                    uid=h.get("owner_id"), market_strict=True, enrich=False,
                 ):
                     continue
                 await send_item(h, ignore_global=True, enforce_cap=False, enforce_consec=consec_multi)
