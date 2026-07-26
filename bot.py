@@ -32,8 +32,15 @@ API_ID       = 36101343
 API_HASH     = "116195fa5e0459d25a9a6266b40807d7"
 BOT_TOKEN    = "8790434095:AAG5eA6OzMcC2-VdLeTeITahdUi_6KiIRiw"
 ADMIN_ID     = 7186944876
-OWNER_ID     = 7186944876  # единственный кто может пользоваться ботом
+OWNER_ID     = 7186944876  # единственный кто может пользоваться ботом — ВСЕ остальные = ОШИБКА
 ALLOWED_USER_IDS = {OWNER_ID}
+# страховка: env не может расширить доступ, только подтвердить тот же id
+_env_owner = (os.environ.get("OWNER_ID") or os.environ.get("ADMIN_ID") or "").strip()
+if _env_owner.isdigit() and int(_env_owner) != int(OWNER_ID):
+    raise SystemExit(
+        "FATAL: OWNER_ID в env=%s не совпадает с зашитым %s. "
+        "Парсер только для одного владельца." % (_env_owner, OWNER_ID)
+    )
 SESSION_NAME = "nft_session"
 USERS_FILE   = "users.json"
 ONBOARDING_FILE = "onboarding_done.json"
@@ -326,16 +333,49 @@ def user_db_path(uid=None):
     return os.path.join(d, "gifts.db")
 
 ACCESS_DENY_HTML = (
-    "<b>❌ Ошибка</b>\n"
-    "Бот только для владельца.\n"
+    "<b>❌ ОШИБКА</b>\n"
+    "Этот парсер только для владельца.\n"
     "Твой ID: <code>{uid}</code>\n"
-    "Доступ запрещён."
+    "Доступ запрещён. Иди нахуй."
 )
-ACCESS_DENY_ALERT = "❌ Ошибка: доступ запрещён. Только владелец."
+ACCESS_DENY_ALERT = "❌ ОШИБКА: доступ запрещён. Только владелец."
+
+
+def _is_owner_uid(uid) -> bool:
+    try:
+        return int(uid) == int(OWNER_ID)
+    except Exception:
+        return False
+
+
+async def _deny_stranger(event, uid) -> None:
+    """Жёсткий отказ чужому: сообщение + лог."""
+    try:
+        uid = int(uid) if uid is not None else 0
+    except Exception:
+        uid = 0
+    logger.warning("ACCESS DENIED uid=%s owner=%s", uid, OWNER_ID)
+    try:
+        if isinstance(event, Message):
+            await event.answer(ACCESS_DENY_HTML.format(uid=uid), parse_mode="HTML")
+        elif isinstance(event, CallbackQuery):
+            try:
+                await event.answer(ACCESS_DENY_ALERT, show_alert=True)
+            except Exception:
+                pass
+            try:
+                if event.message:
+                    await event.message.answer(
+                        ACCESS_DENY_HTML.format(uid=uid), parse_mode="HTML"
+                    )
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 class AdminOnlyMiddleware(BaseMiddleware):
-    """Только OWNER_ID (7186944876). Всем остальным - ошибка."""
+    """Только OWNER_ID. Чужим — ошибка. Без исключений."""
     async def __call__(
         self,
         handler: Callable[[Any, Dict[str, Any]], Awaitable[Any]],
@@ -344,30 +384,12 @@ class AdminOnlyMiddleware(BaseMiddleware):
     ) -> Any:
         user = data.get("event_from_user")
         if user is None:
-            return await handler(event, data)
+            # нет юзера в апдейте — не пускаем (канал/анон и т.п.)
+            logger.warning("blocked update without user")
+            return None
         uid = int(user.id)
-        if uid != int(OWNER_ID):
-            try:
-                if isinstance(event, Message):
-                    await event.answer(
-                        ACCESS_DENY_HTML.format(uid=uid),
-                        parse_mode="HTML",
-                    )
-                elif isinstance(event, CallbackQuery):
-                    try:
-                        await event.answer(ACCESS_DENY_ALERT, show_alert=True)
-                    except Exception:
-                        pass
-                    try:
-                        await event.message.answer(
-                            ACCESS_DENY_HTML.format(uid=uid),
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            logger.warning("blocked uid=%s (owner=%s)", uid, OWNER_ID)
+        if not _is_owner_uid(uid):
+            await _deny_stranger(event, uid)
             return None
         token = set_current_uid(uid)
         try:
@@ -381,6 +403,15 @@ class AdminOnlyMiddleware(BaseMiddleware):
 
 dp.message.middleware(AdminOnlyMiddleware())
 dp.callback_query.middleware(AdminOnlyMiddleware())
+# на всякий — если появятся другие типы апдейтов
+try:
+    dp.edited_message.middleware(AdminOnlyMiddleware())
+except Exception:
+    pass
+try:
+    dp.inline_query.middleware(AdminOnlyMiddleware())
+except Exception:
+    pass
 
 stats             = {"checks": 0, "found": 0}
 is_searching      = False
@@ -1106,10 +1137,7 @@ def get_limit(uid):     return USER_LIMIT.get(uid, DEFAULT_LIMIT)
 def get_region(uid):    return USER_REGION.get(uid, DEFAULT_REGION)
 def is_admin(uid):
     """Только владелец OWNER_ID."""
-    try:
-        return int(uid) == int(OWNER_ID)
-    except Exception:
-        return False
+    return _is_owner_uid(uid)
 
 
 # ── FSM ───────────────────────────────────────────────────────────────────────
@@ -1474,10 +1502,12 @@ def model_col_kb(who, search_type, collections, page=0):
     if row:
         rows.append(row)
 
-    rows.append([InlineKeyboardButton(
-        text="📦 Все коллекции",
-        callback_data="mdlrun_" + who[0] + "_" + search_type[0] + "_all"
-    )])
+    # для профиля — только одна модель (кнопка «все» даёт рандом)
+    if search_type != "profile":
+        rows.append([InlineKeyboardButton(
+            text="📦 Все коллекции",
+            callback_data="mdlrun_" + who[0] + "_" + search_type[0] + "_all"
+        )])
 
     nav = []
     if page > 0:
@@ -2032,7 +2062,8 @@ async def fetch_saved_gifts(uid_or_username, max_pages=2, only_off_market=False,
     # не форсим 6 страниц - убивало скорость/выдачу
     pages = max(1, int(max_pages or 1))
     if require_zero_on_market:
-        pages = max(pages, 2)
+        # глубже: лот на 3–5й странице иначе пропускали и врали «0 на маркете»
+        pages = max(pages, 6)
     try:
         peer = await tg_client.get_input_entity(uid_or_username)
     except Exception as e:
@@ -3486,7 +3517,7 @@ async def get_chat_members_with_gifts(chat_username, max_users=500):
 async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                             min_gifts=1, max_gifts=0,
                             max_results=30, region="any"):
-    """Профиль: сначала 0 на маркете, потом добор скрытых NFT (чтобы не было пусто)."""
+    """Профиль: СТРОГО 0 гифтов на маркете. Без soft-refill и без «скрытых»."""
     global is_searching
     is_searching = True
     lock = asyncio.Lock()
@@ -3519,7 +3550,8 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             return
         await check_q.put(info)
 
-    async def check_one(info, require_zero=True):
+    async def check_one(info):
+        """Только require_zero=True. Кто имеет хоть 1 лот на маркете — мимо."""
         if not is_searching or found[0] >= max_results:
             return
         owner_obj = info.get("owner")
@@ -3548,14 +3580,19 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         if region and region != "any":
             if not region_match_full(owner_obj, username, name, region):
                 return
+        # строго 0 на маркете, копаем глубоко
         saved = await fetch_saved_gifts(
-            peer, max_pages=1, only_off_market=True, require_zero_on_market=require_zero
+            peer, max_pages=6, only_off_market=True, require_zero_on_market=True
         )
         if saved is None:
             stats_skip["market"] += 1
             return
         if not saved:
             stats_skip["empty"] += 1
+            return
+        # страховка: ни одного on_market
+        if any(g.get("on_market") for g in saved):
+            stats_skip["market"] += 1
             return
         hidden = []
         for g in saved:
@@ -3597,8 +3634,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         first_nft_url = hidden[0].get("nft_url")
         nft_count = len(hidden)
         cat_note = (" / " + CAT_LABELS.get(cat, str(cat))) if cat_filter_on else ""
-        zero_note = "0 на маркете" if require_zero else "скрытые"
-        txt = ("<b>" + owner_s + "\nNFT в профиле (" + zero_note + cat_note + "): "
+        txt = ("<b>" + owner_s + "\nNFT в профиле (0 на маркете" + cat_note + "): "
                + str(nft_count) + "</b>" + _make_nft_lines(hidden))
         kb = owner_card_kb(username, profile_url, uid or 0,
                            nft_url_for_msg=first_nft_url if nft_count == 1 else None,
@@ -3628,7 +3664,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                     return
                 continue
             try:
-                await check_one(info, require_zero=True)
+                await check_one(info)
             finally:
                 check_q.task_done()
 
@@ -3645,7 +3681,6 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             gids, titles = await resolve_collections_for_cat(cat, gift_ids)
             allowed_titles = list(titles)
             if not allowed_titles:
-                # не блокируем поиск пустым флором - берём все выбранные gift_ids
                 cat_filter_on = False
         if not cat_filter_on:
             title_by = {gid: title for gid, title in ALL_GIFT_IDS}
@@ -3653,9 +3688,9 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             allowed_titles = [title_by[g] for g in allowed_gids if title_by.get(g)]
 
         await status_msg.edit_text(
-            "<b>Ищу профили с 0 гифтов на маркете"
+            "<b>Ищу профили: строго 0 гифтов на маркете"
             + ((" / " + esc(CAT_LABELS.get(cat, str(cat)))) if cat_filter_on else "")
-            + "...</b>",
+            + "\n(без добора «скрытых»)</b>",
             parse_mode="HTML", reply_markup=stop_kb()
         )
         workers = [asyncio.create_task(worker()) for _ in range(22)]
@@ -3664,16 +3699,20 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             st = pricenft_db_stats()
             try:
                 await status_msg.edit_text(
-                    "<b>Профиль:</b> БД (" + str(st.get("users", 0)) + " юзеров)...",
+                    "<b>Профиль (0 на маркете):</b> БД ("
+                    + str(st.get("users", 0)) + " юзеров)...",
                     parse_mode="HTML", reply_markup=stop_kb()
                 )
             except Exception:
                 pass
             cands = []
+            # если выбран ценовой фильтр — только юзеры этих коллекций (не рандом всех)
             if cat_filter_on and allowed_titles:
-                for t in allowed_titles[:60]:
-                    cands.extend(random_from_pricenft_db(limit=40, model=t, exact=True))
-            cands.extend(random_users_from_db(limit=max(400 if girls_only else 250, max_results * 12)))
+                for t in allowed_titles[:80]:
+                    cands.extend(random_from_pricenft_db(limit=50, model=t, exact=True))
+            else:
+                # без категории — можно брать случайных, но check_one всё равно режет market
+                cands.extend(random_users_from_db(limit=max(400 if girls_only else 280, max_results * 14)))
             random.shuffle(cands)
             for h in cands:
                 if not is_searching or found[0] >= max_results:
@@ -3690,7 +3729,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         if is_searching and found[0] < max_results:
             try:
                 await status_msg.edit_text(
-                    "<b>Профиль:</b> чаты...\nНайдено: " + str(found[0]),
+                    "<b>Профиль (0 на маркете):</b> чаты...\nНайдено: " + str(found[0]),
                     parse_mode="HTML", reply_markup=stop_kb()
                 )
             except Exception:
@@ -3721,47 +3760,12 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
 
         feeder_done.set()
         try:
-            await asyncio.wait_for(asyncio.gather(*workers, return_exceptions=True), timeout=150)
+            await asyncio.wait_for(asyncio.gather(*workers, return_exceptions=True), timeout=180)
         except asyncio.TimeoutError:
             for w in workers:
                 w.cancel()
 
-        # добор скрытых NFT если строго 0 дал мало
-        if is_searching and found[0] < max(3, max_results // 2):
-            try:
-                await status_msg.edit_text(
-                    "<b>Профиль:</b> добор (скрытые NFT)...\nНайдено: " + str(found[0]),
-                    parse_mode="HTML", reply_markup=stop_kb()
-                )
-            except Exception:
-                pass
-            more = []
-            if cat_filter_on and allowed_titles:
-                for t in allowed_titles[:40]:
-                    more.extend(random_from_pricenft_db(limit=30, model=t, exact=True))
-            more.extend(random_users_from_db(limit=max(300 if girls_only else 200, max_results * 12)))
-            random.shuffle(more)
-            sem = asyncio.Semaphore(18)
-
-            async def soft_one(h):
-                async with sem:
-                    info = {
-                        "owner": None, "owner_id": h.get("owner_id"),
-                        "username": h.get("username"), "name": h.get("username") or "",
-                        "profile_url": h.get("profile_url"),
-                    }
-                    key = "soft:" + str(h.get("username") or h.get("owner_id") or "")
-                    if not key or key in checked:
-                        return
-                    checked.add(key)
-                    await check_one(info, require_zero=False)
-
-            batch = [h for h in more if h.get("username")][:500]
-            for i in range(0, len(batch), 40):
-                if not is_searching or found[0] >= max_results:
-                    break
-                await asyncio.gather(*[soft_one(h) for h in batch[i:i + 40]], return_exceptions=True)
-
+        # soft-refill УДАЛЁН: больше не добираем тех, у кого есть лоты на маркете
         logger.info("profile_search done found=%s skips=%s checked=%s", found[0], stats_skip, len(checked))
     except Exception as e:
         logger.error("do_profile_search: %s", e)
@@ -4333,7 +4337,9 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
 # ── SEARCH CORE: MODEL BY PROFILE ─────────────────────────────────────────────
 async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                                   max_results=30, region="any"):
-    """Модели по профилю: ТОЛЬКО выбранная коллекция, строго 0 лотов на маркете."""
+    """Модели по профилю: ТОЛЬКО 1 выбранная коллекция + строго 0 лотов на маркете.
+    Никакого random_users_from_db и никаких чужих гифтов в выдаче.
+    """
     global is_searching
     is_searching = True
     try:
@@ -4353,34 +4359,48 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             allowed_gids.add(int(g))
         except Exception:
             pass
-    allowed_titles = []
-    for g in allowed_gids:
-        t = title_by_gid.get(g)
-        if t:
-            allowed_titles.append(t)
-    # без названий нельзя надёжно матчить slug → не ищем «рандом»
-    single = len(allowed_gids) == 1
-    label = allowed_titles[0] if single and allowed_titles else (
-        (allowed_titles[0] + " +" + str(len(allowed_titles) - 1)) if allowed_titles else str(len(allowed_gids)) + " кол."
-    )
-    want_norms = _titles_norms(allowed_titles)
+
+    # профиль+модель: только одна коллекция
+    if len(allowed_gids) != 1:
+        await status_msg.edit_text(
+            "<b>Для поиска модели по профилю выбери ОДНУ коллекцию</b>",
+            parse_mode="HTML", reply_markup=menu_kb()
+        )
+        is_searching = False
+        return 0
+
+    gid0 = next(iter(allowed_gids))
+    col_title = title_by_gid.get(gid0)
+    if not col_title:
+        await status_msg.edit_text(
+            "<b>Не удалось определить имя коллекции. Обнови коллекции в /admin</b>",
+            parse_mode="HTML", reply_markup=menu_kb()
+        )
+        is_searching = False
+        return 0
+
+    allowed_titles = [col_title]
+    want_norm = _norm_col_name(col_title)
+    want_norms = {want_norm} if want_norm else set()
+    label = col_title
 
     lock = asyncio.Lock()
     found = [0]
     seen_owners = set()
 
-    def gift_ok(g):
-        """Только выбранная модель: slug база == коллекция. Без slug - отказ."""
-        if g.get("on_market"):
+    def _exact_model_gift(g):
+        """Гифт принадлежит ТОЛЬКО выбранной коллекции (slug база == имя)."""
+        if not g or g.get("on_market"):
             return False
         url = g.get("nft_url")
-        if not url or not want_norms:
+        if not url or not want_norm:
             return False
-        if not slug_matches_titles(url, allowed_titles):
+        base = _slug_base(url)
+        if base != want_norm:
             return False
-        # доп. проверка title гифта если есть - не пускать чужое имя
         gt = _norm_col_name(g.get("title") or g.get("model") or "")
-        if gt and gt not in want_norms:
+        # если title есть и это не дефолт — обязан совпасть
+        if gt and gt not in ("nft", "none", "unknown") and gt != want_norm:
             return False
         return True
 
@@ -4406,23 +4426,22 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             if not region_match_full(owner_obj, username, name, region):
                 return
 
-        # кандидат из БД обязан быть выбранной моделью (никакого рандома)
+        # кандидат из БД: slug/model обязаны = выбранная коллекция
         pref = info.get("nft_url") or info.get("slug")
         pref_model = _norm_col_name(info.get("model") or info.get("title") or "")
-        if want_norms:
-            if pref and not slug_matches_titles(pref, allowed_titles):
-                return
-            if pref_model and pref_model not in want_norms:
-                return
-            if single and not pref and not pref_model:
-                return
+        if pref and _slug_base(pref) != want_norm:
+            return
+        if pref_model and pref_model != want_norm:
+            return
+        if not pref and not pref_model:
+            return
 
         saved = await fetch_saved_gifts(
-            peer, max_pages=5 if single else 2,
+            peer, max_pages=8,
             only_off_market=True, require_zero_on_market=True,
         )
         if saved is None:
-            return  # есть лот на маркете
+            return  # есть лот на маркете — мимо
         if not saved:
             return
         if any(g.get("on_market") for g in saved):
@@ -4430,24 +4449,10 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
 
         matched = [
             g for g in saved
-            if g.get("nft_url") and gift_ok(g) and not is_gift_seen(g.get("nft_url"))
+            if g.get("nft_url") and _exact_model_gift(g) and not is_gift_seen(g.get("nft_url"))
         ]
         if not matched:
             return
-        # ещё раз жёстко: только выбранная модель
-        matched = [g for g in matched if slug_matches_titles(g.get("nft_url"), allowed_titles)]
-        if not matched:
-            return
-        if single and allowed_titles:
-            # финальный стоп: title в карточке = выбранная модель
-            show_n = _norm_col_name(allowed_titles[0])
-            matched = [
-                g for g in matched
-                if _slug_base(g.get("nft_url")) == show_n
-                or _norm_col_name(g.get("title") or "") == show_n
-            ]
-            if not matched:
-                return
 
         if girls_only and not is_girl(owner_obj, username, name, gifts=saved):
             return
@@ -4465,10 +4470,8 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             seen_owners.add(ok_key)
             found[0] += 1
 
-        # не жжём весь инвентарь в seen - иначе следующий поиск пустой
         mark_seen(uid, username, matched[0].get("nft_url"))
         profile_url = info.get("profile_url") or (("https://t.me/" + username) if username else None)
-        show = allowed_titles[0] if allowed_titles else (matched[0].get("title") or "?")
         if uid:
             cache_owner(uid, owner_obj, username, name, profile_url, matched)
 
@@ -4478,11 +4481,14 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             u = g.get("nft_url")
             if not u or u in seen_s:
                 continue
-            # финальный guard - не показать чужой гифт
-            if not slug_matches_titles(u, allowed_titles):
+            if _slug_base(u) != want_norm:
                 continue
             seen_s.add(u)
-            lines.append('\n<a href="' + u + '">' + esc(str(show)) + "</a>")
+            # в тексте — реальное имя из гифта или выбранная модель (не чужое)
+            gtitle = g.get("title") or label
+            if _norm_col_name(gtitle) not in want_norms and _norm_col_name(gtitle) not in ("nft", ""):
+                gtitle = label
+            lines.append('\n<a href="' + u + '">' + esc(str(gtitle)) + "</a>")
         if not lines:
             async with lock:
                 found[0] = max(0, found[0] - 1)
@@ -4491,7 +4497,7 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
 
         txt = (
             "<b>" + fmt_owner(owner_obj, username, name)
-            + "\n🎨 " + esc(str(show))
+            + "\n🎨 " + esc(str(label))
             + "\n0 на маркете · NFT этой модели: " + str(len(matched)) + "</b>"
             + "".join(lines)
         )
@@ -4514,16 +4520,6 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
                 seen_owners.discard(ok_key)
 
     try:
-        if not allowed_gids:
-            await status_msg.edit_text("<b>Коллекция не выбрана</b>", parse_mode="HTML", reply_markup=menu_kb())
-            return 0
-        if not allowed_titles:
-            await status_msg.edit_text(
-                "<b>Не удалось определить имя коллекции. Обнови коллекции в /admin</b>",
-                parse_mode="HTML", reply_markup=menu_kb()
-            )
-            return 0
-
         await status_msg.edit_text(
             "<b>Модели / профиль / " + esc(str(label))
             + (" / Девушки" if girls_only else "")
@@ -4532,25 +4528,18 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             parse_mode="HTML", reply_markup=stop_kb()
         )
 
-        # кандидаты ТОЛЬКО с exact slug выбранной модели (без random_users_from_db!)
-        cands = []
-        titles_q = list(allowed_titles) if single else random.sample(
-            allowed_titles, min(len(allowed_titles), 40)
+        # кандидаты ТОЛЬКО exact выбранной модели
+        cands = random_from_pricenft_db(
+            limit=max(max_results * (40 if girls_only else 28), 350),
+            model=col_title, exact=True,
         )
-        for t in titles_q:
-            cands.extend(random_from_pricenft_db(
-                limit=max(max_results * (35 if girls_only else 22), 280),
-                model=t, exact=True,
-            ))
-
-        # отсев: slug + model обязаны совпасть; иначе мимо
         filtered = []
         for h in cands:
             url = h.get("nft_url") or h.get("slug")
             mk = _norm_col_name(h.get("model") or h.get("title") or "")
-            if not url or not slug_matches_titles(url, allowed_titles):
+            if not url or _slug_base(url) != want_norm:
                 continue
-            if mk and mk not in want_norms:
+            if mk and mk != want_norm:
                 continue
             filtered.append(h)
         cands = filtered
@@ -4564,7 +4553,7 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             )
             return 0
 
-        sem = asyncio.Semaphore(16)
+        sem = asyncio.Semaphore(14)
 
         async def _one(info):
             async with sem:
@@ -4580,10 +4569,10 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             seen_c.add(key)
             uniq.append(h)
 
-        for i in range(0, len(uniq), 30):
+        for i in range(0, len(uniq), 28):
             if not is_searching or found[0] >= max_results:
                 break
-            chunk = uniq[i:i + 30]
+            chunk = uniq[i:i + 28]
             await asyncio.gather(*[_one(h) for h in chunk], return_exceptions=True)
             try:
                 await status_msg.edit_text(
@@ -4607,6 +4596,9 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
 
 async def _start_market(cb, cat, girls):
     global is_searching
+    if not _is_owner_uid(cb.from_user.id):
+        await _deny_stranger(cb, cb.from_user.id)
+        return
     if not begin_search():
         await cb.answer("Поиск уже идёт! Нажми Стоп или /clear", show_alert=True)
         return
@@ -4663,6 +4655,9 @@ async def _start_market(cb, cat, girls):
 
 async def _start_profile(cb, cat, girls):
     global is_searching
+    if not _is_owner_uid(cb.from_user.id):
+        await _deny_stranger(cb, cb.from_user.id)
+        return
     if not begin_search():
         await cb.answer("Поиск уже идёт! Нажми Стоп или /clear", show_alert=True)
         return
@@ -4705,6 +4700,25 @@ async def _start_profile(cb, cat, girls):
 async def _start_model(cb, girls=False, single_gid=None, search_type="market",
                        already_answered=False, skip_begin=False):
     global is_searching
+    if not _is_owner_uid(cb.from_user.id):
+        await _deny_stranger(cb, cb.from_user.id)
+        return
+    # профиль + модель: только одна коллекция (иначе рандом)
+    if search_type == "profile" and single_gid is None:
+        is_searching = False
+        try:
+            await cb.answer("Выбери одну коллекцию", show_alert=True)
+        except Exception:
+            pass
+        try:
+            await bot.send_message(
+                cb.message.chat.id if cb.message else cb.from_user.id,
+                "<b>Для моделей по профилю выбери ОДНУ коллекцию — не «все».</b>",
+                parse_mode="HTML", reply_markup=menu_kb(),
+            )
+        except Exception:
+            pass
+        return
     if not skip_begin:
         if not begin_search():
             if not already_answered:
@@ -4823,11 +4837,8 @@ def ob_region_kb():
 async def cmd_start(message: Message, state: FSMContext):
     global is_searching
     uid = message.from_user.id
-    if int(uid) != int(OWNER_ID):
-        await message.answer(
-            ACCESS_DENY_HTML.format(uid=uid),
-            parse_mode="HTML",
-        )
+    if not _is_owner_uid(uid):
+        await _deny_stranger(message, uid)
         return
     is_searching = False
     await state.clear()
@@ -4980,10 +4991,14 @@ async def cmd_clear(message: Message, state: FSMContext):
 @dp.message(Command("myid"))
 async def cmd_myid(message: Message):
     uid = message.from_user.id
-    if int(uid) != int(OWNER_ID):
-        await message.answer(ACCESS_DENY_HTML.format(uid=uid), parse_mode="HTML")
+    if not _is_owner_uid(uid):
+        await _deny_stranger(message, uid)
         return
-    await message.answer("<b>ID: <code>" + str(uid) + "</code></b>", parse_mode="HTML")
+    await message.answer(
+        "<b>ID: <code>" + str(uid) + "</code>\n"
+        "Ты владелец. Доступ есть.</b>",
+        parse_mode="HTML",
+    )
 
 @dp.message(Command("neptunteam"))
 async def cmd_neptunteam(message: Message, state: FSMContext):
@@ -5191,6 +5206,9 @@ async def cb_noop(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("mdlrun_"))
 async def cb_mdlrun(cb: CallbackQuery, state: FSMContext):
+    if not _is_owner_uid(cb.from_user.id):
+        await _deny_stranger(cb, cb.from_user.id)
+        return
     await state.clear()
     rest = cb.data[len("mdlrun_"):]
     # Формат: mdlrun_{w}_{t}_{gid|all}
@@ -5208,6 +5226,9 @@ async def cb_mdlrun(cb: CallbackQuery, state: FSMContext):
         except ValueError:
             await cb.answer("Некорректная коллекция", show_alert=True)
             return
+    elif search_type == "profile":
+        await cb.answer("Для профиля выбери одну коллекцию", show_alert=True)
+        return
     if not begin_search():
         await cb.answer("Поиск уже идёт! Стоп или /clear", show_alert=True)
         return
