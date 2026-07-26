@@ -27,8 +27,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 API_ID       = 36101343
 API_HASH     = "116195fa5e0459d25a9a6266b40807d7"
 BOT_TOKEN    = "8790434095:AAG5eA6OzMcC2-VdLeTeITahdUi_6KiIRiw"
-ADMIN_ID     = 8366506987
-ALLOWED_USER_IDS = {8366506987, 5622874132}  # оба юзера, у каждого своя БД
+ADMIN_ID     = 7186944876
+ALLOWED_USER_IDS = {7186944876}  # только этот юзер
 SESSION_NAME = "nft_session"
 USERS_FILE   = "users.json"
 ONBOARDING_FILE = "onboarding_done.json"
@@ -43,9 +43,32 @@ MINI_APP_IS_WEBAPP = False
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Сессия Telethon в data/ - не слетает при смене cwd; keepalive ниже
+os.makedirs(DATA_DIR, exist_ok=True)
+_SESSION_DIR = os.path.join(DATA_DIR, "session")
+os.makedirs(_SESSION_DIR, exist_ok=True)
+SESSION_PATH = os.path.join(_SESSION_DIR, SESSION_NAME)
+# миграция старого nft_session из корня проекта
+for _old in (SESSION_NAME + ".session", SESSION_NAME):
+    try:
+        if os.path.isfile(_old) and not os.path.isfile(SESSION_PATH + ".session"):
+            import shutil
+            shutil.copy2(_old, SESSION_PATH + ("" if _old.endswith(".session") else ".session"))
+            logger.info("Migrated telethon session -> %s", SESSION_PATH)
+            break
+    except Exception as _e:
+        logger.warning("session migrate: %s", _e)
+
 bot       = Bot(token=BOT_TOKEN)
 dp        = Dispatcher(storage=MemoryStorage())
-tg_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+tg_client = TelegramClient(
+    SESSION_PATH, API_ID, API_HASH,
+    connection_retries=10,
+    retry_delay=2,
+    auto_reconnect=True,
+    request_retries=5,
+)
+_keepalive_task = None
 
 # ── ACCESS + per-user DB context ─────────────────────────────────────────────
 from typing import Any, Awaitable, Callable, Dict
@@ -866,11 +889,63 @@ class SetBoost(StatesGroup):
 
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
-async def check_authorized():
+async def ensure_tg_connected():
+    """Подключить Telethon и убедиться что сессия жива."""
     try:
         if not tg_client.is_connected():
             await tg_client.connect()
-        return await tg_client.is_user_authorized()
+        if await tg_client.is_user_authorized():
+            # лёгкий ping - держит auth key активным
+            await tg_client.get_me()
+            try:
+                tg_client.session.save()
+            except Exception:
+                pass
+            return True
+        return False
+    except Exception as e:
+        logger.warning("ensure_tg_connected: %s", e)
+        try:
+            await tg_client.connect()
+        except Exception:
+            pass
+        try:
+            return await tg_client.is_user_authorized()
+        except Exception:
+            return False
+
+
+async def session_keepalive_loop():
+    """Раз в 3 мин пингуем Telegram - иначе сессия «засыпает» и слетает."""
+    while True:
+        try:
+            await asyncio.sleep(180)
+            ok = await ensure_tg_connected()
+            if not ok:
+                logger.warning("Telethon session not authorized - relink in /admin")
+            else:
+                logger.debug("Telethon keepalive ok")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("session_keepalive: %s", e)
+            await asyncio.sleep(30)
+
+
+def start_session_keepalive():
+    global _keepalive_task
+    try:
+        if _keepalive_task and not _keepalive_task.done():
+            return False
+    except NameError:
+        pass
+    _keepalive_task = asyncio.create_task(session_keepalive_loop())
+    return True
+
+
+async def check_authorized():
+    try:
+        return await ensure_tg_connected()
     except Exception:
         return False
 
@@ -3572,6 +3647,13 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                 return
             if not items:
                 return
+            # рандом внутри страницы - иначе после деплоя одни и те же «свежие» лоты
+            items = list(items)
+            random.shuffle(items)
+            # случайный сдвиг на первой странице
+            if _page == 0 and len(items) > 8:
+                skip = random.randint(0, min(25, len(items) // 2))
+                items = items[skip:] + items[:skip]
             for item in items:
                 if not is_searching or found[0] >= max_results:
                     return
@@ -3608,6 +3690,13 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             )
             return 0
         random.shuffle(valid_pairs)
+        # ещё раз перемешаем кусками - сильнее рандом после деплоя
+        if len(valid_pairs) > 10:
+            mid = len(valid_pairs) // 2
+            a, b = valid_pairs[:mid], valid_pairs[mid:]
+            random.shuffle(a)
+            random.shuffle(b)
+            valid_pairs = b + a if random.random() < 0.5 else a + b
         n_cols = max(1, len(valid_pairs))
 
         PARALLEL = 20
@@ -3740,15 +3829,15 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 gid = int(raw)
             except Exception:
                 return False
-        # slug чужой коллекции: на маркете с верным gift_id - ок; иначе отказ
+        # slug чужой коллекции - отказ (даже с market gift_id при расхождении имени)
         src = item.get("source") or ""
         if slug and allowed_titles:
             base = _norm_col_name(re.sub(r"-\d+$", "", slug))
             norms = {_norm_col_name(t) for t in allowed_titles if t}
-            if base and norms and base not in norms and not any(n in base or base in n for n in norms if len(n) >= 4):
-                if not (src == "market" and gid is not None and gid in allowed_gids):
-                    return False
+            if base and norms and base not in norms:
+                return False
         if single and not slug:
+            # одна модель без slug - только если gift_id точно выбранный с маркета
             try:
                 if src != "market" or int(item.get("gift_id")) not in allowed_gids:
                     return False
@@ -3845,7 +3934,8 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 return
             if not items:
                 return
-            # без shuffle - свежие лоты этой модели сверху
+            items = list(items)
+            random.shuffle(items)
             for it in items:
                 if not is_searching or found[0] >= max_results:
                     return
@@ -3854,14 +3944,15 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                 it["source"] = "market"
                 if title:
                     it["title"] = title
-                # gift_id из скана маркета - источник истины; slug сверяем мягко
+                # строго: slug базы == выбранная коллекция (без подстрок → без «рандома»)
                 slug = gift_slug_of(it.get("nft_url")) or ""
                 if slug and title:
                     base = _norm_col_name(re.sub(r"-\d+$", "", slug))
                     want = _norm_col_name(title)
-                    # отсекаем только явный чужой slug (не подстрока)
-                    if base and want and base != want and want not in base and base not in want:
+                    if base and want and base != want:
                         continue
+                elif single and not slug:
+                    continue
                 if girls_only and not is_girl(it.get("owner"), it.get("username"), it.get("name")):
                     continue
                 if region and region != "any":
@@ -4007,13 +4098,19 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
     seen_owners = set()
 
     def gift_ok(g):
-        """Только выбранная модель по slug. Без slug - отказ."""
+        """Только выбранная модель: slug база == коллекция. Без slug - отказ."""
         if g.get("on_market"):
             return False
         url = g.get("nft_url")
         if not url or not want_norms:
             return False
-        return slug_matches_titles(url, allowed_titles)
+        if not slug_matches_titles(url, allowed_titles):
+            return False
+        # доп. проверка title гифта если есть - не пускать чужое имя
+        gt = _norm_col_name(g.get("title") or g.get("model") or "")
+        if gt and gt not in want_norms:
+            return False
+        return True
 
     async def check_user(info):
         if not is_searching or found[0] >= max_results:
@@ -4037,14 +4134,19 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             if not region_match_full(owner_obj, username, name, region):
                 return
 
-        # предфильтр по slug кандидата из БД (если есть) - отсечь чужие модели сразу
+        # кандидат из БД обязан быть выбранной моделью (никакого рандома)
         pref = info.get("nft_url") or info.get("slug")
-        if single and want_norms and pref:
-            if not slug_matches_titles(pref, allowed_titles):
+        pref_model = _norm_col_name(info.get("model") or info.get("title") or "")
+        if want_norms:
+            if pref and not slug_matches_titles(pref, allowed_titles):
+                return
+            if pref_model and pref_model not in want_norms:
+                return
+            if single and not pref and not pref_model:
                 return
 
         saved = await fetch_saved_gifts(
-            peer, max_pages=4 if single else 2,
+            peer, max_pages=5 if single else 2,
             only_off_market=True, require_zero_on_market=True,
         )
         if saved is None:
@@ -4060,10 +4162,20 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
         ]
         if not matched:
             return
-        # ещё раз жёстко: все matched обязаны быть выбранной моделью
+        # ещё раз жёстко: только выбранная модель
         matched = [g for g in matched if slug_matches_titles(g.get("nft_url"), allowed_titles)]
         if not matched:
             return
+        if single and allowed_titles:
+            # финальный стоп: title в карточке = выбранная модель
+            show_n = _norm_col_name(allowed_titles[0])
+            matched = [
+                g for g in matched
+                if _slug_base(g.get("nft_url")) == show_n
+                or _norm_col_name(g.get("title") or "") == show_n
+            ]
+            if not matched:
+                return
 
         if girls_only and not is_girl(owner_obj, username, name, gifts=saved):
             return
@@ -4148,23 +4260,27 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             parse_mode="HTML", reply_markup=stop_kb()
         )
 
-        # кандидаты ТОЛЬКО с exact slug выбранной модели
+        # кандидаты ТОЛЬКО с exact slug выбранной модели (без random_users_from_db!)
         cands = []
         titles_q = list(allowed_titles) if single else random.sample(
             allowed_titles, min(len(allowed_titles), 40)
         )
         for t in titles_q:
             cands.extend(random_from_pricenft_db(
-                limit=max(max_results * (30 if girls_only else 18), 220),
+                limit=max(max_results * (35 if girls_only else 22), 280),
                 model=t, exact=True,
             ))
 
-        # отсев: slug обязан совпасть; без slug / чужой slug - мимо
+        # отсев: slug + model обязаны совпасть; иначе мимо
         filtered = []
         for h in cands:
             url = h.get("nft_url") or h.get("slug")
-            if url and slug_matches_titles(url, allowed_titles):
-                filtered.append(h)
+            mk = _norm_col_name(h.get("model") or h.get("title") or "")
+            if not url or not slug_matches_titles(url, allowed_titles):
+                continue
+            if mk and mk not in want_norms:
+                continue
+            filtered.append(h)
         cands = filtered
         random.shuffle(cands)
 
@@ -4345,19 +4461,24 @@ async def _start_model(cb, girls=False, single_gid=None, search_type="market",
             return
         if single_gid is not None:
             ids = [int(single_gid)]
+            # имя коллекции для статуса
+            title_map = {int(g): t for g, t in (ALL_GIFT_IDS or [])}
+            col_name = title_map.get(int(single_gid)) or str(single_gid)
+        else:
+            col_name = "все коллекции"
         lim    = get_limit(uid)
         reg    = get_region(uid)
         who_l  = "Девушки" if girls else "Все"
         reg_l  = REGIONS.get(reg, {}).get("label", "Все страны")
-        col_l  = "все коллекции" if single_gid is None else "1 коллекция"
         type_l = "маркет" if search_type == "market" else "профиль"
         txt = (
             "<b>Модели / " + who_l + " / " + type_l + "\n"
-            "Коллекция: " + col_l + "\n"
+            "Коллекция: " + esc(str(col_name)) + "\n"
             "Регион: " + reg_l + "\n"
             "Лимит выдачи: " + str(lim) + "</b>"
         )
         status = await bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=stop_kb())
+        # профиль + 1 модель → только do_profile_model_search с ровно этим gid
         if search_type == "profile":
             found = await do_profile_model_search(status, ids, girls_only=girls,
                                                   max_results=lim, region=reg)
@@ -5361,15 +5482,21 @@ async def auth_code(message: Message, state: FSMContext):
     data = await state.get_data()
     try:
         await tg_client.sign_in(phone=data["phone"], code=code, phone_code_hash=data["phone_code_hash"])
+        try:
+            tg_client.session.save()
+        except Exception:
+            pass
         me = await tg_client.get_me()
         await state.clear()
         await load_collections()
         await message.answer(
             "<b>Авторизован как @" + esc(str(me.username or me.first_name)) + "\n"
             "Коллекций: " + str(len(ALL_GIFT_IDS)) + "\n"
+            "Сессия сохранена в data/session/\n"
             "Сохраняю все гифты в БД...</b>",
             parse_mode="HTML", reply_markup=main_menu_kb()
         )
+        start_session_keepalive()
         start_bootstrap_gifts_db(notify_chat_id=message.chat.id)
         start_background_db_keeper()
     except SessionPasswordNeededError:
@@ -5385,15 +5512,21 @@ async def auth_password(message: Message, state: FSMContext):
         return
     try:
         await tg_client.sign_in(password=message.text.strip())
+        try:
+            tg_client.session.save()
+        except Exception:
+            pass
         me = await tg_client.get_me()
         await state.clear()
         await load_collections()
         await message.answer(
             "<b>Авторизован как @" + esc(str(me.username or me.first_name)) + "\n"
             "Коллекций: " + str(len(ALL_GIFT_IDS)) + "\n"
+            "Сессия сохранена в data/session/\n"
             "Сохраняю все гифты в БД...</b>",
             parse_mode="HTML", reply_markup=main_menu_kb()
         )
+        start_session_keepalive()
         start_bootstrap_gifts_db(notify_chat_id=message.chat.id)
         start_background_db_keeper()
     except Exception as e:
@@ -5414,9 +5547,8 @@ async def main():
         load_seen_into_memory()
     except Exception as e:
         logger.warning("load_seen: %s", e)
-    if not tg_client.is_connected():
-        await tg_client.connect()
-    logger.info("Neptun Parser запущен!")
+    await ensure_tg_connected()
+    logger.info("Neptun Parser запущен! admin=%s session=%s", ADMIN_ID, SESSION_PATH)
     st = pricenft_db_stats()
     logger.info(
         "PriceNFT БД: models=%s users=%s nfts=%s seen=%s/%s",
@@ -5428,11 +5560,13 @@ async def main():
         BotCommand(command="start",      description="Главное меню"),
         BotCommand(command="clear",      description="Остановить поиск / прервать настройку"),
         BotCommand(command="neptunteam", description="Справка"),
+        BotCommand(command="myid",       description="Узнать свой Telegram ID"),
     ])
     try:
         if await tg_client.is_user_authorized():
             await load_collections()
             logger.info("Авторизован, коллекций: %d", len(ALL_GIFT_IDS))
+            start_session_keepalive()
             st0 = pricenft_db_stats()
             if st0.get("users", 0) < 50:
                 logger.info("БД мала (%s) - автосбор гифтов", st0.get("users"))
@@ -5440,15 +5574,25 @@ async def main():
             # основной режим: постоянно пишем маркет + PriceNFT в локальную БД
             start_background_db_keeper()
         else:
-            logger.warning("Не авторизован - пройди /start")
+            logger.warning("Не авторизован - пройди /admin и привяжи аккаунт")
     except Exception as e:
         logger.error("Ошибка старта: %s", e)
     try:
         await dp.start_polling(bot)
     finally:
+        global _keepalive_task
+        try:
+            if _keepalive_task and not _keepalive_task.done():
+                _keepalive_task.cancel()
+        except Exception:
+            pass
         try:
             db_flush(force=True)
             save_pricenft_db()
+        except Exception:
+            pass
+        try:
+            tg_client.session.save()
         except Exception:
             pass
         await tg_client.disconnect()
