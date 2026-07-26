@@ -180,13 +180,29 @@ tg_client = TelegramClient(
 _keepalive_task = None
 _lock_fp = None  # single-instance lock
 
-# ── ANTI-FLOOD: глобальный cooldown API (иначе Telegram сносит сессию) ────────
+# ── ANTI-FLOOD: пауза ПЕРЕД КАЖДЫМ запросом + глобальный cooldown ─────────────
 _api_cooldown_until = 0.0
 _api_cooldown_notified = 0.0
+_api_lock = None  # lazy asyncio.Lock
+_last_api_ts = 0.0
+# пауза между ЛЮБЫМИ RPC (сек). Без этого флуд → краш/снос сессии.
+# env: TG_REQUEST_GAP=2.5
+try:
+    REQUEST_GAP = float((os.environ.get("TG_REQUEST_GAP") or "2.0").strip())
+except Exception:
+    REQUEST_GAP = 2.0
+REQUEST_GAP = max(0.4, min(REQUEST_GAP, 15.0))
 # авто-сбор PriceNFT ВЫКЛ по умолчанию — жрёт ResolveUsername/сообщения и валит акк
 AUTO_PRICENFT = (os.environ.get("AUTO_PRICENFT") or "0").strip() in ("1", "true", "yes", "on")
 # фоновый keeper маркета можно выключить: AUTO_DB_KEEPER=0
 AUTO_DB_KEEPER = (os.environ.get("AUTO_DB_KEEPER") or "1").strip() not in ("0", "false", "no", "off")
+
+
+def _get_api_lock():
+    global _api_lock
+    if _api_lock is None:
+        _api_lock = asyncio.Lock()
+    return _api_lock
 
 
 def _api_cooldown_left() -> float:
@@ -198,7 +214,7 @@ def _api_cooldown_active() -> bool:
 
 
 def set_api_cooldown(seconds, reason="FloodWait"):
-    """Пауза ВСЕХ фоновых запросов к Telegram API. Спасает сессию от бана/сноса."""
+    """Пауза ВСЕХ запросов к Telegram API. Спасает сессию от бана/сноса."""
     global _api_cooldown_until, _pricenft_flood_until, _api_cooldown_notified
     try:
         sec = int(max(0, seconds or 0))
@@ -206,21 +222,19 @@ def set_api_cooldown(seconds, reason="FloodWait"):
         sec = 60
     if sec <= 0:
         return
-    # минимум 60с при серьёзном флуде, потолок 6ч
     if sec >= 30:
         sec = max(sec, 60)
     sec = min(sec, 6 * 3600)
     until = time.time() + sec
     if until > float(_api_cooldown_until or 0):
         _api_cooldown_until = until
-    # PriceNFT тоже на паузу
     try:
         if until > float(_pricenft_flood_until or 0):
             _pricenft_flood_until = until
     except NameError:
         pass
     logger.warning(
-        "API COOLDOWN +%ss (~%.1fh) reason=%s — фон/PriceNFT/маркет на паузе",
+        "API COOLDOWN +%ss (~%.1fh) reason=%s — все запросы на паузе",
         sec, sec / 3600.0, reason,
     )
     now = time.time()
@@ -242,25 +256,66 @@ async def _notify_api_cooldown(sec, reason):
             OWNER_ID,
             "<b>⏳ Антифлуд: API на паузе " + wait_s + "</b>\n"
             "Причина: <code>" + safe + "</code>\n\n"
-            "Фон / PriceNFT / агрессивный маркет остановлены.\n"
-            "Иначе Telegram может <b>снести сессию</b>.\n"
-            "Сбор БД через PriceNFT — только вручную из /admin.",
+            "Между запросами пауза " + str(REQUEST_GAP) + "с.\n"
+            "Иначе Telegram крашит / сносит сессию.",
             parse_mode="HTML",
         )
     except Exception:
         pass
 
 
-async def wait_api_slot(tag="api"):
-    """Ждём глобальный cooldown перед запросом."""
+async def _throttle_before_request(tag="api"):
+    """Обязательная пауза перед КАЖДЫМ запросом к Telegram."""
+    global _last_api_ts
+    # 1) длинный FloodWait cooldown
     left = _api_cooldown_left()
-    if left <= 0:
+    if left > 0:
+        sleep_for = min(left, 90 if str(tag).startswith("bg") else 20)
+        logger.info("throttle(%s): cooldown sleep %.1fs", tag, sleep_for)
+        await asyncio.sleep(sleep_for)
+    # 2) пауза между любыми запросами
+    now = time.time()
+    gap = float(REQUEST_GAP) - (now - float(_last_api_ts or 0))
+    if gap > 0:
+        await asyncio.sleep(gap)
+
+
+async def tg_invoke(request, tag="rpc"):
+    """Единственная точка вызова tg_client(...): пауза → запрос → по одному."""
+    global _last_api_ts
+    async with _get_api_lock():
+        await _throttle_before_request(tag)
+        try:
+            return await tg_client(request)
+        except FloodWaitError as e:
+            set_api_cooldown(getattr(e, "seconds", 0) or 0, reason=tag + " FloodWait")
+            raise
+        finally:
+            _last_api_ts = time.time()
+
+
+async def tg_do(method, *args, tag=None, **kwargs):
+    """Вызов метода клиента (get_entity / get_me / send_message...) с паузой."""
+    global _last_api_ts
+    name = method if isinstance(method, str) else getattr(method, "__name__", "method")
+    tag = tag or name
+    async with _get_api_lock():
+        await _throttle_before_request(tag)
+        fn = getattr(tg_client, name) if isinstance(method, str) else method
+        try:
+            return await fn(*args, **kwargs)
+        except FloodWaitError as e:
+            set_api_cooldown(getattr(e, "seconds", 0) or 0, reason=tag + " FloodWait")
+            raise
+        finally:
+            _last_api_ts = time.time()
+
+
+async def wait_api_slot(tag="api"):
+    """Совместимость: ждём cooldown + слот паузы (без самого запроса)."""
+    async with _get_api_lock():
+        await _throttle_before_request(tag)
         return True
-    # фону — ждать; поиску — коротко поспать и всё равно пробовать осторожно
-    sleep_for = min(left, 90 if tag.startswith("bg") else 15)
-    logger.info("wait_api_slot(%s): sleep %.0fs (left=%.0fs)", tag, sleep_for, left)
-    await asyncio.sleep(sleep_for)
-    return True
 
 
 def _pid_alive(pid: int) -> bool:
@@ -822,10 +877,10 @@ async def is_girl_async(owner, username=None, name=None, uid=None, gifts=None,
     if peer:
         try:
             if ent is None:
-                ent = await tg_client.get_entity(peer)
+                ent = await tg_do("get_entity", peer)
             try:
                 from telethon.tl.functions.users import GetFullUserRequest
-                full = await tg_client(GetFullUserRequest(ent))
+                full = await tg_invoke(GetFullUserRequest(ent))
                 fu = getattr(full, "full_user", None) or full
                 bio = (getattr(fu, "about", None) or bio or "") or ""
                 if getattr(fu, "profile_photo", None) is not None:
@@ -1257,7 +1312,7 @@ async def ensure_tg_connected():
         if not tg_client.is_connected():
             await tg_client.connect()
         if await tg_client.is_user_authorized():
-            await tg_client.get_me()
+            await tg_do("get_me")
             persist_telethon_session()
             return True
         # не авторизован - файлы могут остаться, но ключ уже мёртв
@@ -1781,7 +1836,7 @@ def input_cancel_kb():
 async def load_collections():
     global ALL_GIFT_IDS, NFT_COLLECTIONS
     try:
-        result = await tg_client(GetStarGiftsRequest(hash=0))
+        result = await tg_invoke(GetStarGiftsRequest(hash=0))
         ALL_GIFT_IDS    = []
         NFT_COLLECTIONS = {}
         seen = set()
@@ -1975,7 +2030,7 @@ async def resolve_collections_for_cat(cat, gift_ids=None):
         return [g for g, _ in pairs], [t for _, t in pairs if t]
 
     out_g, out_t = [], []
-    PARALLEL = 16
+    PARALLEL = 4  # пауза перед каждым RPC — параллель почти не нужна
 
     async def _one(gid, title):
         fl = await get_floor(gid)
@@ -2057,7 +2112,7 @@ async def get_floor(gid):
         return PRICE_FLOOR_CACHE[gid]
     try:
         # для флора сортируем по цене
-        result = await tg_client(GetResaleStarGiftsRequest(
+        result = await tg_invoke(GetResaleStarGiftsRequest(
             gift_id=gid, offset="", limit=20, sort_by_price=True
         ))
         prices = []
@@ -2092,7 +2147,7 @@ async def fetch_market_page(gid, offset, limit=100, newest=True):
             kwargs = dict(gift_id=gid, offset=offset, limit=limit)
             if not newest:
                 kwargs["sort_by_price"] = True
-            result    = await tg_client(GetResaleStarGiftsRequest(**kwargs))
+            result    = await tg_invoke(GetResaleStarGiftsRequest(**kwargs))
             users_map = {int(u.id): u for u in (getattr(result, "users", None) or [])}
             col_title = next((t for t, i in NFT_COLLECTIONS.items() if i == gid), None)
             items     = []
@@ -2159,14 +2214,14 @@ async def fetch_saved_gifts(uid_or_username, max_pages=2, only_off_market=False,
         # глубже: лот на 3–5й странице иначе пропускали и врали «0 на маркете»
         pages = max(pages, 6)
     try:
-        peer = await tg_client.get_input_entity(uid_or_username)
+        peer = await tg_do("get_input_entity", uid_or_username)
     except Exception as e:
         logger.debug("saved_gifts peer=%s: %s", uid_or_username, e)
         return []
     saw_any = False
     for _ in range(pages):
         try:
-            result = await tg_client(GetSavedStarGiftsRequest(
+            result = await tg_invoke(GetSavedStarGiftsRequest(
                 peer=peer,
                 offset=offset, limit=100,
                 exclude_unlimited=True,  # только уникальные NFT
@@ -2724,7 +2779,7 @@ async def _pricenft_peer():
                 _pricenft_entity = InputPeerUser(uid, ah)
                 return _pricenft_entity
             try:
-                _pricenft_entity = await tg_client.get_input_entity(uid)
+                _pricenft_entity = await tg_do("get_input_entity", uid)
                 return _pricenft_entity
             except Exception:
                 pass
@@ -2736,6 +2791,7 @@ async def _pricenft_peer():
 
     # 2) уже открытый диалог
     try:
+        await wait_api_slot("iter_dialogs")
         async for d in tg_client.iter_dialogs(limit=80):
             ent = getattr(d, "entity", None)
             uname = (getattr(ent, "username", None) or "").lower()
@@ -2751,7 +2807,7 @@ async def _pricenft_peer():
 
     # 3) один раз resolve username
     try:
-        ent = await tg_client.get_entity(PRICENFT_BOT)
+        ent = await tg_do("get_entity", PRICENFT_BOT)
         _pricenft_entity = ent
         _save_pricenft_peer_id(ent)
         return _pricenft_entity
@@ -2784,27 +2840,26 @@ def _find_btn_text(texts, keywords):
 async def _pricenft_send(text):
     await _pricenft_wait_cd()
     peer = await _pricenft_peer()
-    return await tg_client.send_message(peer, text)
+    return await tg_do("send_message", peer, text)
 
 async def _pricenft_latest(limit=6):
     peer = await _pricenft_peer()
-    return await tg_client.get_messages(peer, limit=limit)
+    return await tg_do("get_messages", peer, limit=limit)
 
 async def _pricenft_click_or_send(msg, text):
     """Кликаем inline/reply кнопку, иначе шлём текст."""
     if msg is not None:
         try:
-            # Telethon Message.click по тексту
             await _pricenft_wait_cd()
-            await msg.click(text=text)
+            # клик = тоже RPC → обязательная пауза через общий шлюз
+            await tg_do(msg.click, text=text, tag="pricenft_click")
             return True
         except Exception:
             try:
-                # по индексу среди кнопок
                 texts = _btn_texts_from_msg(msg)
                 if text in texts:
                     await _pricenft_wait_cd()
-                    await msg.click(texts.index(text))
+                    await tg_do(msg.click, texts.index(text), tag="pricenft_click")
                     return True
             except Exception:
                 pass
@@ -2976,7 +3031,7 @@ async def resolve_pricenft_hits(hits, limit=None):
         oid = h.get("owner_id")
         if owner is None or oid is None:
             try:
-                owner = await tg_client.get_entity(uname)
+                owner = await tg_do("get_entity", uname)
                 oid = int(owner.id)
             except Exception:
                 # без entity тоже можно показать @username
@@ -3605,14 +3660,14 @@ NFT_SCAN_CHATS = [
 async def get_chat_members_with_gifts(chat_username, max_users=500):
     results = []
     try:
-        entity = await tg_client.get_entity(chat_username)
+        entity = await tg_do("get_entity", chat_username)
         try:
             from telethon.tl.functions.channels import GetParticipantsRequest
             from telethon.tl.types import ChannelParticipantsSearch
             offset = 0
             limit  = 200
             while len(results) < max_users:
-                part = await tg_client(GetParticipantsRequest(
+                part = await tg_invoke(GetParticipantsRequest(
                     channel=entity,
                     filter=ChannelParticipantsSearch(""),
                     offset=offset, limit=limit, hash=0
@@ -3629,7 +3684,7 @@ async def get_chat_members_with_gifts(chat_username, max_users=500):
                 offset += len(users)
                 await asyncio.sleep(0.05)
         except Exception:
-            history = await tg_client(GetHistoryRequest(
+            history = await tg_invoke(GetHistoryRequest(
                 peer=entity, offset_id=0, offset_date=None,
                 add_offset=0, limit=200, max_id=0, min_id=0, hash=0
             ))
@@ -3752,7 +3807,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
             return
         if uid is None and username:
             try:
-                ent = await tg_client.get_entity(username)
+                ent = await tg_do("get_entity", username)
                 uid = int(ent.id)
                 owner_obj = ent
                 fn = (getattr(ent, "first_name", "") or "")
@@ -4113,7 +4168,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
             valid_pairs = b + a if random.random() < 0.5 else a + b
         n_cols = max(1, len(valid_pairs))
 
-        PARALLEL = 20
+        PARALLEL = 4  # запросы сериализованы паузой; больше = только очередь
 
         async def run_pass(ignore_global=False, enforce_div=True):
             for i in range(0, len(valid_pairs), PARALLEL):
@@ -4596,7 +4651,7 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
             return
         if uid is None and username:
             try:
-                ent = await tg_client.get_entity(username)
+                ent = await tg_do("get_entity", username)
                 uid = int(ent.id)
                 owner_obj = ent
                 ok_key = "id:" + str(uid)
@@ -5891,7 +5946,7 @@ async def cb_admin_session(cb: CallbackQuery):
     try:
         alive = await ensure_tg_connected()
         if alive:
-            me = await tg_client.get_me()
+            me = await tg_do("get_me")
             me_s = "@%s / id=%s" % (me.username or me.first_name, me.id)
     except Exception as e:
         err = str(e)
@@ -6021,7 +6076,7 @@ async def auth_code(message: Message, state: FSMContext):
     try:
         await tg_client.sign_in(phone=data["phone"], code=code, phone_code_hash=data["phone_code_hash"])
         _mark_auth_ok()
-        me = await tg_client.get_me()
+        me = await tg_do("get_me")
         await state.clear()
         await load_collections()
         await message.answer(
@@ -6052,7 +6107,7 @@ async def auth_password(message: Message, state: FSMContext):
     try:
         await tg_client.sign_in(password=message.text.strip())
         _mark_auth_ok()
-        me = await tg_client.get_me()
+        me = await tg_do("get_me")
         await state.clear()
         await load_collections()
         await message.answer(
@@ -6087,8 +6142,8 @@ async def main():
         logger.warning("load_seen: %s", e)
     await ensure_tg_connected()
     logger.info(
-        "Neptun Parser запущен! owner=%s session_file=%s string_bak=%s",
-        OWNER_ID, SESSION_PATH, SESSION_STRING_BAK,
+        "Neptun Parser запущен! owner=%s request_gap=%.1fs session_file=%s string_bak=%s",
+        OWNER_ID, REQUEST_GAP, SESSION_PATH, SESSION_STRING_BAK,
     )
     st = pricenft_db_stats()
     logger.info(
