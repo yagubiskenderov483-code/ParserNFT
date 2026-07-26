@@ -22,6 +22,10 @@ data/
 *.session
 *.session-journal
 nft_session*
+telethon_auth.string
+telethon_auth.string.tmp
+data/session/
+
 
 # Python
 __pycache__/

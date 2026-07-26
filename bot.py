@@ -9,12 +9,15 @@ import datetime
 import re
 import random
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.tl.functions.payments import (
     GetResaleStarGiftsRequest, GetStarGiftsRequest, GetSavedStarGiftsRequest
 )
 from telethon.tl.functions.messages import GetHistoryRequest, SearchRequest, GetInlineBotResultsRequest
 from telethon.tl.types import InputPeerEmpty, MessageService, InputPeerSelf
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telethon.errors import (
+    FloodWaitError, SessionPasswordNeededError, AuthKeyError, AuthKeyDuplicatedError,
+)
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -44,32 +47,153 @@ MINI_APP_IS_WEBAPP = False
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Сессия Telethon в data/ - не слетает при смене cwd; keepalive ниже
+# ── TELETHON SESSION (жёсткое сохранение, чтобы не слетала) ───────────────────
 os.makedirs(DATA_DIR, exist_ok=True)
 _SESSION_DIR = os.path.join(DATA_DIR, "session")
 os.makedirs(_SESSION_DIR, exist_ok=True)
 SESSION_PATH = os.path.join(_SESSION_DIR, SESSION_NAME)
-# миграция старого nft_session из корня проекта
+# бэкап StringSession - переживает порчу sqlite .session
+SESSION_STRING_FILE = os.path.join(_SESSION_DIR, "auth.string")
+# второй бэкап вне data/ (если data чистят при деплое - этот может остаться)
+SESSION_STRING_BAK = os.path.join(os.path.dirname(os.path.abspath(__file__)) or ".", "telethon_auth.string")
+
+def _read_session_string():
+    """Читаем StringSession: env → auth.string → telethon_auth.string."""
+    for key in ("TELETHON_SESSION", "TG_SESSION", "STRING_SESSION"):
+        v = (os.environ.get(key) or "").strip().strip('"').strip("'")
+        if v and len(v) > 20:
+            logger.info("Telethon session from env %s", key)
+            return v
+    for path in (SESSION_STRING_FILE, SESSION_STRING_BAK):
+        try:
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    v = (f.read() or "").strip()
+                if v and len(v) > 20:
+                    logger.info("Telethon session from file %s", path)
+                    return v
+        except Exception as e:
+            logger.warning("read session string %s: %s", path, e)
+    return None
+
+def _write_session_string(s):
+    """Пишем StringSession в 2 файла + fsync (не слетает при крэше)."""
+    s = (s or "").strip()
+    if not s:
+        return False
+    ok = False
+    for path in (SESSION_STRING_FILE, SESSION_STRING_BAK):
+        try:
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(s)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            ok = True
+            logger.info("Saved StringSession -> %s", path)
+        except Exception as e:
+            logger.warning("write session string %s: %s", path, e)
+    return ok
+
+def persist_telethon_session():
+    """Сохранить сессию на диск (sqlite + StringSession в 2 местах)."""
+    try:
+        tg_client.session.save()
+    except Exception as e:
+        logger.warning("session.save: %s", e)
+    try:
+        raw = tg_client.session
+        if isinstance(raw, StringSession):
+            s = raw.save()
+        else:
+            # SQLiteSession → StringSession
+            ss = StringSession()
+            try:
+                ss.set_dc(raw.dc_id, raw.server_address, raw.port)
+            except Exception:
+                pass
+            try:
+                if getattr(raw, "auth_key", None):
+                    ss.auth_key = raw.auth_key
+            except Exception:
+                pass
+            s = ss.save()
+        if s and len(str(s)) > 20:
+            _write_session_string(str(s))
+            return True
+    except Exception as e:
+        logger.warning("persist string session: %s", e)
+    return False
+
+
+# миграция старого nft_session.* из корня
 for _old in (SESSION_NAME + ".session", SESSION_NAME):
     try:
-        if os.path.isfile(_old) and not os.path.isfile(SESSION_PATH + ".session"):
+        dst = SESSION_PATH + ".session"
+        if os.path.isfile(_old) and not os.path.isfile(dst):
             import shutil
-            shutil.copy2(_old, SESSION_PATH + ("" if _old.endswith(".session") else ".session"))
-            logger.info("Migrated telethon session -> %s", SESSION_PATH)
+            shutil.copy2(_old, dst)
+            logger.info("Migrated telethon session file -> %s", dst)
             break
     except Exception as _e:
         logger.warning("session migrate: %s", _e)
 
+_session_str = _read_session_string()
+if _session_str:
+    _tg_session = StringSession(_session_str)
+    logger.info("Using StringSession backup (stable)")
+else:
+    _tg_session = SESSION_PATH
+    logger.info("Using file session %s", SESSION_PATH)
+
 bot       = Bot(token=BOT_TOKEN)
 dp        = Dispatcher(storage=MemoryStorage())
 tg_client = TelegramClient(
-    SESSION_PATH, API_ID, API_HASH,
-    connection_retries=10,
-    retry_delay=2,
+    _tg_session, API_ID, API_HASH,
+    connection_retries=20,
+    retry_delay=1,
     auto_reconnect=True,
-    request_retries=5,
+    request_retries=8,
+    flood_sleep_threshold=60,
 )
 _keepalive_task = None
+_lock_fp = None  # single-instance lock
+
+
+def acquire_bot_lock():
+    """Один процесс парсера. Два сразу = Telegram сносит auth key."""
+    global _lock_fp
+    lock_path = os.path.join(DATA_DIR, "parser.lock")
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        _lock_fp = open(lock_path, "a+")
+        try:
+            import fcntl
+            fcntl.flock(_lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.error("УЖЕ ЗАПУЩЕН другой процесс парсера! Второй инстанс убивает сессию.")
+            raise SystemExit(
+                "ERROR: parser already running. Stop the other instance "
+                "(иначе Telegram сносит сессию AuthKeyDuplicated)."
+            )
+        except ImportError:
+            # Windows fallback - pid file
+            pass
+        _lock_fp.seek(0)
+        _lock_fp.truncate()
+        _lock_fp.write(str(os.getpid()))
+        _lock_fp.flush()
+        logger.info("Bot lock acquired pid=%s", os.getpid())
+        return True
+    except SystemExit:
+        raise
+    except Exception as e:
+        logger.warning("lock: %s", e)
+        return False
 
 # ── ACCESS + per-user DB context ─────────────────────────────────────────────
 from typing import Any, Awaitable, Callable, Dict
@@ -911,46 +1035,63 @@ class SetBoost(StatesGroup):
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 async def ensure_tg_connected():
-    """Подключить Telethon и убедиться что сессия жива."""
+    """Подключить Telethon и убедиться что сессия жива. НЕ логинимся заново."""
     try:
         if not tg_client.is_connected():
             await tg_client.connect()
         if await tg_client.is_user_authorized():
-            # лёгкий ping - держит auth key активным
             await tg_client.get_me()
-            try:
-                tg_client.session.save()
-            except Exception:
-                pass
+            persist_telethon_session()
             return True
+        # не авторизован - пробуем подтянуть StringSession бэкап
+        s = _read_session_string()
+        if s and not isinstance(tg_client.session, StringSession):
+            logger.warning("File session dead, reload from StringSession backup")
+        return False
+    except AuthKeyDuplicatedError:
+        logger.error(
+            "AuthKeyDuplicatedError: запущено 2 копии бота с одной сессией. "
+            "Telegram УБИЛ ключ. Оставь ОДИН процесс и заново /admin auth."
+        )
+        try:
+            await bot.send_message(
+                OWNER_ID,
+                "<b>❌ Сессия убита Telegram</b>\n"
+                "Запущено 2 копии парсера одновременно.\n"
+                "Останови все, оставь одну, заново привяжи акк в /admin.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return False
+    except AuthKeyError as e:
+        logger.error("AuthKeyError: %s", e)
         return False
     except Exception as e:
         logger.warning("ensure_tg_connected: %s", e)
         try:
-            await tg_client.connect()
-        except Exception:
-            pass
-        try:
+            if not tg_client.is_connected():
+                await tg_client.connect()
             return await tg_client.is_user_authorized()
         except Exception:
             return False
 
 
 async def session_keepalive_loop():
-    """Раз в 3 мин пингуем Telegram - иначе сессия «засыпает» и слетает."""
+    """Каждую минуту пинг - сессия не засыпает и бэкап обновляется."""
     while True:
         try:
-            await asyncio.sleep(180)
+            await asyncio.sleep(60)
             ok = await ensure_tg_connected()
             if not ok:
-                logger.warning("Telethon session not authorized - relink in /admin")
+                logger.warning("Telethon NOT authorized - /admin → привяжи акк")
             else:
-                logger.debug("Telethon keepalive ok")
+                logger.info("Telethon keepalive OK, session persisted")
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.warning("session_keepalive: %s", e)
-            await asyncio.sleep(30)
+            await asyncio.sleep(20)
 
 
 def start_session_keepalive():
@@ -4571,9 +4712,15 @@ def ob_region_kb():
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     global is_searching
+    uid = message.from_user.id
+    if int(uid) != int(OWNER_ID):
+        await message.answer(
+            ACCESS_DENY_HTML.format(uid=uid),
+            parse_mode="HTML",
+        )
+        return
     is_searching = False
     await state.clear()
-    uid = message.from_user.id
     add_user(uid, message.from_user.username,
              message.from_user.first_name, message.from_user.last_name)
 
@@ -4722,7 +4869,11 @@ async def cmd_clear(message: Message, state: FSMContext):
 
 @dp.message(Command("myid"))
 async def cmd_myid(message: Message):
-    await message.answer("<b>ID: <code>" + str(message.from_user.id) + "</code></b>", parse_mode="HTML")
+    uid = message.from_user.id
+    if int(uid) != int(OWNER_ID):
+        await message.answer(ACCESS_DENY_HTML.format(uid=uid), parse_mode="HTML")
+        return
+    await message.answer("<b>ID: <code>" + str(uid) + "</code></b>", parse_mode="HTML")
 
 @dp.message(Command("neptunteam"))
 async def cmd_neptunteam(message: Message, state: FSMContext):
@@ -5458,11 +5609,21 @@ async def cb_admin_auth(cb: CallbackQuery, state: FSMContext):
 async def cb_admin_logout(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return
+    # НЕ вызываем log_out() - он УБИВАЕТ auth key на стороне Telegram!
+    # Только отключаемся локально, файлы сессии оставляем.
     try:
-        await tg_client.log_out()
+        if tg_client.is_connected():
+            await tg_client.disconnect()
     except Exception:
         pass
-    await cb.message.answer("<b>Вышел из TG.</b>", parse_mode="HTML", reply_markup=admin_kb())
+    persist_telethon_session()
+    await cb.message.answer(
+        "<b>Отключился локально.</b>\n"
+        "Сессия на диске сохранена (не снесена).\n"
+        "Чтобы снова войти - просто /admin → авторизация не нужна, если файл цел.\n"
+        "Полный сброс: удали <code>data/session/</code> и <code>telethon_auth.string</code>.",
+        parse_mode="HTML", reply_markup=admin_kb()
+    )
     await cb.answer()
 
 @dp.callback_query(F.data == "admin_cancel")
@@ -5503,18 +5664,18 @@ async def auth_code(message: Message, state: FSMContext):
     data = await state.get_data()
     try:
         await tg_client.sign_in(phone=data["phone"], code=code, phone_code_hash=data["phone_code_hash"])
-        try:
-            tg_client.session.save()
-        except Exception:
-            pass
+        persist_telethon_session()
         me = await tg_client.get_me()
         await state.clear()
         await load_collections()
         await message.answer(
             "<b>Авторизован как @" + esc(str(me.username or me.first_name)) + "\n"
             "Коллекций: " + str(len(ALL_GIFT_IDS)) + "\n"
-            "Сессия сохранена в data/session/\n"
-            "Сохраняю все гифты в БД...</b>",
+            "Сессия сохранена:\n"
+            "• data/session/auth.string\n"
+            "• telethon_auth.string\n"
+            "Не запускай 2 копии бота сразу - Telegram снесёт сессию!\n"
+            "Сохраняю гифты в БД...</b>",
             parse_mode="HTML", reply_markup=main_menu_kb()
         )
         start_session_keepalive()
@@ -5533,18 +5694,16 @@ async def auth_password(message: Message, state: FSMContext):
         return
     try:
         await tg_client.sign_in(password=message.text.strip())
-        try:
-            tg_client.session.save()
-        except Exception:
-            pass
+        persist_telethon_session()
         me = await tg_client.get_me()
         await state.clear()
         await load_collections()
         await message.answer(
             "<b>Авторизован как @" + esc(str(me.username or me.first_name)) + "\n"
             "Коллекций: " + str(len(ALL_GIFT_IDS)) + "\n"
-            "Сессия сохранена в data/session/\n"
-            "Сохраняю все гифты в БД...</b>",
+            "Сессия сохранена (auth.string + telethon_auth.string)\n"
+            "Не запускай 2 копии сразу!\n"
+            "Сохраняю гифты в БД...</b>",
             parse_mode="HTML", reply_markup=main_menu_kb()
         )
         start_session_keepalive()
