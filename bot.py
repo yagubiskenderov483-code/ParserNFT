@@ -28,7 +28,8 @@ API_ID       = 36101343
 API_HASH     = "116195fa5e0459d25a9a6266b40807d7"
 BOT_TOKEN    = "8790434095:AAG5eA6OzMcC2-VdLeTeITahdUi_6KiIRiw"
 ADMIN_ID     = 7186944876
-ALLOWED_USER_IDS = {7186944876}  # только этот юзер
+OWNER_ID     = 7186944876  # единственный кто может пользоваться ботом
+ALLOWED_USER_IDS = {OWNER_ID}
 SESSION_NAME = "nft_session"
 USERS_FILE   = "users.json"
 ONBOARDING_FILE = "onboarding_done.json"
@@ -96,8 +97,17 @@ def user_db_path(uid=None):
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, "gifts.db")
 
+ACCESS_DENY_HTML = (
+    "<b>❌ Ошибка</b>\n"
+    "Бот только для владельца.\n"
+    "Твой ID: <code>{uid}</code>\n"
+    "Доступ запрещён."
+)
+ACCESS_DENY_ALERT = "❌ Ошибка: доступ запрещён. Только владелец."
+
+
 class AdminOnlyMiddleware(BaseMiddleware):
-    """Парсер доступен только ALLOWED_USER_IDS. Ставит uid в контекст БД."""
+    """Только OWNER_ID (7186944876). Всем остальным - ошибка."""
     async def __call__(
         self,
         handler: Callable[[Any, Dict[str, Any]], Awaitable[Any]],
@@ -108,21 +118,31 @@ class AdminOnlyMiddleware(BaseMiddleware):
         if user is None:
             return await handler(event, data)
         uid = int(user.id)
-        if uid not in ALLOWED_USER_IDS:
+        if uid != int(OWNER_ID):
             try:
                 if isinstance(event, Message):
-                    txt = (event.text or "").strip().lower()
-                    if txt.startswith("/myid"):
-                        return await handler(event, data)
-                    await event.answer("<b>Доступ закрыт</b>", parse_mode="HTML")
+                    await event.answer(
+                        ACCESS_DENY_HTML.format(uid=uid),
+                        parse_mode="HTML",
+                    )
                 elif isinstance(event, CallbackQuery):
-                    await event.answer("Доступ закрыт", show_alert=True)
+                    try:
+                        await event.answer(ACCESS_DENY_ALERT, show_alert=True)
+                    except Exception:
+                        pass
+                    try:
+                        await event.message.answer(
+                            ACCESS_DENY_HTML.format(uid=uid),
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 pass
+            logger.warning("blocked uid=%s (owner=%s)", uid, OWNER_ID)
             return None
         token = set_current_uid(uid)
         try:
-            # подгружаем антидубль этой БД при первом заходе
             try:
                 ensure_user_seen_loaded(uid)
             except Exception:
@@ -857,8 +877,9 @@ def get_max_gifts(uid): return USER_MAX_GIFTS.get(uid, DEFAULT_MAX_GIFTS)
 def get_limit(uid):     return USER_LIMIT.get(uid, DEFAULT_LIMIT)
 def get_region(uid):    return USER_REGION.get(uid, DEFAULT_REGION)
 def is_admin(uid):
+    """Только владелец OWNER_ID."""
     try:
-        return int(uid) in ALLOWED_USER_IDS
+        return int(uid) == int(OWNER_ID)
     except Exception:
         return False
 
