@@ -25,6 +25,8 @@ nft_session*
 telethon_auth.string
 telethon_auth.string.tmp
 data/session/
+parser.lock
+data/parser.lock
 
 
 # Python
