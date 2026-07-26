@@ -27,6 +27,10 @@ telethon_auth.string.tmp
 data/session/
 parser.lock
 data/parser.lock
+neptun_gifts_backup.db
+neptun_gifts_backup.db.tmp
+backups/
+upload_restore_tmp.db
 
 
 # Python

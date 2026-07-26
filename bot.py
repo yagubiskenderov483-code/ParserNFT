@@ -22,7 +22,8 @@ from telethon.errors import (
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, WebAppInfo
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, WebAppInfo,
+    FSInputFile,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -974,7 +975,10 @@ GIRL_NAMES_SET = {
     "марина","елизавета","ульяна","варвара","снежана","лилия","аделина","дарина",
     "софия","софья","марьяна","ярослава","всеслава","люба","любовь","снежа",
     "ксания","ксеша","настенька","катенька","машенька","дашенька","иришка",
-    "анна","аня","анютка","тоня","тоня","ксения","олеся","леся","настя",
+    "анютка","тоня","олеся","леся","лизавета","катюша","юленька","маруся",
+    "снежанка","дашуля","викуля","полинка","аленка","каринка","настюша","сонечка",
+    "мирослава","владислава","богдана","светка","ритка","дианка","кристя","евачка",
+    "анна","аня",
     "anna","maria","kate","elena","olga","natasha","tatiana","irina","diana",
     "alina","dasha","masha","vika","lena","anya","yulia","julia","lisa","tanya",
     "sonya","arina","karina","milana","zlata","eva","yana","veronika","kira",
@@ -984,15 +988,18 @@ GIRL_NAMES_SET = {
     "lauren","grace","lily","ella","amber","kayla","chloe","jade","ruby","rose",
     "violet","daisy","aurora","aria","luna","scarlett","zoey","penelope","layla",
     "riley","nora","maya","claire","savannah","eleanor","camila","alexa","leah",
-    "aubrey","ariana","alice","lana","lola","zara",
+    "aubrey","ariana","alice","lana","lola","zara","emma","charlotte","harper",
+    "amelia","evelyn","ella","scarlett","grace","chloe","victoria","riley","aria",
+    "lily","aurora","willow","ellie","stella","hazel","luna","nova","ivy","paisley",
     "nastya","ksenia","kseniya","polina","katya","olya","lera","ksusha",
     "marina","elizaveta","uliana","ulyana","varvara","adelina","darina","olesya",
     "sveta","svetlana","nastia","anastasia","ekaterina","aleksandra","alexandra",
     "daria","darya","viktoria","viktoriya","valeriya","natalya","nataliya",
     "zhanna","regina","amina","mila","rita","liza","sonia","tonya","lesya",
-    "kamilla","camilla","evelina","milena","yasmin","lara","lada","mila",
+    "kamilla","camilla","evelina","milena","yasmin","lara","lada",
     "dashka","mashka","katusha","yulya","uliya","nastenka","polinka","alenka",
-    "karinka",
+    "karinka","katrin","katie","kathryn","catherine","nicole","natalie","stephanie",
+    "rachel","jennifer","amanda","melissa","michelle","stephanie","heather","angela",
 }
 BOY_NAMES_SET = {
     "александр","алексей","андрей","антон","артем","артём","борис","вадим","василий",
@@ -1001,6 +1008,8 @@ BOY_NAMES_SET = {
     "леонид","максим","михаил","никита","николай","олег","павел","петр","пётр","роман",
     "руслан","сергей","степан","тимур","федор","фёдор","юрий","яков","аркадий",
     "саша","женя","жора","толя","ваня","петя","костя","миша","лёша","леша",
+    "матвей","ярослав","святослав","глеб","тимофей","семен","семён","владислав",
+    "стас","станислав","арсений","марк","лев","платон","филипп","егор","захар",
     "alex","alexander","alexey","aleksey","andrey","andre","anton","artem","artyom",
     "boris","victor","viktor","vladimir","vlad","dmitri","dmitry","evgeny","eugene",
     "ivan","igor","ilya","kirill","konstantin","maxim","maksim","mikhail","michael",
@@ -1008,8 +1017,9 @@ BOY_NAMES_SET = {
     "yuri","george","james","john","robert","david","william","richard","charles",
     "joseph","thomas","mark","paul","andrew","egor","danil","daniil","petya",
     "serezha","kostya","roma","yura","kolya","gosha","lesha","sasha","zhenya",
-    "jack","harry","daniel","matthew","chris","chris","kevin","brian","steve",
-    "peter","frank","tony","mike","nick","tom","bob","sam",
+    "jack","harry","daniel","matthew","chris","kevin","brian","steve",
+    "peter","frank","tony","mike","nick","tom","bob","sam","jake","luke","ryan",
+    "brandon","justin","tyler","jason","jeff","eric","sean","kyle","derek","aaron",
 }
 # Только явные маркеры (без «✨/💫» - слишком шумные)
 GIRL_SIGNALS_STRICT = [
@@ -1071,8 +1081,11 @@ def _girl_gift_boost(gifts):
 
 def is_girl(owner, username=None, name=None, require_photo=False, has_photo=None,
             gifts=None, market_strict=False):
-    """Детект девушки: парней режем жёстко, девушек пропускаем по имени/нику/bio.
-    market_strict - чуть строже (нужно имя или ник или явный маркер), без убийства выдачи."""
+    """Детект девушки (улучшенный):
+    - парней режем жёстко
+    - одного «окончания на -а» или 1 сердечка в гифтах — мало
+    - женское имя / she-her / эмодзи / ник — сильные сигналы
+    """
     bio_raw   = (getattr(owner, "bio",        "") or "") if owner else ""
     uname_raw = (getattr(owner, "username",   "") or "") if owner else (username or "")
     fname_raw = (getattr(owner, "first_name", "") or "") if owner else ""
@@ -1106,7 +1119,7 @@ def is_girl(owner, username=None, name=None, require_photo=False, has_photo=None
     )
     has_girl_kw = any(x in full for x in (
         "girl", "female", "woman", "lady", "девушка", "девочка", "женщина",
-        "she/her", "she her", "♀", "princess", "queen",
+        "she/her", "she her", "♀", "princess", "queen", "wife", "girlfriend",
     ))
 
     # Мужские маркеры - мгновенный отказ
@@ -1118,10 +1131,11 @@ def is_girl(owner, username=None, name=None, require_photo=False, has_photo=None
         return False
     if (tokens & BOY_NAMES_SET) and not has_girl_name and not has_girl_kw:
         return False
-    if bio_l and any(w in bio_l.split() for w in (
-        "парень", "мужчина", "мужик", "he/him",
+    if bio_l and any(w in bio_l for w in (
+        "парень", "мужчина", "мужик", "he/him", "he him", "boy ", "i am a guy",
+        "я парень", "я мужчина", "♂",
     )):
-        if "she/her" not in bio_l and "девушка" not in bio_l:
+        if "she/her" not in bio_l and "девушка" not in bio_l and "♀" not in bio_raw:
             return False
 
     score = 0
@@ -1157,7 +1171,7 @@ def is_girl(owner, username=None, name=None, require_photo=False, has_photo=None
             strong = True
             break
     for gn in GIRL_NAMES_SET:
-        if len(gn) >= 4 and gn in uname:
+        if len(gn) >= 4 and gn in uname_compact:
             score += 2
             strong = True
             break
@@ -1170,26 +1184,46 @@ def is_girl(owner, username=None, name=None, require_photo=False, has_photo=None
     if has_photo and (has_girl_name or has_girl_kw):
         score += 1
 
-    # женские окончания имени
+    # женские окончания имени — слабый сигнал один, сильный с именем
     STRONG_RU = ("на", "ья", "ия", "ая", "ина", "ена", "лла", "елла", "ка", "ша", "ля")
     STRONG_LAT = ("ina", "yna", "ella", "ette", "elle", "issa", "enna", "ia", "ya")
     soft_end = False
     if fname0 and len(fname0) >= 3 and fname0 not in MALE_NAME_EXCEPTIONS_A:
         if any(fname0.endswith(e) for e in STRONG_RU) or any(fname0.endswith(e) for e in STRONG_LAT):
-            score += 2
+            score += 2 if has_girl_name else 1
             soft_end = True
         elif len(fname0) >= 4 and fname0[-1] in ("a", "а", "я"):
-            score += 2
+            score += 2 if has_girl_name else 1
             soft_end = True
 
     if require_photo and not has_photo:
         if not (has_girl_name and score >= 5):
             return False
 
-    # как в рабочей старой версии: хватает 1 балла (имя/окончание/ник/эмодзи)
-    if not (fname0 or uname or bio_l):
+    if not (fname0 or uname or bio_l or _gifts):
         return False
-    return score >= 1
+
+    # Улучшенный порог: не пускать «рандом с -а» / одно сердечко в NFT
+    if has_girl_name:
+        return score >= 2
+    if strong:
+        return score >= 3
+    # только окончание / слабые гифты — мало
+    if soft_end and gboost <= 1 and not has_girl_kw:
+        return False
+    if market_strict:
+        return score >= 5
+    return score >= 4
+
+
+def girl_filter(owner, username=None, name=None, gifts=None):
+    """Единая точка для girls_only поиска (строже, меньше парней в выдаче)."""
+    if clearly_not_girl(owner, username, name):
+        return False
+    return is_girl(
+        owner, username, name,
+        require_photo=False, gifts=gifts, market_strict=True,
+    )
 
 
 # ── MODEL DETECTION ───────────────────────────────────────────────────────────
@@ -1821,6 +1855,10 @@ def admin_kb():
         [InlineKeyboardButton(text="Авторизация TG",     callback_data="admin_auth")],
         [InlineKeyboardButton(text="Обновить коллекции", callback_data="admin_reload_cols")],
         [db_btn],
+        [
+            InlineKeyboardButton(text="💾 Скачать БД", callback_data="admin_db_download"),
+            InlineKeyboardButton(text="📥 Восстановить БД", callback_data="admin_db_restore"),
+        ],
         [InlineKeyboardButton(text="🧹 Сброс антидубля (" + str(seen_n) + ")", callback_data="admin_clear_seen")],
         [InlineKeyboardButton(text="Выйти из TG",        callback_data="admin_logout")],
         [InlineKeyboardButton(text="В меню",             callback_data="menu")],
@@ -2418,7 +2456,7 @@ def load_pricenft_db(force=False):
     return True
 
 def save_pricenft_db():
-    """SQLite уже на диске; делаем checkpoint WAL."""
+    """SQLite уже на диске; делаем checkpoint WAL + бэкап вне data/."""
     try:
         conn = _db()
         conn.commit()
@@ -2428,6 +2466,189 @@ def save_pricenft_db():
             pass
     except Exception as e:
         logger.warning("save_pricenft_db: %s", e)
+    try:
+        backup_owner_db(reason="autosave")
+    except Exception as e:
+        logger.debug("autosave backup: %s", e)
+
+
+# ── DB BACKUP (чтобы после смены акка/деплоя БД не пропадала) ─────────────────
+# data/ часто чистят → держим копию в корне и в backups/
+BACKUP_DB_FILE = os.path.join(_ROOT_DIR, "neptun_gifts_backup.db")
+BACKUP_DIR = os.path.join(_ROOT_DIR, "backups")
+_last_backup_ts = 0.0
+_last_backup_sent_ts = 0.0
+_last_backup_size = 0
+
+
+def backup_owner_db(reason="manual"):
+    """
+    Копируем БД владельца в neptun_gifts_backup.db (+ ротация в backups/).
+    Сессия Telethon тут не нужна — только файлы.
+    """
+    global _last_backup_ts, _last_backup_size
+    import shutil
+    # autosave не чаще раза в 5 мин
+    if reason == "autosave" and (time.time() - float(_last_backup_ts or 0)) < 300:
+        return {"ok": True, "skipped": True}
+    src = user_db_path(OWNER_ID)
+    if not os.path.isfile(src) or os.path.getsize(src) < 200:
+        return {"ok": False, "error": "empty_db"}
+    try:
+        # checkpoint чтобы WAL вмержился в основной файл
+        try:
+            conn = _db(OWNER_ID)
+            conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        # атомарно в корень
+        tmp = BACKUP_DB_FILE + ".tmp"
+        shutil.copy2(src, tmp)
+        os.replace(tmp, BACKUP_DB_FILE)
+        # ротация по времени
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        snap = os.path.join(BACKUP_DIR, "gifts_" + ts + ".db")
+        shutil.copy2(BACKUP_DB_FILE, snap)
+        # оставляем последние 8 снапшотов
+        snaps = sorted(
+            [os.path.join(BACKUP_DIR, f) for f in os.listdir(BACKUP_DIR)
+             if f.startswith("gifts_") and f.endswith(".db")],
+            key=lambda p: os.path.getmtime(p),
+        )
+        for old in snaps[:-8]:
+            try:
+                os.remove(old)
+            except Exception:
+                pass
+        size = os.path.getsize(BACKUP_DB_FILE)
+        _last_backup_ts = time.time()
+        _last_backup_size = size
+        logger.info("DB backup ok reason=%s size=%s -> %s", reason, size, BACKUP_DB_FILE)
+        return {"ok": True, "path": BACKUP_DB_FILE, "size": size, "snap": snap}
+    except Exception as e:
+        logger.warning("backup_owner_db: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+def restore_owner_db_from_backup(src_path=None):
+    """Восстановить data/user_<owner>/gifts.db из бэкапа (после смены акка)."""
+    import shutil
+    src = src_path or BACKUP_DB_FILE
+    if not src or not os.path.isfile(src) or os.path.getsize(src) < 200:
+        # пробуем последний снапшот
+        try:
+            snaps = sorted(
+                [os.path.join(BACKUP_DIR, f) for f in os.listdir(BACKUP_DIR)
+                 if f.startswith("gifts_") and f.endswith(".db")],
+                key=lambda p: os.path.getmtime(p),
+            )
+            if snaps:
+                src = snaps[-1]
+        except Exception:
+            pass
+    if not src or not os.path.isfile(src) or os.path.getsize(src) < 200:
+        return {"ok": False, "error": "no_backup"}
+    uid = int(OWNER_ID)
+    dst = user_db_path(uid)
+    try:
+        # закрыть живое соединение
+        conn = _db_conns.pop(uid, None)
+        if conn is not None:
+            try:
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        # убрать WAL хвосты
+        for ext in ("", "-wal", "-shm"):
+            p = dst + ext if ext else dst
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        shutil.copy2(src, dst)
+        # сбросить seen в RAM — перезагрузится
+        try:
+            SEEN_BY_USER.pop(uid, None)
+        except Exception:
+            pass
+        # открыть заново + load
+        _db(uid)
+        ensure_user_seen_loaded(uid)
+        st = pricenft_db_stats()
+        logger.info(
+            "DB restored from %s -> users=%s nfts=%s",
+            src, st.get("users"), st.get("nfts"),
+        )
+        return {"ok": True, "src": src, **st}
+    except Exception as e:
+        logger.error("restore_owner_db: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+def maybe_restore_db_on_startup():
+    """Если живая БД пустая, а бэкап есть — поднимаем бэкап автоматически."""
+    try:
+        live = user_db_path(OWNER_ID)
+        live_n = 0
+        if os.path.isfile(live) and os.path.getsize(live) > 200:
+            try:
+                live_n = int(pricenft_db_stats().get("users", 0) or 0)
+            except Exception:
+                live_n = 0
+        bak_ok = os.path.isfile(BACKUP_DB_FILE) and os.path.getsize(BACKUP_DB_FILE) > 200
+        if live_n < 20 and bak_ok:
+            logger.warning(
+                "Live DB small (users=%s) — restore from backup %s",
+                live_n, BACKUP_DB_FILE,
+            )
+            return restore_owner_db_from_backup(BACKUP_DB_FILE)
+        # если live пустой файла нет — тоже
+        if (not os.path.isfile(live) or os.path.getsize(live) < 200) and bak_ok:
+            return restore_owner_db_from_backup(BACKUP_DB_FILE)
+    except Exception as e:
+        logger.warning("maybe_restore_db: %s", e)
+    return {"ok": False, "skipped": True}
+
+
+async def send_db_backup_to_owner(caption=None, force=False):
+    """Выдать бэкап БД владельцу в Telegram (файл)."""
+    global _last_backup_sent_ts
+    r = backup_owner_db(reason="send")
+    if not r.get("ok"):
+        return r
+    path = r.get("path") or BACKUP_DB_FILE
+    # не спамить чаще раза в 6ч, если не force
+    now = time.time()
+    if not force and (now - float(_last_backup_sent_ts or 0)) < 6 * 3600:
+        return {"ok": True, "skipped_send": True, **r}
+    try:
+        st = pricenft_db_stats()
+        cap = caption or (
+            "💾 Бэкап БД Neptun\n"
+            "Юзеров: " + str(st.get("users", 0))
+            + " | NFT: " + str(st.get("nfts", 0))
+            + " | Моделей: " + str(st.get("models", 0))
+            + "\nСохрани файл. Если сессия слетит — кинь его боту обратно."
+        )
+        await bot.send_document(
+            OWNER_ID,
+            FSInputFile(path, filename="neptun_gifts_backup.db"),
+            caption="<b>" + esc(cap) + "</b>",
+            parse_mode="HTML",
+        )
+        _last_backup_sent_ts = now
+        return {"ok": True, "sent": True, **r}
+    except Exception as e:
+        logger.warning("send_db_backup: %s", e)
+        return {"ok": False, "error": str(e), **r}
 
 def pricenft_db_stats():
     try:
@@ -3560,6 +3781,12 @@ async def background_db_keeper():
                     logger.warning("keeper PriceNFT: %s", e)
 
             await asyncio.sleep(60)  # было 8с — слишком агрессивно
+            # раз в ~30 циклов (~30 мин) бэкапим БД и шлём владельцу файл
+            if cycle > 0 and cycle % 30 == 0:
+                try:
+                    await send_db_backup_to_owner(force=False)
+                except Exception as e:
+                    logger.debug("keeper backup send: %s", e)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -3606,7 +3833,7 @@ async def deliver_pricenft_random(status_msg, max_results=20, girls_only=False, 
         if is_trader_account(owner, uname, name):
             mark_seen(oid, uname, None)
             continue
-        if girls_only and not is_girl(owner, uname, name):
+        if girls_only and not girl_filter(owner, uname, name):
             continue
         if region and region != "any":
             if not region_match_full(owner, uname, name, region):
@@ -3767,7 +3994,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
         if is_trader_account(owner_obj, username, name):
             stats_skip["trader"] += 1
             return
-        if girls_only and not is_girl(owner_obj, username, name):
+        if girls_only and not girl_filter(owner_obj, username, name):
             stats_skip["girl"] += 1
             return
         if region and region != "any":
@@ -3943,7 +4170,7 @@ async def do_profile_search(status_msg, gift_ids, cat=None, girls_only=False,
                     ln = (getattr(u_obj, "last_name", "") or "")
                     uname = getattr(u_obj, "username", None)
                     name = (fn + " " + ln).strip()
-                    if girls_only and not is_girl(u_obj, uname, name):
+                    if girls_only and not girl_filter(u_obj, uname, name):
                         continue
                     p_url = ("https://t.me/" + uname) if uname else ("tg://user?id=" + str(uid))
                     await emit_cand(uid, {
@@ -4133,7 +4360,7 @@ async def do_market_search(status_msg, gift_ids, cat=None, girls_only=False,
                     item["title"] = title
                 if not price_in_cat(item.get("price"), cat):
                     continue
-                if girls_only and not is_girl(item.get("owner"), item.get("username"), item.get("name")):
+                if girls_only and not girl_filter(item.get("owner"), item.get("username"), item.get("name")):
                     continue
                 if region and region != "any":
                     if not region_match_full(item.get("owner"), item.get("username"), item.get("name"), region):
@@ -4422,7 +4649,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
                         continue
                 elif single and not slug:
                     continue
-                if girls_only and not is_girl(it.get("owner"), it.get("username"), it.get("name")):
+                if girls_only and not girl_filter(it.get("owner"), it.get("username"), it.get("name")):
                     continue
                 if region and region != "any":
                     if not region_match_full(it.get("owner"), it.get("username"), it.get("name"), region):
@@ -4511,7 +4738,7 @@ async def do_model_search(status_msg, gift_ids, girls_only=False,
             for h in hits:
                 if not is_searching or found[0] >= max_results:
                     break
-                if girls_only and not is_girl(None, h.get("username"), h.get("name")):
+                if girls_only and not girl_filter(None, h.get("username"), h.get("name")):
                     continue
                 await send_item(h, ignore_global=True, enforce_cap=False, enforce_consec=consec_multi)
 
@@ -4647,7 +4874,7 @@ async def do_profile_model_search(status_msg, gift_ids, girls_only=False,
         if not matched:
             return
 
-        if girls_only and not is_girl(owner_obj, username, name, gifts=saved):
+        if girls_only and not girl_filter(owner_obj, username, name, gifts=saved):
             return
         if uid is None and username:
             try:
@@ -5936,6 +6163,114 @@ async def cb_admin_auth(cb: CallbackQuery, state: FSMContext):
     await state.set_state(Auth.phone)
     await cb.answer()
 
+@dp.callback_query(F.data == "admin_db_download")
+async def cb_admin_db_download(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    await cb.answer("Готовлю бэкап...")
+    r = await send_db_backup_to_owner(force=True)
+    if r.get("ok") and r.get("sent"):
+        await cb.message.answer(
+            "<b>💾 БД отправлена файлом выше.</b>\n"
+            "Сохрани его. Если сессия слетит / купишь новый акк — "
+            "просто <b>пришли этот .db файл</b> боту, и я восстановлю базу.",
+            parse_mode="HTML", reply_markup=admin_kb(),
+        )
+    elif r.get("ok"):
+        await cb.message.answer(
+            "<b>Бэкап на диске:</b> <code>neptun_gifts_backup.db</code>\n"
+            "Размер: " + str(r.get("size", 0)) + " байт",
+            parse_mode="HTML", reply_markup=admin_kb(),
+        )
+    else:
+        await cb.message.answer(
+            "<b>Не удалось:</b> <code>" + esc(str(r.get("error") or r)) + "</code>",
+            parse_mode="HTML", reply_markup=admin_kb(),
+        )
+
+
+@dp.callback_query(F.data == "admin_db_restore")
+async def cb_admin_db_restore(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    await cb.answer()
+    r = restore_owner_db_from_backup()
+    if r.get("ok"):
+        await cb.message.answer(
+            "<b>✅ БД восстановлена из бэкапа</b>\n"
+            "Юзеров: " + str(r.get("users", 0))
+            + " | NFT: " + str(r.get("nfts", 0))
+            + " | Моделей: " + str(r.get("models", 0))
+            + "\nФайл: <code>" + esc(str(r.get("src") or "")) + "</code>",
+            parse_mode="HTML", reply_markup=admin_kb(),
+        )
+    else:
+        await cb.message.answer(
+            "<b>Нет бэкапа на диске.</b>\n"
+            "Пришли файл <code>neptun_gifts_backup.db</code> сюда в чат "
+            "(тот что бот отправлял ранее) — восстановлю.",
+            parse_mode="HTML", reply_markup=admin_kb(),
+        )
+
+
+@dp.message(F.document)
+async def on_owner_db_upload(message: Message):
+    """Владелец кинул .db — восстанавливаем БД (после смены акка)."""
+    if not _is_owner_uid(message.from_user.id):
+        await _deny_stranger(message, message.from_user.id)
+        return
+    doc = message.document
+    name = (doc.file_name or "").lower()
+    if not (name.endswith(".db") or name.endswith(".sqlite") or "gifts" in name or "neptun" in name):
+        await message.answer(
+            "<b>Это не похоже на бэкап БД.</b>\n"
+            "Нужен файл <code>neptun_gifts_backup.db</code>",
+            parse_mode="HTML",
+        )
+        return
+    # лимит ~200MB на всякий
+    if doc.file_size and doc.file_size > 200 * 1024 * 1024:
+        await message.answer("<b>Файл слишком большой</b>", parse_mode="HTML")
+        return
+    status = await message.answer("<b>⏳ Качаю и восстанавливаю БД...</b>", parse_mode="HTML")
+    tmp = os.path.join(_ROOT_DIR, "upload_restore_tmp.db")
+    try:
+        await bot.download(doc, destination=tmp)
+        # сначала положим как главный бэкап
+        import shutil
+        if os.path.isfile(tmp) and os.path.getsize(tmp) > 200:
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            shutil.copy2(tmp, BACKUP_DB_FILE)
+            r = restore_owner_db_from_backup(BACKUP_DB_FILE)
+            if r.get("ok"):
+                await status.edit_text(
+                    "<b>✅ БД восстановлена из твоего файла</b>\n"
+                    "Юзеров: " + str(r.get("users", 0))
+                    + " | NFT: " + str(r.get("nfts", 0))
+                    + " | Моделей: " + str(r.get("models", 0))
+                    + "\nМожно авторизовать новый акк — база уже на месте.",
+                    parse_mode="HTML", reply_markup=admin_kb(),
+                )
+            else:
+                await status.edit_text(
+                    "<b>Ошибка восстановления:</b> <code>"
+                    + esc(str(r.get("error"))) + "</code>",
+                    parse_mode="HTML",
+                )
+        else:
+            await status.edit_text("<b>Пустой/битый файл</b>", parse_mode="HTML")
+    except Exception as e:
+        await status.edit_text(
+            "<b>Ошибка:</b> <code>" + esc(str(e)) + "</code>", parse_mode="HTML"
+        )
+    finally:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
 @dp.callback_query(F.data == "admin_session")
 async def cb_admin_session(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
@@ -6093,6 +6428,13 @@ async def auth_code(message: Message, state: FSMContext):
         start_session_keepalive()
         start_bootstrap_gifts_db(notify_chat_id=message.chat.id)
         start_background_db_keeper()
+        try:
+            asyncio.create_task(send_db_backup_to_owner(
+                caption="💾 Бэкап БД после авторизации. Сохрани файл — если акк слетит, кинь его боту.",
+                force=True,
+            ))
+        except Exception:
+            pass
     except SessionPasswordNeededError:
         await state.set_state(Auth.password)
         await message.answer("<b>Введи пароль 2FA:</b>", parse_mode="HTML")
@@ -6121,6 +6463,13 @@ async def auth_password(message: Message, state: FSMContext):
         start_session_keepalive()
         start_bootstrap_gifts_db(notify_chat_id=message.chat.id)
         start_background_db_keeper()
+        try:
+            asyncio.create_task(send_db_backup_to_owner(
+                caption="💾 Бэкап БД после авторизации. Сохрани файл — если акк слетит, кинь его боту.",
+                force=True,
+            ))
+        except Exception:
+            pass
     except Exception as e:
         await message.answer("<b>Неверный пароль: <code>" + esc(str(e)) + "</code></b>", parse_mode="HTML")
 
@@ -6131,6 +6480,13 @@ async def main():
     global ONBOARDING_DONE
     acquire_bot_lock()
     ONBOARDING_DONE = load_onboarding()
+    # если data/ стёрли / новый сервер — поднимем БД из neptun_gifts_backup.db
+    try:
+        r0 = maybe_restore_db_on_startup()
+        if r0.get("ok"):
+            logger.info("Startup DB restore: users=%s nfts=%s", r0.get("users"), r0.get("nfts"))
+    except Exception as e:
+        logger.warning("startup restore: %s", e)
     load_pricenft_db()
     try:
         _load_pricenft_flood()
@@ -6142,8 +6498,8 @@ async def main():
         logger.warning("load_seen: %s", e)
     await ensure_tg_connected()
     logger.info(
-        "Neptun Parser запущен! owner=%s request_gap=%.1fs session_file=%s string_bak=%s",
-        OWNER_ID, REQUEST_GAP, SESSION_PATH, SESSION_STRING_BAK,
+        "Neptun Parser запущен! owner=%s request_gap=%.1fs session_file=%s string_bak=%s backup=%s",
+        OWNER_ID, REQUEST_GAP, SESSION_PATH, SESSION_STRING_BAK, BACKUP_DB_FILE,
     )
     st = pricenft_db_stats()
     logger.info(
@@ -6169,6 +6525,10 @@ async def main():
                 logger.info("БД мала (%s) - автосбор гифтов", st0.get("users"))
                 start_bootstrap_gifts_db(notify_chat_id=ADMIN_ID)
             start_background_db_keeper()
+            try:
+                backup_owner_db(reason="startup")
+            except Exception:
+                pass
         else:
             logger.warning("Не авторизован - /admin и привяжи аккаунт")
     except Exception as e:
@@ -6185,6 +6545,7 @@ async def main():
         try:
             db_flush(force=True)
             save_pricenft_db()
+            backup_owner_db(reason="shutdown")
         except Exception:
             pass
         try:
