@@ -171,14 +171,96 @@ bot       = Bot(token=BOT_TOKEN)
 dp        = Dispatcher(storage=MemoryStorage())
 tg_client = TelegramClient(
     _tg_session, API_ID, API_HASH,
-    connection_retries=20,
-    retry_delay=1,
+    connection_retries=8,
+    retry_delay=2,
     auto_reconnect=True,
-    request_retries=8,
-    flood_sleep_threshold=60,
+    request_retries=2,          # меньше ретраев = меньше флуда при FloodWait
+    flood_sleep_threshold=24,   # >24с не авто-спим в библиотеке — ловим сами и ставим cooldown
 )
 _keepalive_task = None
 _lock_fp = None  # single-instance lock
+
+# ── ANTI-FLOOD: глобальный cooldown API (иначе Telegram сносит сессию) ────────
+_api_cooldown_until = 0.0
+_api_cooldown_notified = 0.0
+# авто-сбор PriceNFT ВЫКЛ по умолчанию — жрёт ResolveUsername/сообщения и валит акк
+AUTO_PRICENFT = (os.environ.get("AUTO_PRICENFT") or "0").strip() in ("1", "true", "yes", "on")
+# фоновый keeper маркета можно выключить: AUTO_DB_KEEPER=0
+AUTO_DB_KEEPER = (os.environ.get("AUTO_DB_KEEPER") or "1").strip() not in ("0", "false", "no", "off")
+
+
+def _api_cooldown_left() -> float:
+    return max(0.0, float(_api_cooldown_until or 0) - time.time())
+
+
+def _api_cooldown_active() -> bool:
+    return _api_cooldown_left() > 0
+
+
+def set_api_cooldown(seconds, reason="FloodWait"):
+    """Пауза ВСЕХ фоновых запросов к Telegram API. Спасает сессию от бана/сноса."""
+    global _api_cooldown_until, _pricenft_flood_until, _api_cooldown_notified
+    try:
+        sec = int(max(0, seconds or 0))
+    except Exception:
+        sec = 60
+    if sec <= 0:
+        return
+    # минимум 60с при серьёзном флуде, потолок 6ч
+    if sec >= 30:
+        sec = max(sec, 60)
+    sec = min(sec, 6 * 3600)
+    until = time.time() + sec
+    if until > float(_api_cooldown_until or 0):
+        _api_cooldown_until = until
+    # PriceNFT тоже на паузу
+    try:
+        if until > float(_pricenft_flood_until or 0):
+            _pricenft_flood_until = until
+    except NameError:
+        pass
+    logger.warning(
+        "API COOLDOWN +%ss (~%.1fh) reason=%s — фон/PriceNFT/маркет на паузе",
+        sec, sec / 3600.0, reason,
+    )
+    now = time.time()
+    if now - float(_api_cooldown_notified or 0) > 600:
+        _api_cooldown_notified = now
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_notify_api_cooldown(sec, reason))
+        except Exception:
+            pass
+
+
+async def _notify_api_cooldown(sec, reason):
+    try:
+        hrs = max(1, int(round(sec / 3600.0))) if sec >= 3600 else 0
+        wait_s = ("~" + str(hrs) + "ч") if hrs else (str(int(sec)) + "с")
+        safe = str(reason).replace("<", "").replace(">", "")[:120]
+        await bot.send_message(
+            OWNER_ID,
+            "<b>⏳ Антифлуд: API на паузе " + wait_s + "</b>\n"
+            "Причина: <code>" + safe + "</code>\n\n"
+            "Фон / PriceNFT / агрессивный маркет остановлены.\n"
+            "Иначе Telegram может <b>снести сессию</b>.\n"
+            "Сбор БД через PriceNFT — только вручную из /admin.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+async def wait_api_slot(tag="api"):
+    """Ждём глобальный cooldown перед запросом."""
+    left = _api_cooldown_left()
+    if left <= 0:
+        return True
+    # фону — ждать; поиску — коротко поспать и всё равно пробовать осторожно
+    sleep_for = min(left, 90 if tag.startswith("bg") else 15)
+    logger.info("wait_api_slot(%s): sleep %.0fs (left=%.0fs)", tag, sleep_for, left)
+    await asyncio.sleep(sleep_for)
+    return True
 
 
 def _pid_alive(pid: int) -> bool:
@@ -445,7 +527,7 @@ TRADER_NAME_KW = (
 PRICENFT_BOT = "PriceNFTbot"
 PRICENFT_DB_FILE = "pricenft_db.json"   # legacy, мигрируем в sqlite
 GIFTS_DB_FILE = "gifts.db"             # старый общий файл (мигрируем в data/user_*)
-PRICENFT_MSG_CD = 3.0
+PRICENFT_MSG_CD = 12.0  # было 3с — флудило бота и валило сессию; 12с безопаснее
 WRITE_MSG = "привет, ты продаешь свой нфт подарок или нет"
 _pricenft_collecting = False
 _pricenft_stop = False
@@ -1211,10 +1293,11 @@ async def ensure_tg_connected():
 
 
 async def session_keepalive_loop():
-    """Каждую минуту пинг - сессия не засыпает и бэкап обновляется."""
+    """Пинг сессии. Реже при cooldown — не добиваем аккаунт."""
     while True:
         try:
-            await asyncio.sleep(60)
+            # при флуде — реже пингуем
+            await asyncio.sleep(180 if _api_cooldown_active() else 90)
             if _session_killed:
                 logger.error("keepalive: сессия убита Telegram — жду /admin re-auth")
                 await asyncio.sleep(300)
@@ -1223,12 +1306,15 @@ async def session_keepalive_loop():
             if not ok:
                 logger.warning("Telethon NOT authorized - /admin → привяжи акк")
             else:
-                logger.info("Telethon keepalive OK, session persisted")
+                logger.info(
+                    "Telethon keepalive OK cooldown_left=%.0fs",
+                    _api_cooldown_left(),
+                )
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.warning("session_keepalive: %s", e)
-            await asyncio.sleep(20)
+            await asyncio.sleep(30)
 
 
 def start_session_keepalive():
@@ -1995,12 +2081,17 @@ async def fetch_market_page(gid, offset, limit=100, newest=True):
                    последнего выставления/смены цены (desc). Порядок НЕ перемешиваем.
     newest=False - сортировка по цене (для флора и т.п.)
     """
-    for _ in range(2):
+    if _api_cooldown_active():
+        left = _api_cooldown_left()
+        if left > 20:
+            # при длинном cooldown не долбим — сразу пусто
+            return [], ""
+        await wait_api_slot("market")
+    for attempt in range(2):
         try:
             kwargs = dict(gift_id=gid, offset=offset, limit=limit)
             if not newest:
                 kwargs["sort_by_price"] = True
-            # явно не ставим sort_by_num - иначе не будет «свежих»
             result    = await tg_client(GetResaleStarGiftsRequest(**kwargs))
             users_map = {int(u.id): u for u in (getattr(result, "users", None) or [])}
             col_title = next((t for t, i in NFT_COLLECTIONS.items() if i == gid), None)
@@ -2011,7 +2102,6 @@ async def fetch_market_page(gid, offset, limit=100, newest=True):
                 fn = (getattr(owner, "first_name", "") or "") if owner else ""
                 ln = (getattr(owner, "last_name",  "") or "") if owner else ""
                 name = (fn + " " + ln).strip()
-                # fallback: owner_name с маркета если нет User-объекта
                 if not name:
                     name = (getattr(gift, "owner_name", None) or "") or ""
                 nft_url = make_nft_url(gift)
@@ -2019,7 +2109,6 @@ async def fetch_market_page(gid, offset, limit=100, newest=True):
                 raw_title = getattr(gift, "title", None)
                 if not raw_title or str(raw_title).strip() in ("", "?", "None"):
                     raw_title = col_title or "NFT"
-                # дата выставления/смены цены если есть в объекте
                 listed_at = None
                 for attr in ("resell_date", "availability_resale", "date", "listed_at"):
                     v = getattr(gift, attr, None)
@@ -2038,12 +2127,17 @@ async def fetch_market_page(gid, offset, limit=100, newest=True):
                     "source": "market",
                     "listed_at": listed_at,
                 })
-            # порядок API = newest first; если есть listed_at - подстрахуем
             if any(it.get("listed_at") for it in items):
                 items.sort(key=lambda x: x.get("listed_at") or 0, reverse=True)
             return items, getattr(result, "next_offset", "") or ""
         except FloodWaitError as e:
-            await asyncio.sleep(max(min(e.seconds, 8), 1))
+            sec = int(getattr(e, "seconds", 0) or 0)
+            # БЫЛО: sleep(min(sec, 8)) и снова долбить — это УБИВАЛО сессию
+            set_api_cooldown(sec, reason="GetResaleStarGifts FloodWait")
+            if sec <= 20 and attempt == 0:
+                await asyncio.sleep(sec + 1)
+                continue
+            return [], ""
         except Exception as e:
             logger.error("fetch_market gid=%s: %s", gid, e)
             return [], ""
@@ -2109,7 +2203,8 @@ async def fetch_saved_gifts(uid_or_username, max_pages=2, only_off_market=False,
             if not offset:
                 break
         except FloodWaitError as e:
-            await asyncio.sleep(min(e.seconds, 2))
+            sec = int(getattr(e, "seconds", 0) or 0)
+            set_api_cooldown(sec, reason="GetSavedStarGifts FloodWait")
             break
         except Exception as e:
             logger.debug("saved_gifts uid=%s: %s", uid_or_username, e)
@@ -2533,8 +2628,10 @@ def _parse_pricenft_text(text):
     return out_u, out_n
 
 async def _pricenft_wait_cd():
-    """CD 3 сек перед каждым сообщением к PriceNFTbot."""
+    """CD перед каждым сообщением к PriceNFTbot (антифлуд)."""
     global _pricenft_last_send
+    if _api_cooldown_active():
+        raise PriceNftFloodError(int(_api_cooldown_left()) or 60)
     now = time.time()
     wait = PRICENFT_MSG_CD - (now - _pricenft_last_send)
     if wait > 0:
@@ -2548,7 +2645,6 @@ def _set_pricenft_flood(seconds):
     """Запомнить FloodWait, не резолвить username снова часами."""
     global _pricenft_flood_until
     sec = int(max(0, seconds or 0))
-    # не ждём 20 часов в UI - просто блокируем PriceNFT до этого момента
     _pricenft_flood_until = time.time() + sec
     try:
         conn = _db()
@@ -2560,6 +2656,11 @@ def _set_pricenft_flood(seconds):
     except Exception:
         pass
     logger.warning("PriceNFT flood until +%ss (~%.1fh)", sec, sec / 3600.0)
+    # глобальный cooldown — чтобы фон маркета тоже не долбил
+    try:
+        set_api_cooldown(sec, reason="PriceNFT FloodWait")
+    except Exception:
+        pass
 
 def _load_pricenft_flood():
     global _pricenft_flood_until
@@ -2710,10 +2811,10 @@ async def _pricenft_click_or_send(msg, text):
     await _pricenft_send(text)
     return True
 
-async def fill_db_from_market_fast(progress_cb=None, parallel=24, target_users=None):
+async def fill_db_from_market_fast(progress_cb=None, parallel=4, target_users=None):
     """
-    Быстрое наполнение БД с маркета до цели (по умолчанию 100к юзеров).
-    Несколько кругов по коллекциям + пагинация. Можно Стопнуть.
+    Наполнение БД с маркета (бережно). parallel по умолчанию 4 — не 24.
+    Большой parallel = FloodWait = риск сноса сессии.
     """
     if target_users is None:
         target_users = DB_TARGET_USERS
@@ -2724,6 +2825,7 @@ async def fill_db_from_market_fast(progress_cb=None, parallel=24, target_users=N
         return {"ok": False, "error": "no_collections", **pricenft_db_stats()}
     total = 0
     rounds = 0
+    parallel = max(1, min(int(parallel or 4), 6))
 
     async def prog(t):
         if progress_cb:
@@ -2732,10 +2834,15 @@ async def fill_db_from_market_fast(progress_cb=None, parallel=24, target_users=N
             except Exception:
                 pass
 
-    # круги пока не набрали цель / не стоп
     while True:
         if _pricenft_stop:
             break
+        if _api_cooldown_active():
+            left = _api_cooldown_left()
+            await prog("⏳ API cooldown ~" + str(int(left)) + "с — пауза маркета→БД")
+            await asyncio.sleep(min(left, 120))
+            if _api_cooldown_active():
+                break
         st0 = pricenft_db_stats()
         users0 = int(st0.get("users", 0) or 0)
         if users0 >= target_users:
@@ -2747,9 +2854,10 @@ async def fill_db_from_market_fast(progress_cb=None, parallel=24, target_users=N
             "Маркет→БД круг " + str(rounds)
             + "\nЮзеров: " + str(users0) + " / " + str(target_users)
             + "\nКоллекций: " + str(len(pairs))
+            + "\nparallel=" + str(parallel)
         )
         for i in range(0, len(pairs), parallel):
-            if _pricenft_stop:
+            if _pricenft_stop or _api_cooldown_active():
                 break
             if int(pricenft_db_stats().get("users", 0) or 0) >= target_users:
                 break
@@ -2758,9 +2866,11 @@ async def fill_db_from_market_fast(progress_cb=None, parallel=24, target_users=N
             async def one(gid, title):
                 n = 0
                 offset = ""
-                for _page in range(3):
+                for _page in range(2):
+                    if _api_cooldown_active():
+                        break
                     try:
-                        items, nxt = await fetch_market_page(gid, offset, limit=100, newest=True)
+                        items, nxt = await fetch_market_page(gid, offset, limit=50, newest=True)
                     except Exception:
                         break
                     if not items:
@@ -2785,6 +2895,7 @@ async def fill_db_from_market_fast(progress_cb=None, parallel=24, target_users=N
                 if isinstance(p, int):
                     total += p
             db_flush(force=True)
+            await asyncio.sleep(1.2)  # пауза между чанками — антифлуд
             if (i // parallel) % 2 == 0:
                 st = pricenft_db_stats()
                 await prog(
@@ -2795,13 +2906,13 @@ async def fill_db_from_market_fast(progress_cb=None, parallel=24, target_users=N
                 )
         db_flush(force=True)
         save_pricenft_db()
-        # защита от бесконечного круга если юзеры не растут
         st1 = pricenft_db_stats()
         if int(st1.get("users", 0) or 0) <= users0 and rounds >= 3:
             await prog("Рост юзеров остановился на " + str(st1.get("users", 0)))
             break
         if rounds >= 30:
             break
+        await asyncio.sleep(3)
 
     db_flush(force=True)
     save_pricenft_db()
@@ -3194,11 +3305,9 @@ _bootstrap_task = None
 
 async def bootstrap_gifts_db(notify_chat_id=None):
     """
-    Автосохранение гифтов в БД после авторизации:
-    1) Быстрый проход по маркету всех коллекций
-    2) Фоновый сбор через @PriceNFTbot
+    Бережное автосохранение гифтов в БД после авторизации (только маркет).
+    PriceNFT автоматом НЕ трогаем — флудит и сносит сессию.
     """
-    global _pricenft_collecting
     if not await check_authorized():
         return {"ok": False, "error": "not_authorized"}
     await ensure_collections()
@@ -3214,19 +3323,23 @@ async def bootstrap_gifts_db(notify_chat_id=None):
             pass
 
     await _notify(
-        "📦 Сохраняю гифты в БД...\n"
+        "📦 Сохраняю гифты в БД (бережно)...\n"
         "Коллекций: " + str(len(ALL_GIFT_IDS)) + "\n"
-        "Сейчас: " + str(before.get("users", 0)) + " юзеров"
+        "Сейчас: " + str(before.get("users", 0)) + " юзеров\n"
+        "PriceNFT авто — ВЫКЛ (флуд валит сессию)"
     )
 
     pairs = list(ALL_GIFT_IDS)
     random.shuffle(pairs)
-    PARALLEL = 15
+    PARALLEL = 4
     for i in range(0, len(pairs), PARALLEL):
+        if _api_cooldown_active():
+            await _notify("⏳ FloodWait — bootstrap на паузе, сессию бережём")
+            break
         chunk = pairs[i:i+PARALLEL]
         async def one(gid, title):
             try:
-                items, _ = await fetch_market_page(gid, "", limit=80, newest=True)
+                items, _ = await fetch_market_page(gid, "", limit=50, newest=True)
             except Exception:
                 return 0
             for it in items:
@@ -3238,6 +3351,7 @@ async def bootstrap_gifts_db(notify_chat_id=None):
             return len(items)
         await asyncio.gather(*[one(gid, title) for gid, title in chunk], return_exceptions=True)
         db_flush(force=True)
+        await asyncio.sleep(1.5)
         if (i // PARALLEL) % 4 == 0:
             save_pricenft_db()
             mid = pricenft_db_stats()
@@ -3251,21 +3365,22 @@ async def bootstrap_gifts_db(notify_chat_id=None):
     save_pricenft_db()
     after_m = pricenft_db_stats()
     await _notify(
-        "✅ Гифты с маркета в БД\n"
+        "✅ Маркет→БД готово\n"
         "Моделей: " + str(after_m.get("models", 0)) + "\n"
         "Юзеров: " + str(after_m.get("users", 0)) + "\n"
-        "Дальше @PriceNFTbot в фоне..."
+        "PriceNFT — только вручную из /admin (AUTO_PRICENFT="
+        + ("on" if AUTO_PRICENFT else "off") + ")"
     )
 
-    async def _bg_price():
-        try:
-            await collect_pricenft_db(progress_cb=None, max_models=80)
-            st = pricenft_db_stats()
-            await _notify("✅ PriceNFT в БД: " + str(st.get("models", 0)) + " моделей / " + str(st.get("users", 0)) + " юзеров")
-        except Exception as e:
-            logger.warning("bg PriceNFT: %s", e)
-
-    if not _pricenft_collecting:
+    # авто PriceNFT только если явно включили env AUTO_PRICENFT=1
+    if AUTO_PRICENFT and not _pricenft_collecting and not _pricenft_flood_active():
+        async def _bg_price():
+            try:
+                await collect_pricenft_db(progress_cb=None, max_models=30)
+                st = pricenft_db_stats()
+                await _notify("✅ PriceNFT в БД: " + str(st.get("models", 0)) + " / " + str(st.get("users", 0)))
+            except Exception as e:
+                logger.warning("bg PriceNFT: %s", e)
         asyncio.create_task(_bg_price())
     return {"ok": True, **after_m}
 
@@ -3283,48 +3398,69 @@ def start_bootstrap_gifts_db(notify_chat_id=None):
 
 async def background_db_keeper():
     """
-    Основной фоновый режим: постоянно быстро пишет маркет в sqlite,
-    периодически дособирает через @PriceNFTbot (CD 3с).
-    Работает всегда после авторизации - даже когда поиск не идёт.
+    Фоновый добор БД с маркета — МЕДЛЕННО.
+    PriceNFT автоматом НЕ трогаем (флуд = снос сессии).
     """
-    logger.info("background_db_keeper started")
-    await asyncio.sleep(5)
+    logger.info(
+        "background_db_keeper started (gentle) AUTO_PRICENFT=%s AUTO_DB_KEEPER=%s",
+        AUTO_PRICENFT, AUTO_DB_KEEPER,
+    )
+    await asyncio.sleep(15)
     cycle = 0
     while True:
         try:
-            if not await check_authorized():
-                await asyncio.sleep(30)
+            if not AUTO_DB_KEEPER:
+                await asyncio.sleep(120)
                 continue
-            # во время поиска не конкурируем за API - маркет и так сидится из выдачи
-            if is_searching:
-                await asyncio.sleep(3)
+            if not await check_authorized():
+                await asyncio.sleep(60)
+                continue
+            if _session_killed:
+                await asyncio.sleep(300)
+                continue
+            if _api_cooldown_active():
+                left = _api_cooldown_left()
+                logger.info("keeper: API cooldown %.0fs — спим", left)
+                await asyncio.sleep(min(max(left, 30), 300))
+                continue
+            if is_searching or _pricenft_collecting:
+                await asyncio.sleep(5)
                 continue
             await ensure_collections()
             pairs = list(ALL_GIFT_IDS) or []
             if not pairs:
-                await asyncio.sleep(20)
+                await asyncio.sleep(30)
                 continue
-            random.shuffle(pairs)
-            PARALLEL = 22
-            # быстрый проход маркета - основной объём БД до 100к
+
             st0 = pricenft_db_stats()
-            if int(st0.get("users", 0) or 0) < DB_TARGET_USERS:
-                # глубокий fill раз в несколько циклов
-                if cycle % 3 == 0:
-                    try:
-                        await fill_db_from_market_fast(
-                            progress_cb=None, parallel=22, target_users=DB_TARGET_USERS
-                        )
-                    except Exception as e:
-                        logger.warning("keeper fill: %s", e)
-            for i in range(0, len(pairs), PARALLEL):
-                if is_searching:
+            users_n = int(st0.get("users", 0) or 0)
+            # если уже много юзеров — редко и мелко
+            if users_n >= DB_TARGET_USERS:
+                await asyncio.sleep(180)
+                cycle += 1
+                continue
+
+            random.shuffle(pairs)
+            PARALLEL = 3
+            # полный fill — редко и с parallel=3
+            if cycle > 0 and cycle % 8 == 0 and users_n < DB_TARGET_USERS:
+                try:
+                    await fill_db_from_market_fast(
+                        progress_cb=None, parallel=3, target_users=min(DB_TARGET_USERS, users_n + 5000)
+                    )
+                except Exception as e:
+                    logger.warning("keeper fill: %s", e)
+
+            # обычный тихий проход — не все коллекции сразу
+            batch = pairs[:40]
+            for i in range(0, len(batch), PARALLEL):
+                if is_searching or _api_cooldown_active() or _pricenft_collecting:
                     break
-                chunk = pairs[i:i + PARALLEL]
+                chunk = batch[i:i + PARALLEL]
 
                 async def one(gid, title):
                     try:
-                        items, _ = await fetch_market_page(gid, "", limit=100, newest=True)
+                        items, _ = await fetch_market_page(gid, "", limit=40, newest=True)
                     except Exception:
                         return 0
                     for it in items:
@@ -3340,38 +3476,40 @@ async def background_db_keeper():
                     return_exceptions=True,
                 )
                 db_flush(force=True)
-                # не душим API: короткая пауза между чанками
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(2.0)
 
             db_flush(force=True)
             save_pricenft_db()
             cycle += 1
             st = pricenft_db_stats()
             logger.info(
-                "DB keeper cycle=%s models=%s users=%s nfts=%s",
+                "DB keeper cycle=%s models=%s users=%s nfts=%s cooldown=%s",
                 cycle, st.get("models"), st.get("users"), st.get("nfts"),
+                int(_api_cooldown_left()),
             )
 
-            # PriceNFTbot - только если нет FloodWait
+            # PriceNFT только если AUTO_PRICENFT=1 и нет флуда
             if (
-                cycle % 2 == 0
+                AUTO_PRICENFT
+                and cycle % 10 == 0
                 and not _pricenft_collecting
                 and not is_searching
                 and not _pricenft_flood_active()
+                and not _api_cooldown_active()
             ):
                 try:
-                    await collect_pricenft_db(progress_cb=None, max_models=40)
+                    await collect_pricenft_db(progress_cb=None, max_models=15)
                     db_flush(force=True)
                     save_pricenft_db()
                 except Exception as e:
                     logger.warning("keeper PriceNFT: %s", e)
 
-            await asyncio.sleep(8)
+            await asyncio.sleep(60)  # было 8с — слишком агрессивно
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.warning("background_db_keeper: %s", e)
-            await asyncio.sleep(15)
+            await asyncio.sleep(30)
 
 
 def start_background_db_keeper():
@@ -5549,8 +5687,10 @@ async def cb_pricenft_collect(cb: CallbackQuery):
         "<b>📦 База данных</b>\n"
         "Цель: " + str(DB_TARGET_USERS) + " юзеров\n"
         "Сейчас: " + str(pricenft_db_stats().get("users", 0)) + "\n"
-        "1) Быстрый маркет→БД\n"
-        "2) @PriceNFTbot (если нет FloodWait)\n"
+        "1) Маркет→БД (бережно, parallel=4)\n"
+        "2) @PriceNFTbot CD=" + str(int(PRICENFT_MSG_CD)) + "с "
+        "(автофон ВЫКЛ — флуд сносит сессию)\n"
+        "При FloodWait всё встаёт на cooldown.\n"
         "Можно остановить в любой момент",
         parse_mode="HTML",
         reply_markup=stop_kb_db,

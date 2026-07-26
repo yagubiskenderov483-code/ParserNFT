@@ -27,9 +27,24 @@ Telegram **убивает auth-ключ целиком**, если одна и �
 - старый `log_out()` (в коде больше не вызывается — он тоже убивает ключ)
 - «Завершить все другие сессии» в Telegram, если там висит парсер
 
+## Флуд PriceNFT / маркет тоже валит сессию
+
+Если долбить `@PriceNFTbot` (CD 3с) и маркет (20+ параллелей), Telegram даёт
+длинный `FloodWait`, а при игноре — может отозвать ключ / забанить акк.
+
+В коде теперь:
+- авто-сбор PriceNFT **выключен** (`AUTO_PRICENFT=0`)
+- фон маркета медленный (parallel 3–4, пауза 60с)
+- при любом FloodWait — глобальный API cooldown, фон встаёт
+- PriceNFT вручную из `/admin`, CD = 12с
+
+Включить авто PriceNFT (не рекомендуется): `AUTO_PRICENFT=1`  
+Выключить фон БД совсем: `AUTO_DB_KEEPER=0`
+
 ## Как бот защищается
 
 - `parser.lock` + `fcntl` — второй процесс сразу выходит
 - StringSession бэкап в `telethon_auth.string` + `data/session/auth.string`
-- keepalive раз в минуту + persist
+- keepalive + persist
 - logout только локальный disconnect, без `log_out()`
+- антифлуд cooldown при FloodWait
