@@ -1,54 +1,18 @@
-# Секретные данные
 .env
 *.env
-config.py
-*_config.py
-secrets.py
-*.key
-*.pem
-
-# Файлы с данными пользователей
-users.json
-*.json
-
-# Локальные SQLite БД (маркет / профили / личные)
-gifts.db
-gifts.db-*
-profile_gifts.db
-profile_gifts.db-*
-data/
-
-# Файлы сессии Telegram
-*.session
-*.session-journal
-nft_session*
-telethon_auth.string
-telethon_auth.string.tmp
-data/session/
-parser.lock
-data/parser.lock
-neptun_gifts_backup.db
-neptun_gifts_backup.db.tmp
-backups/
-upload_restore_tmp.db
-
-
-# Python
 __pycache__/
 *.pyc
-*.pyo
-*.so
-.Python
 venv/
-env/
-.env/
 .venv/
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Логи
-*.log
+# data & sessions
+data/
+*.session
+*.session-journal
+telethon_auth.string
+telethon_auth.string.tmp
+parser.lock
+neptun_gifts_backup.db
+backups/
+*.db
+*.db-*
